@@ -1,8 +1,8 @@
 """
-Tests for the Coinbase Web Chat Application.
+Tests for the Mister Risker Web Chat Application.
 
-These tests cover the CoinbaseChatBot class and its integration
-with the LLM and MCP server.
+These tests cover the TradingChatBot class and its integration
+with the LLM and MCP servers (Coinbase and Schwab).
 """
 
 import pytest
@@ -89,9 +89,9 @@ class TestToolCallExtraction:
 
     def test_extract_tool_call_from_pure_json(self):
         """Should extract tool call from pure JSON response."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         text = '{"tool": "get_accounts", "params": {}}'
         result = bot._extract_tool_call(text)
@@ -102,9 +102,9 @@ class TestToolCallExtraction:
 
     def test_extract_tool_call_from_mixed_text_and_json(self):
         """Should extract tool call when LLM prefixes with text like 'Let me check...'"""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         text = 'Let me check your balance for you. {"tool": "get_accounts", "params": {}}'
         result = bot._extract_tool_call(text)
@@ -114,9 +114,9 @@ class TestToolCallExtraction:
 
     def test_extract_tool_call_with_params(self):
         """Should extract tool call with nested params object."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         text = 'I will look that up. {"tool": "get_product", "params": {"product_id": "BTC-USD"}}'
         result = bot._extract_tool_call(text)
@@ -127,9 +127,9 @@ class TestToolCallExtraction:
 
     def test_extract_tool_call_returns_none_for_plain_text(self):
         """Should return None when no tool call is present."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         text = "Hello! How can I help you today?"
         result = bot._extract_tool_call(text)
@@ -138,9 +138,9 @@ class TestToolCallExtraction:
 
     def test_extract_tool_call_ignores_non_tool_json(self):
         """Should return None for JSON that doesn't have 'tool' key."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         text = '{"name": "John", "age": 30}'
         result = bot._extract_tool_call(text)
@@ -149,9 +149,9 @@ class TestToolCallExtraction:
 
     def test_extract_tool_call_with_text_after_json(self):
         """Should extract tool call even with text after the JSON."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         text = 'Let me check. {"tool": "get_accounts", "params": {}} I will get that for you.'
         result = bot._extract_tool_call(text)
@@ -169,9 +169,9 @@ class TestResponseContentExtraction:
 
     def test_extract_content_from_string(self):
         """Should extract content when response.content is a string."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         # String content
         content = "Hello world"
@@ -181,9 +181,9 @@ class TestResponseContentExtraction:
 
     def test_extract_content_from_list_with_text_block(self):
         """Should extract content when response.content is a list with text blocks."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         # List content (Responses API format)
         content = [{"type": "text", "text": "Hello world"}]
@@ -193,9 +193,9 @@ class TestResponseContentExtraction:
 
     def test_extract_content_from_list_with_multiple_blocks(self):
         """Should concatenate multiple text blocks."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         content = [
             {"type": "text", "text": "Hello "},
@@ -207,9 +207,9 @@ class TestResponseContentExtraction:
 
     def test_extract_content_from_empty_list(self):
         """Should return empty string for empty list."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         content = []
         result = bot._extract_content(content)
@@ -218,9 +218,9 @@ class TestResponseContentExtraction:
 
     def test_extract_content_handles_none(self):
         """Should handle None content gracefully."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         result = bot._extract_content(None)
         
@@ -237,10 +237,10 @@ class TestMessageProcessing:
     @pytest.mark.asyncio
     async def test_process_message_with_list_content_response(self, mock_mcp_server):
         """Should handle LLM response with list content (Responses API)."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         # Mock LLM that returns list content
         mock_llm = AsyncMock()
@@ -259,10 +259,10 @@ class TestMessageProcessing:
     @pytest.mark.asyncio
     async def test_process_message_with_string_content_response(self, mock_mcp_server):
         """Should handle LLM response with string content (standard format)."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         # Mock LLM that returns string content
         mock_llm = AsyncMock()
@@ -279,10 +279,10 @@ class TestMessageProcessing:
     @pytest.mark.asyncio
     async def test_process_message_plain_text_response(self, mock_mcp_server):
         """Should handle plain text responses without tool calls."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         mock_llm = AsyncMock()
         mock_llm.ainvoke.return_value = MagicMock(content="Hello! How can I help you today?")
@@ -295,11 +295,11 @@ class TestMessageProcessing:
     @pytest.mark.asyncio
     async def test_process_message_no_llm_configured(self):
         """Should return error when LLM is not configured."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         bot.llm = None
-        bot.mcp_server = MagicMock()
+        bot.coinbase_server = MagicMock()
         
         result = await bot.process_message("Hello")
         
@@ -308,11 +308,11 @@ class TestMessageProcessing:
     @pytest.mark.asyncio
     async def test_process_message_no_mcp_server_configured(self):
         """Should return error when MCP server is not configured."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         bot.llm = MagicMock()
-        bot.mcp_server = None
+        bot.coinbase_server = None
         
         result = await bot.process_message("Hello")
         
@@ -329,10 +329,10 @@ class TestToolExecution:
     @pytest.mark.asyncio
     async def test_execute_tool_success(self, mock_mcp_server):
         """Should execute tool and return result."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         result = await bot._execute_tool("get_accounts", {})
         
@@ -342,11 +342,11 @@ class TestToolExecution:
     @pytest.mark.asyncio
     async def test_execute_tool_handles_error(self, mock_mcp_server):
         """Should handle tool execution errors gracefully."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         mock_mcp_server.call_tool.side_effect = Exception("API Error")
-        bot.mcp_server = mock_mcp_server
+        bot.coinbase_server = mock_mcp_server
         
         result = await bot._execute_tool("get_accounts", {})
         
@@ -362,9 +362,9 @@ class TestConversationHistory:
 
     def test_clear_history(self):
         """Should clear conversation history."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         bot.conversation_history = [{"role": "user", "content": "test"}]
         
         bot.clear_history()
@@ -374,10 +374,10 @@ class TestConversationHistory:
     @pytest.mark.asyncio
     async def test_history_accumulates_messages(self, mock_mcp_server):
         """Should accumulate messages in conversation history."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         mock_llm = AsyncMock()
         mock_llm.ainvoke.return_value = MagicMock(content="Response 1")
@@ -398,10 +398,10 @@ class TestBalanceQueryEndToEnd:
     @pytest.mark.asyncio
     async def test_balance_query_returns_interpreted_result_not_json(self, mock_mcp_server):
         """When user asks for balance, should return friendly text, not raw JSON."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         mock_llm = AsyncMock()
         # First LLM call: decides to call get_accounts tool
@@ -425,10 +425,10 @@ class TestBalanceQueryEndToEnd:
     @pytest.mark.asyncio
     async def test_balance_query_with_mixed_llm_response_extracts_tool_call(self, mock_mcp_server):
         """When LLM responds with 'Let me check...' + JSON, should still execute tool."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         mock_llm = AsyncMock()
         # LLM returns text before the JSON (common pattern)
@@ -450,10 +450,10 @@ class TestBalanceQueryEndToEnd:
     @pytest.mark.asyncio
     async def test_balance_query_calls_mcp_server(self, mock_mcp_server):
         """Should actually call the MCP server to get real balances."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         mock_llm = AsyncMock()
         mock_llm.ainvoke.side_effect = [
@@ -472,10 +472,10 @@ class TestBalanceQueryEndToEnd:
     @pytest.mark.asyncio
     async def test_balance_query_with_responses_api_list_format(self, mock_mcp_server):
         """Should handle OpenAI Responses API format (list content) correctly."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         mock_llm = AsyncMock()
         # Responses API returns content as list of blocks
@@ -497,10 +497,10 @@ class TestBalanceQueryEndToEnd:
     @pytest.mark.asyncio
     async def test_balance_query_llm_interprets_tool_result(self, mock_mcp_server):
         """The LLM should be asked to interpret the raw tool result."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server
         
         mock_llm = AsyncMock()
         mock_llm.ainvoke.side_effect = [
@@ -556,10 +556,10 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_api_error_returns_user_friendly_message(self, mock_mcp_server_with_api_error):
         """When MCP server returns an error dict, LLM should interpret it for the user."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server_with_api_error
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server_with_api_error
         
         mock_llm = AsyncMock()
         mock_llm.ainvoke.side_effect = [
@@ -580,10 +580,10 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_api_exception_is_caught_and_interpreted(self, mock_mcp_server_raises_exception):
         """When MCP server raises CoinbaseAPIError, should catch and interpret."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
-        bot.mcp_server = mock_mcp_server_raises_exception
+        bot = TradingChatBot()
+        bot.coinbase_server = mock_mcp_server_raises_exception
         
         mock_llm = AsyncMock()
         mock_llm.ainvoke.side_effect = [
@@ -603,14 +603,14 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_error_result_passed_to_llm_for_interpretation(self):
         """Error results should be passed to LLM for interpretation, not returned raw."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         # MCP server returns error dict
         mock_server = MagicMock()
         mock_server.call_tool = AsyncMock(return_value={"error": "Some API error message"})
-        bot.mcp_server = mock_server
+        bot.coinbase_server = mock_server
         
         mock_llm = AsyncMock()
         mock_llm.ainvoke.side_effect = [
@@ -633,14 +633,14 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_generic_exception_handled_gracefully(self):
         """Generic exceptions should be handled without crashing."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         # MCP server raises generic exception
         mock_server = MagicMock()
         mock_server.call_tool = AsyncMock(side_effect=Exception("Network timeout"))
-        bot.mcp_server = mock_server
+        bot.coinbase_server = mock_server
         
         mock_llm = AsyncMock()
         mock_llm.ainvoke.side_effect = [
@@ -658,14 +658,14 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_execute_tool_returns_error_dict_on_coinbase_api_error(self):
         """_execute_tool should return error dict when CoinbaseAPIError is raised."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         from src.mcp_servers.coinbase import CoinbaseAPIError
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         mock_server = MagicMock()
         mock_server.call_tool = AsyncMock(side_effect=CoinbaseAPIError("Invalid credentials"))
-        bot.mcp_server = mock_server
+        bot.coinbase_server = mock_server
         
         result = await bot._execute_tool("get_accounts", {})
         
@@ -676,16 +676,164 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_execute_tool_returns_error_dict_on_generic_exception(self):
         """_execute_tool should return error dict when generic exception is raised."""
-        from web.app import CoinbaseChatBot
+        from web.app import TradingChatBot
         
-        bot = CoinbaseChatBot()
+        bot = TradingChatBot()
         
         mock_server = MagicMock()
         mock_server.call_tool = AsyncMock(side_effect=RuntimeError("Connection failed"))
-        bot.mcp_server = mock_server
+        bot.coinbase_server = mock_server
         
         result = await bot._execute_tool("get_accounts", {})
         
         assert isinstance(result, dict)
         assert "error" in result
         assert "Connection failed" in result["error"]
+
+
+# =============================================================================
+# Broker Switching Tests
+# =============================================================================
+
+class TestBrokerSwitching:
+    """Tests for broker switching functionality."""
+
+    @pytest.mark.asyncio
+    async def test_default_broker_is_coinbase(self):
+        """Default broker should be coinbase."""
+        from web.app import TradingChatBot
+        
+        bot = TradingChatBot()
+        
+        assert bot.active_broker == "coinbase"
+
+    @pytest.mark.asyncio
+    async def test_switch_to_schwab(self):
+        """Should switch to Schwab when requested."""
+        from web.app import TradingChatBot
+        
+        bot = TradingChatBot()
+        bot.llm = MagicMock()
+        
+        result = await bot.process_message("switch to schwab")
+        
+        assert bot.active_broker == "schwab"
+        assert "Schwab" in result
+
+    @pytest.mark.asyncio
+    async def test_switch_to_coinbase(self):
+        """Should switch to Coinbase when requested."""
+        from web.app import TradingChatBot
+        
+        bot = TradingChatBot()
+        bot.llm = MagicMock()
+        bot.active_broker = "schwab"  # Start in Schwab mode
+        
+        result = await bot.process_message("switch to coinbase")
+        
+        assert bot.active_broker == "coinbase"
+        assert "Coinbase" in result
+
+    @pytest.mark.asyncio
+    async def test_coinbase_mode_checks_coinbase_server(self):
+        """In Coinbase mode, should check coinbase_server not schwab_server."""
+        from web.app import TradingChatBot
+        
+        bot = TradingChatBot()
+        bot.llm = MagicMock()
+        bot.active_broker = "coinbase"
+        bot.coinbase_server = None
+        bot.schwab_server = MagicMock()  # Schwab is configured but shouldn't matter
+        
+        result = await bot.process_message("what's my balance?")
+        
+        # Should show Coinbase error (primary), may contain hint about Schwab
+        assert "coinbase not configured" in result.lower()
+        assert result.lower().startswith("error: coinbase")
+
+    @pytest.mark.asyncio
+    async def test_schwab_mode_checks_schwab_server(self):
+        """In Schwab mode, should check schwab_server not coinbase_server."""
+        from web.app import TradingChatBot
+        
+        bot = TradingChatBot()
+        bot.llm = MagicMock()
+        bot.active_broker = "schwab"
+        bot.schwab_server = None
+        bot.coinbase_server = MagicMock()  # Coinbase is configured but shouldn't matter
+        
+        result = await bot.process_message("what's my balance?")
+        
+        # Should show Schwab error (primary), may contain hint about Coinbase
+        assert "schwab not configured" in result.lower()
+        assert result.lower().startswith("error: schwab")
+
+    def test_clear_history_resets_broker_to_coinbase(self):
+        """Clear history should reset broker to coinbase."""
+        from web.app import TradingChatBot
+        
+        bot = TradingChatBot()
+        bot.active_broker = "schwab"
+        bot.conversation_history = [{"test": "data"}]
+        
+        bot.clear_history()
+        
+        assert bot.active_broker == "coinbase"
+        assert bot.conversation_history == []
+
+    @pytest.mark.asyncio
+    async def test_coinbase_mode_with_configured_server_proceeds(self, mock_mcp_server):
+        """In Coinbase mode with configured server, should proceed to LLM."""
+        from web.app import TradingChatBot
+        
+        bot = TradingChatBot()
+        bot.active_broker = "coinbase"
+        bot.coinbase_server = mock_mcp_server
+        
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke.return_value = MagicMock(content="Here are your balances...")
+        bot.llm = mock_llm
+        
+        result = await bot.process_message("what's my balance?")
+        
+        # Should have called the LLM (no error about server config)
+        mock_llm.ainvoke.assert_called_once()
+        assert "not configured" not in result.lower()
+
+
+# =============================================================================
+# HTML/UI Response Tests  
+# =============================================================================
+
+class TestUIResponses:
+    """Tests for UI-related response formatting."""
+
+    @pytest.mark.asyncio
+    async def test_switch_response_contains_broker_name_for_ui_update(self):
+        """Switch response should contain broker name in format UI can detect."""
+        from web.app import TradingChatBot
+        
+        bot = TradingChatBot()
+        bot.llm = MagicMock()
+        
+        # Switch to Schwab
+        result = await bot.process_message("switch to schwab")
+        
+        # Response should contain "Switched to **Schwab**" for UI detection
+        assert "switched to" in result.lower()
+        assert "schwab" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_switch_to_coinbase_response_for_ui_update(self):
+        """Switch to coinbase response should be detectable by UI."""
+        from web.app import TradingChatBot
+        
+        bot = TradingChatBot()
+        bot.llm = MagicMock()
+        bot.active_broker = "schwab"
+        
+        result = await bot.process_message("switch to coinbase")
+        
+        # Response should contain text for UI detection
+        assert "switched to" in result.lower()
+        assert "coinbase" in result.lower()

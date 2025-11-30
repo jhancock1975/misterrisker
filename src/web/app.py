@@ -1,7 +1,7 @@
-"""FastAPI web application for Coinbase trading chat interface.
+"""FastAPI web application for Mister Risker trading chat interface.
 
 This module provides a browser-based chat interface that uses an LLM
-to interpret natural language requests and execute Coinbase trades.
+to interpret natural language requests and execute trades via Coinbase and Schwab.
 """
 
 import os
@@ -24,78 +24,124 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from src.mcp_servers.coinbase import CoinbaseMCPServer, CoinbaseAPIError
+from src.mcp_servers.schwab import SchwabMCPServer, SchwabAPIError
 
 # Load environment variables
 load_dotenv()
 
 
-class CoinbaseChatBot:
-    """Chat bot that uses LLM to interact with Coinbase.
+class TradingChatBot:
+    """Chat bot that uses LLM to interact with Coinbase and Schwab.
     
     This bot interprets natural language requests and uses the
-    Coinbase MCP Server to execute trading operations.
+    MCP Servers to execute trading operations.
     """
     
     def __init__(self):
         """Initialize the chat bot."""
-        self.mcp_server: CoinbaseMCPServer | None = None
+        self.coinbase_server: CoinbaseMCPServer | None = None
+        self.schwab_server: SchwabMCPServer | None = None
         self.llm: ChatOpenAI | None = None
         self.conversation_history: list = []
+        self.active_broker: str = "coinbase"  # Default broker
         
         # System prompt for the LLM
-        self.system_prompt = """You are a helpful Coinbase trading assistant. You can help users:
-- Check their account balances
+        self.system_prompt = """You are Mister Risker, a helpful multi-broker trading assistant. You can help users trade on both Coinbase (crypto) and Schwab (stocks/options).
+
+Current active broker: {broker}
+
+You can help users:
+**Coinbase (Crypto):**
+- Check crypto account balances
 - Get current prices for cryptocurrencies
 - Place buy and sell orders (market and limit)
-- View their open orders
-- Get portfolio summaries
-- View market data and candles
+- View open orders and portfolio
+
+**Schwab (Stocks/Options):**
+- Check stock account balances and positions
+- Get stock quotes and option chains
+- Place equity and options orders
+- View transactions and market data
 
 When users ask about trading, first confirm the details before executing trades.
-For buy orders, clarify the amount in USD they want to spend.
-For sell orders, clarify the amount of crypto they want to sell.
+For buy orders, clarify the amount they want to spend or quantity.
+For sell orders, clarify the amount they want to sell.
 
-Always be helpful and explain what you're doing. If there's an error, explain it clearly.
+IMPORTANT: To switch brokers, the user can say "switch to schwab" or "switch to coinbase".
 
-Available trading pairs include: BTC-USD, ETH-USD, SOL-USD, and many others.
+When you need to call a tool, respond with a JSON object in this format:
+{{"tool": "tool_name", "params": {{"param1": "value1"}}}}
 
-IMPORTANT: When you need to call a tool, respond with a JSON object in this format:
-{"tool": "tool_name", "params": {"param1": "value1"}}
-
-Available tools:
-- get_accounts: Get all account balances (no params needed)
+**Coinbase Tools:**
+- get_accounts: Get all crypto account balances
 - get_product: Get details for a product (params: product_id like "BTC-USD")
-- get_best_bid_ask: Get current prices (params: product_ids as list like ["BTC-USD"])
-- market_order_buy: Buy crypto with USD (params: product_id, quote_size as string like "100.00")
-- market_order_sell: Sell crypto (params: product_id, base_size as string like "0.01")
-- list_orders: List orders (params: order_status as list like ["OPEN"])
-- get_portfolios: Get portfolios (no params needed)
-- get_candles: Get price history (params: product_id, start, end, granularity like "ONE_HOUR")
+- get_best_bid_ask: Get current prices (params: product_ids as list)
+- market_order_buy: Buy crypto with USD (params: product_id, quote_size)
+- market_order_sell: Sell crypto (params: product_id, base_size)
+- list_orders: List orders (params: order_status as list)
+
+**Schwab Tools:**
+- get_account_numbers: Get all Schwab account numbers
+- get_account: Get account details (params: account_hash)
+- get_accounts: Get all accounts with positions
+- get_quote: Get stock quote (params: symbol)
+- get_quotes: Get multiple quotes (params: symbols as list)
+- get_orders_for_account: Get orders (params: account_hash)
+- place_order: Place an order (params: account_hash, order)
+- get_option_chain: Get option chain (params: symbol)
+- get_movers: Get market movers (params: index like "$DJI")
+- get_market_hours: Get market hours (params: markets like "EQUITY")
 
 If you don't need to call a tool, just respond normally with text."""
 
     async def initialize(self):
-        """Initialize the MCP server and LLM."""
-        api_key = os.getenv("COINBASE_API_KEY")
-        api_secret = os.getenv("COINBASE_API_SECRET")
-        openai_api_key = os.getenv("OPENAI_API_KEY")
+        """Initialize the MCP servers and LLM."""
+        # Initialize Coinbase
+        coinbase_api_key = os.getenv("COINBASE_API_KEY")
+        coinbase_api_secret = os.getenv("COINBASE_API_SECRET")
         
-        if api_key and api_secret:
+        if coinbase_api_key and coinbase_api_secret:
             try:
-                self.mcp_server = CoinbaseMCPServer(
-                    api_key=api_key,
-                    api_secret=api_secret
+                self.coinbase_server = CoinbaseMCPServer(
+                    api_key=coinbase_api_key,
+                    api_secret=coinbase_api_secret
                 )
             except Exception as e:
                 print(f"Warning: Could not initialize Coinbase MCP Server: {e}")
         
+        # Initialize Schwab - skip if using placeholder credentials
+        schwab_api_key = os.getenv("SCHWAB_API_KEY", "")
+        schwab_app_secret = os.getenv("SCHWAB_APP_SECRET", "")
+        schwab_callback_url = os.getenv("SCHWAB_CALLBACK_URL")
+        schwab_token_path = os.getenv("SCHWAB_TOKEN_PATH")
+        
+        # Check for real credentials (not placeholders)
+        has_real_schwab_creds = (
+            schwab_api_key and 
+            schwab_app_secret and
+            "your_" not in schwab_api_key.lower() and
+            "your_" not in schwab_app_secret.lower()
+        )
+        
+        if has_real_schwab_creds:
+            try:
+                self.schwab_server = SchwabMCPServer(
+                    api_key=schwab_api_key,
+                    app_secret=schwab_app_secret,
+                    callback_url=schwab_callback_url or "https://127.0.0.1:8182/",
+                    token_path=schwab_token_path or "/tmp/schwab_token.json"
+                )
+            except Exception as e:
+                print(f"Warning: Could not initialize Schwab MCP Server: {e}")
+        
+        # Initialize LLM
+        openai_api_key = os.getenv("OPENAI_API_KEY")
         if openai_api_key:
-            # Use OpenAI Responses API for enhanced tool calling and conversation state
             self.llm = ChatOpenAI(
                 model="gpt-4o-mini",
                 temperature=0.7,
                 api_key=openai_api_key,
-                use_responses_api=True,  # Enable OpenAI Responses API
+                use_responses_api=True,
             )
         else:
             print("Warning: OPENAI_API_KEY not set. LLM features will be limited.")
@@ -112,15 +158,28 @@ If you don't need to call a tool, just respond normally with text."""
         if not self.llm:
             return "Error: LLM not configured. Please set OPENAI_API_KEY in your .env file."
         
-        if not self.mcp_server:
-            return "Error: Coinbase not configured. Please set COINBASE_API_KEY and COINBASE_API_SECRET in your .env file."
+        # Check for broker switch commands
+        lower_msg = user_message.lower()
+        if "switch to schwab" in lower_msg or "use schwab" in lower_msg:
+            self.active_broker = "schwab"
+            return "🔄 Switched to **Schwab** (stocks and options trading). How can I help you with your Schwab account?"
+        elif "switch to coinbase" in lower_msg or "use coinbase" in lower_msg:
+            self.active_broker = "coinbase"
+            return "🔄 Switched to **Coinbase** (crypto trading). How can I help you with your crypto portfolio?"
+        
+        # Check if active broker is configured
+        if self.active_broker == "coinbase" and not self.coinbase_server:
+            return "Error: Coinbase not configured. Please set COINBASE_API_KEY and COINBASE_API_SECRET in your .env file, or say 'switch to schwab'."
+        elif self.active_broker == "schwab" and not self.schwab_server:
+            return "Error: Schwab not configured. Please set SCHWAB_API_KEY, SCHWAB_APP_SECRET, SCHWAB_CALLBACK_URL, and SCHWAB_TOKEN_PATH in your .env file, or say 'switch to coinbase'."
         
         # Add user message to history
         self.conversation_history.append(HumanMessage(content=user_message))
         
-        # Build messages for LLM
+        # Build messages for LLM with current broker context
+        system_prompt = self.system_prompt.format(broker=self.active_broker.upper())
         messages = [
-            SystemMessage(content=self.system_prompt),
+            SystemMessage(content=system_prompt),
             *self.conversation_history
         ]
         
@@ -129,11 +188,11 @@ If you don't need to call a tool, just respond normally with text."""
             response = await self.llm.ainvoke(messages)
             response_text = self._extract_content(response.content)
             
-            # Check if LLM wants to call a tool - look for JSON anywhere in the response
+            # Check if LLM wants to call a tool
             tool_call = self._extract_tool_call(response_text)
             
             if tool_call:
-                # Execute the tool
+                # Execute the tool on the appropriate broker
                 tool_result = await self._execute_tool(
                     tool_call["tool"],
                     tool_call.get("params", {})
@@ -143,11 +202,12 @@ If you don't need to call a tool, just respond normally with text."""
                 self.conversation_history.append(AIMessage(content=f"Tool result: {json.dumps(tool_result, indent=2)}"))
                 
                 interpret_messages = [
-                    SystemMessage(content="""You are a helpful Coinbase trading assistant. 
+                    SystemMessage(content=f"""You are Mister Risker, a helpful trading assistant. 
 Interpret the following tool result and explain it to the user in a friendly, clear way.
-- Format currency amounts with $ signs and 2 decimal places for USD
-- Format crypto amounts with appropriate precision (e.g., 0.00123456 BTC)
-- List each account/balance on its own line
+Current broker: {self.active_broker.upper()}
+- Format currency amounts with $ signs and appropriate decimal places
+- Format crypto amounts with appropriate precision
+- List each account/balance/position on its own line
 - Highlight important information
 - Be concise but informative
 - Don't mention JSON or technical details"""),
@@ -168,7 +228,7 @@ Interpret the following tool result and explain it to the user in a friendly, cl
             return error_msg
     
     async def _execute_tool(self, tool_name: str, params: dict) -> dict:
-        """Execute a Coinbase MCP tool.
+        """Execute a tool on the active broker.
         
         Args:
             tool_name: Name of the tool to execute
@@ -178,16 +238,20 @@ Interpret the following tool result and explain it to the user in a friendly, cl
             Tool execution result
         """
         try:
-            result = await self.mcp_server.call_tool(tool_name, params)
+            if self.active_broker == "coinbase":
+                result = await self.coinbase_server.call_tool(tool_name, params)
+            else:  # schwab
+                result = await self.schwab_server.call_tool(tool_name, params)
             return result
-        except CoinbaseAPIError as e:
+        except (CoinbaseAPIError, SchwabAPIError) as e:
             return {"error": str(e)}
         except Exception as e:
             return {"error": f"Tool execution failed: {str(e)}"}
     
     def clear_history(self):
-        """Clear the conversation history."""
+        """Clear the conversation history and reset broker to default."""
         self.conversation_history = []
+        self.active_broker = "coinbase"
     
     def _extract_content(self, content) -> str:
         """Extract text content from LLM response.
@@ -280,7 +344,7 @@ Interpret the following tool result and explain it to the user in a friendly, cl
 
 
 # Global chatbot instance
-chatbot = CoinbaseChatBot()
+chatbot = TradingChatBot()
 
 
 @asynccontextmanager
@@ -292,8 +356,8 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="Coinbase Trading Assistant",
-    description="A chat interface for trading on Coinbase",
+    title="Mister Risker",
+    description="A multi-broker trading assistant for Coinbase and Schwab",
     lifespan=lifespan
 )
 
@@ -311,7 +375,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Coinbase Trading Assistant</title>
+    <title>Mister Risker</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="shortcut icon" type="image/svg+xml" href="/static/favicon.svg">
     <style>
@@ -341,22 +405,51 @@ HTML_TEMPLATE = """
         }
         
         .header {
-            background: linear-gradient(135deg, #0052ff 0%, #0039b3 100%);
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             color: white;
             padding: 20px 24px;
             display: flex;
             align-items: center;
             gap: 12px;
+            position: relative;
         }
         
-        .header svg {
-            width: 32px;
-            height: 32px;
+        .header-logo {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #00d4aa 0%, #0052ff 100%);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            font-weight: bold;
         }
         
         .header h1 {
             font-size: 1.5rem;
             font-weight: 600;
+            background: linear-gradient(135deg, #00d4aa 0%, #0052ff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .broker-indicator {
+            margin-left: auto;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .broker-coinbase {
+            background: linear-gradient(135deg, #0052ff 0%, #0039b3 100%);
+        }
+        
+        .broker-schwab {
+            background: linear-gradient(135deg, #00a0dc 0%, #006b99 100%);
         }
         
         .chat-container {
@@ -389,7 +482,7 @@ HTML_TEMPLATE = """
         }
         
         .message.user .message-content {
-            background: #0052ff;
+            background: linear-gradient(135deg, #00d4aa 0%, #0052ff 100%);
             color: white;
             border-bottom-right-radius: 4px;
         }
@@ -427,23 +520,23 @@ HTML_TEMPLATE = """
         }
         
         .input-container input:focus {
-            border-color: #0052ff;
+            border-color: #00d4aa;
         }
         
         .input-container button {
             padding: 14px 28px;
-            background: #0052ff;
+            background: linear-gradient(135deg, #00d4aa 0%, #0052ff 100%);
             color: white;
             border: none;
             border-radius: 12px;
             font-size: 1rem;
             font-weight: 600;
             cursor: pointer;
-            transition: background 0.2s;
+            transition: opacity 0.2s;
         }
         
         .input-container button:hover {
-            background: #0039b3;
+            opacity: 0.9;
         }
         
         .input-container button:disabled {
@@ -469,7 +562,7 @@ HTML_TEMPLATE = """
             display: inline-block;
             width: 8px;
             height: 8px;
-            background: #0052ff;
+            background: #00d4aa;
             border-radius: 50%;
             margin-right: 4px;
             animation: bounce 1.4s infinite ease-in-out;
@@ -505,15 +598,21 @@ HTML_TEMPLATE = """
         }
         
         .suggestion:hover {
-            background: #0052ff;
+            background: linear-gradient(135deg, #00d4aa 0%, #0052ff 100%);
             color: white;
-            border-color: #0052ff;
+            border-color: transparent;
+        }
+        
+        .suggestion.broker-switch {
+            border-color: #00d4aa;
+            color: #00d4aa;
         }
         
         .clear-btn {
             position: absolute;
-            top: 20px;
+            top: 50%;
             right: 20px;
+            transform: translateY(-50%);
             padding: 8px 16px;
             background: rgba(255,255,255,0.2);
             color: white;
@@ -526,34 +625,36 @@ HTML_TEMPLATE = """
         .clear-btn:hover {
             background: rgba(255,255,255,0.3);
         }
-        
-        .header {
-            position: relative;
-        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <svg viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <circle cx="512" cy="512" r="512" fill="white"/>
-                <path d="M512 256C371.2 256 256 371.2 256 512s115.2 256 256 256 256-115.2 256-256S652.8 256 512 256zm0 384c-70.4 0-128-57.6-128-128s57.6-128 128-128 128 57.6 128 128-57.6 128-128 128z" fill="#0052FF"/>
-            </svg>
-            <h1>Coinbase Trading Assistant</h1>
-            <button class="clear-btn" onclick="clearChat()">Clear Chat</button>
+            <div class="header-logo">M</div>
+            <h1>Mister Risker</h1>
+            <span class="broker-indicator broker-coinbase" id="brokerIndicator">Coinbase</span>
+            <button class="clear-btn" onclick="clearChat()">Clear</button>
         </div>
         
         <div class="chat-container" id="chatContainer">
             <div class="message assistant">
-                <span class="message-label">Assistant</span>
+                <span class="message-label">Mister Risker</span>
                 <div class="message-content">
-                    👋 Hello! I'm your Coinbase trading assistant. I can help you:
-                    
-• Check your account balances
-• Get current crypto prices
-• Place buy and sell orders
-• View your open orders
-• Get market data
+                    👋 Hello! I'm Mister Risker, your multi-broker trading assistant.
+
+I can help you trade on both **Coinbase** (crypto) and **Schwab** (stocks/options).
+
+**Coinbase (Currently Active):**
+• Check crypto balances and prices
+• Buy/sell Bitcoin, Ethereum, and more
+• View your crypto portfolio
+
+**Schwab:**
+• Check stock account balances
+• Get stock quotes and option chains
+• Place equity and options orders
+
+Say "switch to schwab" or "switch to coinbase" to change brokers.
 
 What would you like to do today?
                 </div>
@@ -561,11 +662,11 @@ What would you like to do today?
         </div>
         
         <div class="suggestions">
-            <span class="suggestion" onclick="sendSuggestion('What are my account balances?')">💰 My Balances</span>
-            <span class="suggestion" onclick="sendSuggestion('What is the current price of Bitcoin?')">📈 BTC Price</span>
-            <span class="suggestion" onclick="sendSuggestion('What is the current price of Ethereum?')">📊 ETH Price</span>
-            <span class="suggestion" onclick="sendSuggestion('Show my open orders')">📋 Open Orders</span>
+            <span class="suggestion" onclick="sendSuggestion('What are my account balances?')">💰 Balances</span>
+            <span class="suggestion" onclick="sendSuggestion('What is the current price of Bitcoin?')">₿ BTC Price</span>
             <span class="suggestion" onclick="sendSuggestion('Show my portfolio')">💼 Portfolio</span>
+            <span class="suggestion broker-switch" onclick="sendSuggestion('Switch to Schwab')">🔄 Switch to Schwab</span>
+            <span class="suggestion" onclick="sendSuggestion('What are the market movers today?')">📈 Market Movers</span>
         </div>
         
         <div class="input-container">
@@ -578,6 +679,23 @@ What would you like to do today?
         const chatContainer = document.getElementById('chatContainer');
         const messageInput = document.getElementById('messageInput');
         const sendBtn = document.getElementById('sendBtn');
+        const brokerIndicator = document.getElementById('brokerIndicator');
+        const brokerSwitchBtn = document.querySelector('.broker-switch');
+        
+        function updateBrokerUI(text) {
+            const lowerText = text.toLowerCase();
+            if (lowerText.includes('switched to schwab') || lowerText.includes('🔄 switched to **schwab**')) {
+                brokerIndicator.textContent = 'Schwab';
+                brokerIndicator.className = 'broker-indicator broker-schwab';
+                brokerSwitchBtn.textContent = '🔄 Switch to Coinbase';
+                brokerSwitchBtn.onclick = function() { sendSuggestion('Switch to Coinbase'); };
+            } else if (lowerText.includes('switched to coinbase') || lowerText.includes('🔄 switched to **coinbase**')) {
+                brokerIndicator.textContent = 'Coinbase';
+                brokerIndicator.className = 'broker-indicator broker-coinbase';
+                brokerSwitchBtn.textContent = '🔄 Switch to Schwab';
+                brokerSwitchBtn.onclick = function() { sendSuggestion('Switch to Schwab'); };
+            }
+        }
         
         function addMessage(content, isUser) {
             const messageDiv = document.createElement('div');
@@ -585,7 +703,7 @@ What would you like to do today?
             
             const label = document.createElement('span');
             label.className = 'message-label';
-            label.textContent = isUser ? 'You' : 'Assistant';
+            label.textContent = isUser ? 'You' : 'Mister Risker';
             
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
@@ -596,6 +714,10 @@ What would you like to do today?
             chatContainer.appendChild(messageDiv);
             
             chatContainer.scrollTop = chatContainer.scrollHeight;
+            
+            if (!isUser) {
+                updateBrokerUI(content);
+            }
         }
         
         function showTyping() {
@@ -659,17 +781,30 @@ What would you like to do today?
         async function clearChat() {
             try {
                 await fetch('/clear', { method: 'POST' });
+                brokerIndicator.textContent = 'Coinbase';
+                brokerIndicator.className = 'broker-indicator broker-coinbase';
+                // Reset broker switch button
+                brokerSwitchBtn.textContent = '🔄 Switch to Schwab';
+                brokerSwitchBtn.onclick = function() { sendSuggestion('Switch to Schwab'); };
                 chatContainer.innerHTML = `
                     <div class="message assistant">
-                        <span class="message-label">Assistant</span>
+                        <span class="message-label">Mister Risker</span>
                         <div class="message-content">
-                            👋 Hello! I'm your Coinbase trading assistant. I can help you:
-                            
-• Check your account balances
-• Get current crypto prices
-• Place buy and sell orders
-• View your open orders
-• Get market data
+                    👋 Hello! I'm Mister Risker, your multi-broker trading assistant.
+
+I can help you trade on both **Coinbase** (crypto) and **Schwab** (stocks/options).
+
+**Coinbase (Currently Active):**
+• Check crypto balances and prices
+• Buy/sell Bitcoin, Ethereum, and more
+• View your crypto portfolio
+
+**Schwab:**
+• Check stock account balances
+• Get stock quotes and option chains
+• Place equity and options orders
+
+Say "switch to schwab" or "switch to coinbase" to change brokers.
 
 What would you like to do today?
                         </div>

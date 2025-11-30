@@ -260,32 +260,107 @@ class TestCoinbaseMCPServerInitialization:
         """Server should initialize with API credentials."""
         from mcp_servers.coinbase.server import CoinbaseMCPServer
         
+        # Use a secret with PEM headers so it won't be wrapped
+        pem_secret = "-----BEGIN EC PRIVATE KEY-----\ntest-secret\n-----END EC PRIVATE KEY-----"
+        
         with patch('mcp_servers.coinbase.server.RESTClient') as MockClient:
             server = CoinbaseMCPServer(
                 api_key="test-key",
-                api_secret="test-secret"
+                api_secret=pem_secret
             )
             
             assert server is not None
             MockClient.assert_called_once_with(
                 api_key="test-key",
-                api_secret="test-secret"
+                api_secret=pem_secret
+            )
+
+    def test_server_converts_escaped_newlines_in_secret(self):
+        """Server should convert escaped \\n to actual newlines in PEM secret."""
+        from mcp_servers.coinbase.server import CoinbaseMCPServer
+        
+        # Simulate a PEM key stored in .env with escaped newlines (already has headers)
+        escaped_secret = "-----BEGIN EC PRIVATE KEY-----\\nMHQC...\\n-----END EC PRIVATE KEY-----"
+        expected_secret = "-----BEGIN EC PRIVATE KEY-----\nMHQC...\n-----END EC PRIVATE KEY-----"
+        
+        with patch('mcp_servers.coinbase.server.RESTClient') as MockClient:
+            server = CoinbaseMCPServer(
+                api_key="test-key",
+                api_secret=escaped_secret
+            )
+            
+            # Verify the secret was converted before passing to RESTClient
+            MockClient.assert_called_once_with(
+                api_key="test-key",
+                api_secret=expected_secret
+            )
+            # Also check the stored secret
+            assert server.api_secret == expected_secret
+
+    def test_server_wraps_raw_base64_secret_with_pem_headers(self):
+        """Server should add PEM headers if secret is raw base64 without headers."""
+        from mcp_servers.coinbase.server import CoinbaseMCPServer
+        
+        # Simulate a secret without PEM headers (just the base64 content)
+        raw_secret = "MHcCAQEEIOBmgaQitNbAopUt4oLHgiLdNkuOJzYyWyufxRgn4KX5oAoGCCqGSM49\\nAwEHoUQDQgAEt+HpfUtLba9Q4/fIaX1oirOQVsiZRtiKuzVmfaIAksbE57wmnEAg"
+        expected_secret = (
+            "-----BEGIN EC PRIVATE KEY-----\n"
+            "MHcCAQEEIOBmgaQitNbAopUt4oLHgiLdNkuOJzYyWyufxRgn4KX5oAoGCCqGSM49\n"
+            "AwEHoUQDQgAEt+HpfUtLba9Q4/fIaX1oirOQVsiZRtiKuzVmfaIAksbE57wmnEAg\n"
+            "-----END EC PRIVATE KEY-----"
+        )
+        
+        with patch('mcp_servers.coinbase.server.RESTClient') as MockClient:
+            server = CoinbaseMCPServer(
+                api_key="test-key",
+                api_secret=raw_secret
+            )
+            
+            # Verify PEM headers were added
+            MockClient.assert_called_once()
+            call_args = MockClient.call_args
+            actual_secret = call_args.kwargs.get('api_secret') or call_args[1].get('api_secret')
+            
+            assert actual_secret.startswith("-----BEGIN EC PRIVATE KEY-----")
+            assert actual_secret.endswith("-----END EC PRIVATE KEY-----")
+            assert "MHcCAQEEIOBmgaQitNbAopUt4oLHgiLdNkuOJzYyWyufxRgn4KX5" in actual_secret
+
+    def test_server_handles_secret_with_real_newlines(self):
+        """Server should handle secrets that already have real newlines."""
+        from mcp_servers.coinbase.server import CoinbaseMCPServer
+        
+        # Secret already has real newlines (e.g., from a file)
+        real_newline_secret = "-----BEGIN EC PRIVATE KEY-----\nMHQC...\n-----END EC PRIVATE KEY-----"
+        
+        with patch('mcp_servers.coinbase.server.RESTClient') as MockClient:
+            server = CoinbaseMCPServer(
+                api_key="test-key",
+                api_secret=real_newline_secret
+            )
+            
+            # Should pass through unchanged
+            MockClient.assert_called_once_with(
+                api_key="test-key",
+                api_secret=real_newline_secret
             )
 
     def test_server_initializes_from_env(self):
         """Server should initialize from environment variables."""
         from mcp_servers.coinbase.server import CoinbaseMCPServer
         
+        # Use a secret with PEM headers so it won't be wrapped
+        pem_secret = "-----BEGIN EC PRIVATE KEY-----\nenv-secret\n-----END EC PRIVATE KEY-----"
+        
         with patch.dict(os.environ, {
             "COINBASE_API_KEY": "env-key",
-            "COINBASE_API_SECRET": "env-secret"
+            "COINBASE_API_SECRET": pem_secret
         }):
             with patch('mcp_servers.coinbase.server.RESTClient') as MockClient:
                 server = CoinbaseMCPServer.from_env()
                 
                 MockClient.assert_called_once_with(
                     api_key="env-key",
-                    api_secret="env-secret"
+                    api_secret=pem_secret
                 )
 
     def test_server_raises_error_without_credentials(self):
@@ -459,31 +534,68 @@ class TestOrderTools:
     """Tests for order-related MCP tools."""
 
     @pytest.mark.asyncio
-    async def test_market_order_buy(self, coinbase_server, mock_coinbase_client):
-        """market_order_buy should place a market buy order."""
+    async def test_market_order_buy_generates_client_order_id(self, coinbase_server, mock_coinbase_client):
+        """market_order_buy should auto-generate client_order_id if not provided."""
         result = await coinbase_server.call_tool("market_order_buy", {
             "product_id": "BTC-USD",
             "quote_size": "100.00"
         })
         
         mock_coinbase_client.market_order_buy.assert_called_once()
+        call_kwargs = mock_coinbase_client.market_order_buy.call_args.kwargs
+        assert "client_order_id" in call_kwargs
+        assert call_kwargs["client_order_id"] is not None
+        assert len(call_kwargs["client_order_id"]) == 36  # UUID format
         assert result["success"] is True
         assert "order_id" in result
 
     @pytest.mark.asyncio
-    async def test_market_order_sell(self, coinbase_server, mock_coinbase_client):
-        """market_order_sell should place a market sell order."""
+    async def test_market_order_buy_uses_provided_client_order_id(self, coinbase_server, mock_coinbase_client):
+        """market_order_buy should use provided client_order_id."""
+        custom_id = "my-custom-order-123"
+        result = await coinbase_server.call_tool("market_order_buy", {
+            "product_id": "BTC-USD",
+            "quote_size": "100.00",
+            "client_order_id": custom_id
+        })
+        
+        mock_coinbase_client.market_order_buy.assert_called_once()
+        call_kwargs = mock_coinbase_client.market_order_buy.call_args.kwargs
+        assert call_kwargs["client_order_id"] == custom_id
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_market_order_sell_generates_client_order_id(self, coinbase_server, mock_coinbase_client):
+        """market_order_sell should auto-generate client_order_id if not provided."""
         result = await coinbase_server.call_tool("market_order_sell", {
             "product_id": "BTC-USD",
             "base_size": "0.01"
         })
         
         mock_coinbase_client.market_order_sell.assert_called_once()
+        call_kwargs = mock_coinbase_client.market_order_sell.call_args.kwargs
+        assert "client_order_id" in call_kwargs
+        assert call_kwargs["client_order_id"] is not None
+        assert len(call_kwargs["client_order_id"]) == 36  # UUID format
         assert result["success"] is True
 
     @pytest.mark.asyncio
-    async def test_limit_order_gtc_buy(self, coinbase_server, mock_coinbase_client):
-        """limit_order_gtc_buy should place a GTC limit buy order."""
+    async def test_market_order_sell_uses_provided_client_order_id(self, coinbase_server, mock_coinbase_client):
+        """market_order_sell should use provided client_order_id."""
+        custom_id = "my-sell-order-456"
+        result = await coinbase_server.call_tool("market_order_sell", {
+            "product_id": "BTC-USD",
+            "base_size": "0.01",
+            "client_order_id": custom_id
+        })
+        
+        mock_coinbase_client.market_order_sell.assert_called_once()
+        call_kwargs = mock_coinbase_client.market_order_sell.call_args.kwargs
+        assert call_kwargs["client_order_id"] == custom_id
+
+    @pytest.mark.asyncio
+    async def test_limit_order_gtc_buy_generates_client_order_id(self, coinbase_server, mock_coinbase_client):
+        """limit_order_gtc_buy should auto-generate client_order_id if not provided."""
         result = await coinbase_server.call_tool("limit_order_gtc_buy", {
             "product_id": "BTC-USD",
             "base_size": "0.01",
@@ -491,11 +603,30 @@ class TestOrderTools:
         })
         
         mock_coinbase_client.limit_order_gtc_buy.assert_called_once()
+        call_kwargs = mock_coinbase_client.limit_order_gtc_buy.call_args.kwargs
+        assert "client_order_id" in call_kwargs
+        assert call_kwargs["client_order_id"] is not None
+        assert len(call_kwargs["client_order_id"]) == 36  # UUID format
         assert result["success"] is True
 
     @pytest.mark.asyncio
-    async def test_limit_order_gtc_sell(self, coinbase_server, mock_coinbase_client):
-        """limit_order_gtc_sell should place a GTC limit sell order."""
+    async def test_limit_order_gtc_buy_uses_provided_client_order_id(self, coinbase_server, mock_coinbase_client):
+        """limit_order_gtc_buy should use provided client_order_id."""
+        custom_id = "limit-buy-789"
+        result = await coinbase_server.call_tool("limit_order_gtc_buy", {
+            "product_id": "BTC-USD",
+            "base_size": "0.01",
+            "limit_price": "40000.00",
+            "client_order_id": custom_id
+        })
+        
+        mock_coinbase_client.limit_order_gtc_buy.assert_called_once()
+        call_kwargs = mock_coinbase_client.limit_order_gtc_buy.call_args.kwargs
+        assert call_kwargs["client_order_id"] == custom_id
+
+    @pytest.mark.asyncio
+    async def test_limit_order_gtc_sell_generates_client_order_id(self, coinbase_server, mock_coinbase_client):
+        """limit_order_gtc_sell should auto-generate client_order_id if not provided."""
         result = await coinbase_server.call_tool("limit_order_gtc_sell", {
             "product_id": "BTC-USD",
             "base_size": "0.01",
@@ -503,7 +634,26 @@ class TestOrderTools:
         })
         
         mock_coinbase_client.limit_order_gtc_sell.assert_called_once()
+        call_kwargs = mock_coinbase_client.limit_order_gtc_sell.call_args.kwargs
+        assert "client_order_id" in call_kwargs
+        assert call_kwargs["client_order_id"] is not None
+        assert len(call_kwargs["client_order_id"]) == 36  # UUID format
         assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_limit_order_gtc_sell_uses_provided_client_order_id(self, coinbase_server, mock_coinbase_client):
+        """limit_order_gtc_sell should use provided client_order_id."""
+        custom_id = "limit-sell-xyz"
+        result = await coinbase_server.call_tool("limit_order_gtc_sell", {
+            "product_id": "BTC-USD",
+            "base_size": "0.01",
+            "limit_price": "50000.00",
+            "client_order_id": custom_id
+        })
+        
+        mock_coinbase_client.limit_order_gtc_sell.assert_called_once()
+        call_kwargs = mock_coinbase_client.limit_order_gtc_sell.call_args.kwargs
+        assert call_kwargs["client_order_id"] == custom_id
 
     @pytest.mark.asyncio
     async def test_cancel_orders(self, coinbase_server, mock_coinbase_client):
@@ -622,6 +772,114 @@ class TestFeeTools:
         
         mock_coinbase_client.get_transaction_summary.assert_called_once()
         assert "fee_tier" in result
+
+
+# =============================================================================
+# Client Order ID Tests
+# =============================================================================
+
+class TestClientOrderIdRequired:
+    """Tests verifying client_order_id is properly handled for all order types.
+    
+    The Coinbase API requires a client_order_id for all orders. These tests
+    verify our MCP server properly generates or passes through client_order_id.
+    """
+
+    @pytest.fixture
+    def strict_mock_coinbase_client(self):
+        """Create a mock client that validates client_order_id is provided."""
+        client = MagicMock()
+        
+        def validate_client_order_id(**kwargs):
+            """Validate that client_order_id is provided and valid."""
+            if "client_order_id" not in kwargs:
+                raise TypeError("market_order_buy() missing required argument: 'client_order_id'")
+            if not kwargs["client_order_id"]:
+                raise ValueError("client_order_id cannot be empty")
+            return {
+                "success": True,
+                "order_id": "test-order-123",
+                "client_order_id": kwargs["client_order_id"]
+            }
+        
+        client.market_order_buy.side_effect = validate_client_order_id
+        client.market_order_sell.side_effect = validate_client_order_id
+        client.limit_order_gtc_buy.side_effect = validate_client_order_id
+        client.limit_order_gtc_sell.side_effect = validate_client_order_id
+        
+        return client
+
+    @pytest.fixture
+    def strict_coinbase_server(self, strict_mock_coinbase_client):
+        """Create a server with the strict mock client."""
+        from mcp_servers.coinbase.server import CoinbaseMCPServer
+        
+        with patch('mcp_servers.coinbase.server.RESTClient', return_value=strict_mock_coinbase_client):
+            pem_secret = "-----BEGIN EC PRIVATE KEY-----\ntest\n-----END EC PRIVATE KEY-----"
+            server = CoinbaseMCPServer(api_key="test-key", api_secret=pem_secret)
+            yield server
+
+    @pytest.mark.asyncio
+    async def test_market_order_buy_must_have_client_order_id(self, strict_coinbase_server, strict_mock_coinbase_client):
+        """Verify market_order_buy passes client_order_id to API (required by Coinbase)."""
+        result = await strict_coinbase_server.call_tool("market_order_buy", {
+            "product_id": "BTC-USD",
+            "quote_size": "100.00"
+        })
+        
+        # If we got here without error, client_order_id was properly passed
+        assert result["success"] is True
+        assert "client_order_id" in result
+        assert len(result["client_order_id"]) == 36  # UUID format
+
+    @pytest.mark.asyncio
+    async def test_market_order_sell_must_have_client_order_id(self, strict_coinbase_server, strict_mock_coinbase_client):
+        """Verify market_order_sell passes client_order_id to API (required by Coinbase)."""
+        result = await strict_coinbase_server.call_tool("market_order_sell", {
+            "product_id": "BTC-USD",
+            "base_size": "0.01"
+        })
+        
+        assert result["success"] is True
+        assert "client_order_id" in result
+
+    @pytest.mark.asyncio
+    async def test_limit_order_gtc_buy_must_have_client_order_id(self, strict_coinbase_server, strict_mock_coinbase_client):
+        """Verify limit_order_gtc_buy passes client_order_id to API (required by Coinbase)."""
+        result = await strict_coinbase_server.call_tool("limit_order_gtc_buy", {
+            "product_id": "BTC-USD",
+            "base_size": "0.01",
+            "limit_price": "40000.00"
+        })
+        
+        assert result["success"] is True
+        assert "client_order_id" in result
+
+    @pytest.mark.asyncio
+    async def test_limit_order_gtc_sell_must_have_client_order_id(self, strict_coinbase_server, strict_mock_coinbase_client):
+        """Verify limit_order_gtc_sell passes client_order_id to API (required by Coinbase)."""
+        result = await strict_coinbase_server.call_tool("limit_order_gtc_sell", {
+            "product_id": "BTC-USD",
+            "base_size": "0.01",
+            "limit_price": "50000.00"
+        })
+        
+        assert result["success"] is True
+        assert "client_order_id" in result
+
+    @pytest.mark.asyncio
+    async def test_each_order_gets_unique_client_order_id(self, strict_coinbase_server, strict_mock_coinbase_client):
+        """Each order should get a unique client_order_id."""
+        result1 = await strict_coinbase_server.call_tool("market_order_buy", {
+            "product_id": "BTC-USD",
+            "quote_size": "100.00"
+        })
+        result2 = await strict_coinbase_server.call_tool("market_order_buy", {
+            "product_id": "BTC-USD",
+            "quote_size": "100.00"
+        })
+        
+        assert result1["client_order_id"] != result2["client_order_id"]
 
 
 # =============================================================================

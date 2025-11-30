@@ -7,6 +7,7 @@ that can be used by AI agents.
 
 import asyncio
 import os
+import uuid
 from typing import Any
 from collections.abc import Callable
 
@@ -59,10 +60,24 @@ class CoinbaseMCPServer:
         
         Args:
             api_key: Coinbase API key
-            api_secret: Coinbase API secret
+            api_secret: Coinbase API secret (PEM format - can contain escaped newlines,
+                       or raw base64 without PEM headers)
         """
         self.api_key = api_key
-        self.api_secret = api_secret
+        # Convert escaped newlines to actual newlines for PEM format
+        # This handles secrets stored in .env files with literal \n
+        processed_secret = api_secret.replace("\\n", "\n")
+        
+        # If the secret doesn't have PEM headers, wrap it
+        # Coinbase CDP keys are EC (ECDSA) private keys
+        if not processed_secret.strip().startswith("-----BEGIN"):
+            processed_secret = (
+                "-----BEGIN EC PRIVATE KEY-----\n"
+                + processed_secret.strip()
+                + "\n-----END EC PRIVATE KEY-----"
+            )
+        
+        self.api_secret = processed_secret
         
         # Initialize REST client
         self._client = RESTClient(
@@ -225,7 +240,8 @@ class CoinbaseMCPServer:
                     "type": "object",
                     "properties": {
                         "product_id": {"type": "string", "description": "The product ID (e.g., 'BTC-USD')"},
-                        "quote_size": {"type": "string", "description": "Amount in quote currency (e.g., USD)"}
+                        "quote_size": {"type": "string", "description": "Amount in quote currency (e.g., USD)"},
+                        "client_order_id": {"type": "string", "description": "Unique client order ID (auto-generated if not provided)"}
                     },
                     "required": ["product_id", "quote_size"]
                 }
@@ -237,7 +253,8 @@ class CoinbaseMCPServer:
                     "type": "object",
                     "properties": {
                         "product_id": {"type": "string", "description": "The product ID (e.g., 'BTC-USD')"},
-                        "base_size": {"type": "string", "description": "Amount in base currency (e.g., BTC)"}
+                        "base_size": {"type": "string", "description": "Amount in base currency (e.g., BTC)"},
+                        "client_order_id": {"type": "string", "description": "Unique client order ID (auto-generated if not provided)"}
                     },
                     "required": ["product_id", "base_size"]
                 }
@@ -250,7 +267,8 @@ class CoinbaseMCPServer:
                     "properties": {
                         "product_id": {"type": "string", "description": "The product ID"},
                         "base_size": {"type": "string", "description": "Amount in base currency"},
-                        "limit_price": {"type": "string", "description": "Limit price"}
+                        "limit_price": {"type": "string", "description": "Limit price"},
+                        "client_order_id": {"type": "string", "description": "Unique client order ID (auto-generated if not provided)"}
                     },
                     "required": ["product_id", "base_size", "limit_price"]
                 }
@@ -263,7 +281,8 @@ class CoinbaseMCPServer:
                     "properties": {
                         "product_id": {"type": "string", "description": "The product ID"},
                         "base_size": {"type": "string", "description": "Amount in base currency"},
-                        "limit_price": {"type": "string", "description": "Limit price"}
+                        "limit_price": {"type": "string", "description": "Limit price"},
+                        "client_order_id": {"type": "string", "description": "Unique client order ID (auto-generated if not provided)"}
                     },
                     "required": ["product_id", "base_size", "limit_price"]
                 }
@@ -496,10 +515,20 @@ class CoinbaseMCPServer:
             kwargs["limit"] = params["limit"]
         return self._process_response(self._client.get_market_trades(**kwargs))
     
+    def _generate_client_order_id(self) -> str:
+        """Generate a unique client order ID.
+        
+        Returns:
+            A UUID string for use as client_order_id
+        """
+        return str(uuid.uuid4())
+    
     async def _tool_market_order_buy(self, params: dict) -> dict:
         """Handle market_order_buy tool call."""
+        client_order_id = params.get("client_order_id") or self._generate_client_order_id()
         return self._process_response(
             self._client.market_order_buy(
+                client_order_id=client_order_id,
                 product_id=params["product_id"],
                 quote_size=params["quote_size"]
             )
@@ -507,8 +536,10 @@ class CoinbaseMCPServer:
     
     async def _tool_market_order_sell(self, params: dict) -> dict:
         """Handle market_order_sell tool call."""
+        client_order_id = params.get("client_order_id") or self._generate_client_order_id()
         return self._process_response(
             self._client.market_order_sell(
+                client_order_id=client_order_id,
                 product_id=params["product_id"],
                 base_size=params["base_size"]
             )
@@ -516,8 +547,10 @@ class CoinbaseMCPServer:
     
     async def _tool_limit_order_gtc_buy(self, params: dict) -> dict:
         """Handle limit_order_gtc_buy tool call."""
+        client_order_id = params.get("client_order_id") or self._generate_client_order_id()
         return self._process_response(
             self._client.limit_order_gtc_buy(
+                client_order_id=client_order_id,
                 product_id=params["product_id"],
                 base_size=params["base_size"],
                 limit_price=params["limit_price"]
@@ -526,8 +559,10 @@ class CoinbaseMCPServer:
     
     async def _tool_limit_order_gtc_sell(self, params: dict) -> dict:
         """Handle limit_order_gtc_sell tool call."""
+        client_order_id = params.get("client_order_id") or self._generate_client_order_id()
         return self._process_response(
             self._client.limit_order_gtc_sell(
+                client_order_id=client_order_id,
                 product_id=params["product_id"],
                 base_size=params["base_size"],
                 limit_price=params["limit_price"]
