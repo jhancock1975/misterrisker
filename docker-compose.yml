@@ -1,0 +1,27 @@
+services:
+  misterrisker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: misterrisker
+    environment:
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}
+      - SLACK_TIMEOUT=${SLACK_TIMEOUT:-30}
+    env_file:
+      - .env
+    stdin_open: true
+    tty: true
+    # For interactive mode, run with: docker compose run --rm misterrisker --interactive
+    # For single message: docker compose run --rm misterrisker "Your message here"
+
+  # Test runner service
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: misterrisker-test
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./src:/app/src:ro
+    command: pytest tests/ -v
