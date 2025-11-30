@@ -109,27 +109,27 @@ If you don't need to call a tool, just respond normally with text."""
             except Exception as e:
                 print(f"Warning: Could not initialize Coinbase MCP Server: {e}")
         
-        # Initialize Schwab - skip if using placeholder credentials
-        schwab_api_key = os.getenv("SCHWAB_API_KEY", "")
-        schwab_app_secret = os.getenv("SCHWAB_APP_SECRET", "")
-        schwab_callback_url = os.getenv("SCHWAB_CALLBACK_URL")
-        schwab_token_path = os.getenv("SCHWAB_TOKEN_PATH")
+        # Initialize Schwab - using new env var names with refresh token auth
+        schwab_client_id = os.getenv("SCHWAB_CLIENT_ID", "")
+        schwab_client_secret = os.getenv("SCHWAB_CLIENT_SECRET", "")
+        schwab_refresh_token = os.getenv("SCHWAB_REFRESH_TOKEN", "")
         
         # Check for real credentials (not placeholders)
         has_real_schwab_creds = (
-            schwab_api_key and 
-            schwab_app_secret and
-            "your_" not in schwab_api_key.lower() and
-            "your_" not in schwab_app_secret.lower()
+            schwab_client_id and 
+            schwab_client_secret and
+            schwab_refresh_token and
+            "your_" not in schwab_client_id.lower() and
+            "your_" not in schwab_client_secret.lower() and
+            "your_" not in schwab_refresh_token.lower()
         )
         
         if has_real_schwab_creds:
             try:
                 self.schwab_server = SchwabMCPServer(
-                    api_key=schwab_api_key,
-                    app_secret=schwab_app_secret,
-                    callback_url=schwab_callback_url or "https://127.0.0.1:8182/",
-                    token_path=schwab_token_path or "/tmp/schwab_token.json"
+                    client_id=schwab_client_id,
+                    client_secret=schwab_client_secret,
+                    refresh_token=schwab_refresh_token
                 )
             except Exception as e:
                 print(f"Warning: Could not initialize Schwab MCP Server: {e}")
@@ -171,7 +171,7 @@ If you don't need to call a tool, just respond normally with text."""
         if self.active_broker == "coinbase" and not self.coinbase_server:
             return "Error: Coinbase not configured. Please set COINBASE_API_KEY and COINBASE_API_SECRET in your .env file, or say 'switch to schwab'."
         elif self.active_broker == "schwab" and not self.schwab_server:
-            return "Error: Schwab not configured. Please set SCHWAB_API_KEY, SCHWAB_APP_SECRET, SCHWAB_CALLBACK_URL, and SCHWAB_TOKEN_PATH in your .env file, or say 'switch to coinbase'."
+            return "Error: Schwab not configured. Please set SCHWAB_CLIENT_ID, SCHWAB_CLIENT_SECRET, and SCHWAB_REFRESH_TOKEN in your .env file, or say 'switch to coinbase'."
         
         # Add user message to history
         self.conversation_history.append(HumanMessage(content=user_message))
