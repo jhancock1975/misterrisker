@@ -1,0 +1,18 @@
+# commands
+restart the server
+
+#+begin_src bash
+  docker-compose down && docker-compose up --build -d
+#+end_src
+
+run all the tests
+#+begin_src bash
+  pytest tests/ -v
+#+end_src
+
+# resources
+Schwab  accounts and trading productio API documentation:
+https://developer.schwab.com/products/trader-api--individual/details/specifications/Retail%20Trader%20API%20Production
+
+Schwab market data production:
+https://developer.schwab.com/products/trader-api--individual/details/specifications/Market%20Data%20Production
