@@ -1,0 +1,95 @@
+# Emacs backup files
+\#*\#
+*~
+.#*
+
+# Emacs auto-save files
+*.~undo-tree~
+
+# Emacs directory-local variables
+.dir-locals.el
+
+# Vi/Vim backup files
+*.swp
+*.swo
+*.swn
+*~
+.*.swp
+.*.swo
+
+# IDE files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+*.iml
+.metadata/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Python virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# Python testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# pyenv
+.python-version
+
+# Environment files
+.env
+.env.*
+.env.local
+.env.development
+.env.test
+.env.production
+*.env
+env.local
+.envrc

@@ -16,3 +16,9 @@ https://developer.schwab.com/products/trader-api--individual/details/specificati
 
 Schwab market data production:
 https://developer.schwab.com/products/trader-api--individual/details/specifications/Market%20Data%20Production
+
+# prompts
+created schwab-api.md with the prompt
+#+begin_quote
+ok, now tak this repo https://github.com/alexgolec/schwab-py process all the files in it and create ~/git/misterrisker/resources/schwab-api.md markdown file of documentation for the schwab api.  make sure to be comprehensive. Don't make some high-level short summary of the files in the repo, dig through the files, find the meaty information, and put it in the markdown file.  Make sure you capture all the information about the schwab api from the repository.
+#+end_quote
