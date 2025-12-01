@@ -635,6 +635,18 @@ wheels = [
 ]
 
 [[package]]
+name = "finnhub-python"
+version = "2.4.25"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cd/13/a5bffb4488b2546ba96669f174e15658e8bba81c4a7124f4439d7f7848cd/finnhub_python-2.4.25.tar.gz", hash = "sha256:b6a73e7cf8fc0859430c647a0c7c9487b036be33c77ecb019ecc422227204083", size = 13577, upload-time = "2025-09-26T08:25:35.895Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/18/fb/de45db2c053fc8430b299fd0042a357b5cd7ce21cd586b77c970f2949104/finnhub_python-2.4.25-py3-none-any.whl", hash = "sha256:00da4249ddf598188da9e0ae5f561e3db922cf8a9073d406792b0917cbe99b87", size = 11985, upload-time = "2025-09-26T08:25:34.817Z" },
+]
+
+[[package]]
 name = "frozenlist"
 version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1212,6 +1224,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "coinbase-advanced-py" },
     { name = "fastapi" },
+    { name = "finnhub-python" },
     { name = "langchain-core" },
     { name = "langchain-openai" },
     { name = "langgraph" },
@@ -1245,6 +1258,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "coinbase-advanced-py", specifier = ">=1.0.0" },
     { name = "fastapi", specifier = ">=0.109.0" },
+    { name = "finnhub-python", specifier = ">=2.4.25" },
     { name = "langchain-core", specifier = ">=0.3.0" },
     { name = "langchain-openai", specifier = ">=0.3.9" },
     { name = "langgraph", specifier = ">=0.2.0" },
