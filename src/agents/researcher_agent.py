@@ -13,6 +13,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 
 from src.mcp_servers.researcher import ResearcherMCPServer, ResearcherAPIError
+from src.agents.chain_of_thought import ChainOfThought, ReasoningType
 
 
 class ResearcherAgentError(Exception):
@@ -48,6 +49,7 @@ class ResearcherAgentState(TypedDict, total=False):
         context: Conversation context for follow-ups
         history: History of workflow steps
         status: Current status (success/error)
+        reasoning_steps: Chain of thought reasoning steps
     """
     messages: list[dict[str, Any]]
     query: str
@@ -58,6 +60,7 @@ class ResearcherAgentState(TypedDict, total=False):
     context: dict[str, Any]
     history: list[dict[str, Any]]
     status: str
+    reasoning_steps: list[str]
 
 
 class ResearcherAgent:
@@ -69,6 +72,8 @@ class ResearcherAgent:
     Attributes:
         researcher_server: The Researcher MCP Server instance
         llm: Language model for reasoning
+        enable_chain_of_thought: Whether CoT reasoning is enabled
+        chain_of_thought: ChainOfThought instance for structured reasoning
         _workflow: The compiled LangGraph workflow
     """
     
@@ -77,7 +82,8 @@ class ResearcherAgent:
         researcher_server: ResearcherMCPServer | None = None,
         llm: Any | None = None,
         finnhub_api_key: str | None = None,
-        openai_api_key: str | None = None
+        openai_api_key: str | None = None,
+        enable_chain_of_thought: bool = False
     ):
         """Initialize the Researcher Agent.
         
@@ -86,6 +92,7 @@ class ResearcherAgent:
             llm: Language model instance for reasoning (optional)
             finnhub_api_key: Finnhub API key (optional if server provided)
             openai_api_key: OpenAI API key (optional if server provided)
+            enable_chain_of_thought: Whether to enable CoT reasoning
         """
         if researcher_server is not None:
             self.researcher_server = researcher_server
@@ -96,6 +103,8 @@ class ResearcherAgent:
             )
         
         self.llm = llm
+        self.enable_chain_of_thought = enable_chain_of_thought
+        self.chain_of_thought = ChainOfThought() if enable_chain_of_thought else None
         self._workflow = self._build_workflow()
     
     def get_tools(self) -> list[dict[str, Any]]:
@@ -447,6 +456,10 @@ class ResearcherAgent:
         research_data = state.get("research_data", {})
         query = state.get("query", "")
         
+        # Apply chain of thought if enabled
+        if self.enable_chain_of_thought and self.chain_of_thought:
+            state = self._apply_chain_of_thought(state)
+        
         # If we have an LLM, use it to generate a response
         if self.llm:
             try:
@@ -486,6 +499,15 @@ class ResearcherAgent:
         Returns:
             Prompt string
         """
+        # Use CoT prompt if enabled
+        if self.enable_chain_of_thought and self.chain_of_thought:
+            reasoning_type = self.chain_of_thought.detect_reasoning_type(query)
+            return self.chain_of_thought.get_reasoning_prompt(
+                query=query,
+                data=research_data,
+                reasoning_type=reasoning_type
+            )
+        
         return f"""Based on the following research data, answer the user's question.
 
 User Question: {query}
@@ -497,6 +519,54 @@ Please provide a clear, helpful response that addresses the user's question.
 Include relevant data points and be specific with numbers when available.
 If the user is asking for investment advice, provide analysis but remind them
 that this is not financial advice and they should consult a professional."""
+    
+    def _apply_chain_of_thought(self, state: ResearcherAgentState) -> ResearcherAgentState:
+        """Apply chain of thought reasoning to generate structured response.
+        
+        Args:
+            state: Current workflow state
+        
+        Returns:
+            Updated state with reasoning steps
+        """
+        if not self.chain_of_thought or not self.llm:
+            return state
+        
+        query = state.get("query", "")
+        research_data = state.get("research_data", {})
+        
+        # Detect reasoning type
+        reasoning_type = self.chain_of_thought.detect_reasoning_type(query)
+        
+        # Generate CoT prompt
+        prompt = self.chain_of_thought.get_reasoning_prompt(
+            query=query,
+            data=research_data,
+            reasoning_type=reasoning_type
+        )
+        
+        try:
+            # Get LLM response
+            response = self.llm.invoke(prompt)
+            response_text = response.content if hasattr(response, "content") else str(response)
+            
+            # Parse the response
+            parsed = self.chain_of_thought.parse_response(response_text)
+            
+            # Update state with reasoning
+            state["reasoning_steps"] = parsed.get("reasoning_steps", [])
+            
+            # Include reasoning in history
+            state["history"].append({
+                "step": "chain_of_thought",
+                "reasoning_type": reasoning_type.value,
+                "steps_count": len(state["reasoning_steps"])
+            })
+        except Exception:
+            # If CoT fails, continue without it
+            state["reasoning_steps"] = []
+        
+        return state
     
     def _generate_fallback_response(self, research_data: dict) -> str:
         """Generate a fallback response without LLM.

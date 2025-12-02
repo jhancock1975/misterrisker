@@ -13,6 +13,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 
 from src.mcp_servers.coinbase import CoinbaseMCPServer, CoinbaseAPIError
+from src.agents.chain_of_thought import ChainOfThought, ReasoningType
 
 
 class CoinbaseAgentError(Exception):
@@ -45,6 +46,7 @@ class CoinbaseAgentState(TypedDict, total=False):
         current_task: Current task being executed
         portfolio_balance: Current portfolio balance
         positions: Dictionary of currency positions
+        reasoning_steps: Chain of thought reasoning steps
     """
     messages: list[dict[str, Any]]
     tool_calls: list[dict[str, Any]]
@@ -52,6 +54,7 @@ class CoinbaseAgentState(TypedDict, total=False):
     current_task: str
     portfolio_balance: float
     positions: dict[str, float]
+    reasoning_steps: list[str]
 
 
 class CoinbaseAgent:
@@ -62,6 +65,9 @@ class CoinbaseAgent:
     
     Attributes:
         mcp_server: The Coinbase MCP Server instance
+        llm: Language model for reasoning (optional)
+        enable_chain_of_thought: Whether CoT reasoning is enabled
+        chain_of_thought: ChainOfThought instance for structured reasoning
         _workflow: The compiled LangGraph workflow
     """
     
@@ -69,7 +75,9 @@ class CoinbaseAgent:
         self,
         api_key: str | None = None,
         api_secret: str | None = None,
-        mcp_server: CoinbaseMCPServer | None = None
+        mcp_server: CoinbaseMCPServer | None = None,
+        llm: Any | None = None,
+        enable_chain_of_thought: bool = False
     ):
         """Initialize the Coinbase Agent.
         
@@ -77,6 +85,8 @@ class CoinbaseAgent:
             api_key: Coinbase API key (optional if mcp_server provided)
             api_secret: Coinbase API secret (optional if mcp_server provided)
             mcp_server: Pre-configured MCP server instance (optional)
+            llm: Language model for reasoning (optional)
+            enable_chain_of_thought: Whether to enable CoT reasoning
         """
         if mcp_server is not None:
             self.mcp_server = mcp_server
@@ -85,6 +95,10 @@ class CoinbaseAgent:
                 api_key=api_key or os.getenv("COINBASE_API_KEY", ""),
                 api_secret=api_secret or os.getenv("COINBASE_API_SECRET", "")
             )
+        
+        self.llm = llm
+        self.enable_chain_of_thought = enable_chain_of_thought
+        self.chain_of_thought = ChainOfThought() if enable_chain_of_thought else None
         
         self._workflow = self._build_workflow()
         self._available_tools: list[str] | None = None
@@ -232,6 +246,10 @@ class CoinbaseAgent:
         results = state.get("tool_results", [])
         messages = state.get("messages", [])
         
+        # Apply chain of thought if enabled
+        if self.enable_chain_of_thought and self.chain_of_thought:
+            state = self._apply_chain_of_thought(state)
+        
         # Add results as assistant message
         if results:
             messages.append({
@@ -240,6 +258,59 @@ class CoinbaseAgent:
             })
         
         state["messages"] = messages
+        return state
+    
+    def _apply_chain_of_thought(self, state: CoinbaseAgentState) -> CoinbaseAgentState:
+        """Apply chain of thought reasoning to process results.
+        
+        Args:
+            state: Current workflow state
+        
+        Returns:
+            Updated state with reasoning steps
+        """
+        if not self.chain_of_thought or not self.llm:
+            return state
+        
+        task = state.get("current_task", "")
+        results = state.get("tool_results", [])
+        
+        # Detect reasoning type based on task
+        reasoning_type = self.chain_of_thought.detect_reasoning_type(task)
+        
+        # Prepare data from tool results
+        data = {}
+        for result in results:
+            if isinstance(result, dict):
+                data.update(result)
+        
+        # Add portfolio context if available
+        portfolio_context = None
+        if state.get("positions"):
+            portfolio_context = state["positions"]
+        
+        # Generate CoT prompt
+        prompt = self.chain_of_thought.get_reasoning_prompt(
+            query=task,
+            data=data,
+            reasoning_type=reasoning_type,
+            portfolio_context=portfolio_context
+        )
+        
+        try:
+            # Get LLM response
+            response = self.llm.invoke(prompt)
+            response_text = response.content if hasattr(response, "content") else str(response)
+            
+            # Parse the response
+            parsed = self.chain_of_thought.parse_response(response_text)
+            
+            # Update state with reasoning
+            state["reasoning_steps"] = parsed.get("reasoning_steps", [])
+        except Exception:
+            # If CoT fails, continue without it
+            state["reasoning_steps"] = []
+        
         return state
     
     def _handle_error(self, state: CoinbaseAgentState) -> CoinbaseAgentState:

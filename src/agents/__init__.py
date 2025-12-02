@@ -13,6 +13,20 @@ from .coinbase_agent import (
     CoinbaseAgentState,
     CoinbaseAgentError,
 )
+from .schwab_agent import (
+    SchwabAgent,
+    SchwabAgentState,
+    SchwabAgentError,
+)
+from .researcher_agent import (
+    ResearcherAgent,
+    ResearcherAgentState,
+    ResearcherAgentError,
+)
+from .chain_of_thought import (
+    ChainOfThought,
+    ReasoningType,
+)
 
 __all__ = [
     "SlackAgent",
@@ -22,4 +36,12 @@ __all__ = [
     "CoinbaseAgent",
     "CoinbaseAgentState",
     "CoinbaseAgentError",
+    "SchwabAgent",
+    "SchwabAgentState",
+    "SchwabAgentError",
+    "ResearcherAgent",
+    "ResearcherAgentState",
+    "ResearcherAgentError",
+    "ChainOfThought",
+    "ReasoningType",
 ]

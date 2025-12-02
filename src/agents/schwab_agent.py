@@ -12,6 +12,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 
 from src.mcp_servers.schwab import SchwabMCPServer, SchwabAPIError
+from src.agents.chain_of_thought import ChainOfThought, ReasoningType
 
 
 class SchwabAgentError(Exception):
@@ -48,6 +49,7 @@ class SchwabAgentState(TypedDict, total=False):
         positions: Dictionary of positions
         quotes: Dictionary of quotes
         market_hours: Market hours info
+        reasoning_steps: Chain of thought reasoning steps
     """
     messages: list[dict[str, Any]]
     tool_calls: list[dict[str, Any]]
@@ -59,6 +61,7 @@ class SchwabAgentState(TypedDict, total=False):
     positions: dict[str, float]
     quotes: dict[str, float]
     market_hours: dict[str, Any]
+    reasoning_steps: list[str]
 
 
 class SchwabAgent:
@@ -70,6 +73,9 @@ class SchwabAgent:
     Attributes:
         mcp_server: The Schwab MCP Server instance
         default_account_hash: Default account hash to use
+        llm: Language model for reasoning (optional)
+        enable_chain_of_thought: Whether CoT reasoning is enabled
+        chain_of_thought: ChainOfThought instance for structured reasoning
         _workflow: The compiled LangGraph workflow
     """
     
@@ -80,7 +86,9 @@ class SchwabAgent:
         callback_url: str | None = None,
         token_path: str | None = None,
         mcp_server: SchwabMCPServer | None = None,
-        default_account_hash: str | None = None
+        default_account_hash: str | None = None,
+        llm: Any | None = None,
+        enable_chain_of_thought: bool = False
     ):
         """Initialize the Schwab Agent.
         
@@ -91,6 +99,8 @@ class SchwabAgent:
             token_path: Token file path (optional if mcp_server provided)
             mcp_server: Pre-configured MCP server instance (optional)
             default_account_hash: Default account hash to use
+            llm: Language model for reasoning (optional)
+            enable_chain_of_thought: Whether to enable CoT reasoning
         """
         if mcp_server is not None:
             self.mcp_server = mcp_server
@@ -103,6 +113,10 @@ class SchwabAgent:
             )
         
         self.default_account_hash = default_account_hash
+        self.llm = llm
+        self.enable_chain_of_thought = enable_chain_of_thought
+        self.chain_of_thought = ChainOfThought() if enable_chain_of_thought else None
+        
         self._workflow = self._build_workflow()
         self._available_tools: list[str] | None = None
     
@@ -261,6 +275,10 @@ class SchwabAgent:
         results = state.get("tool_results", [])
         messages = state.get("messages", [])
         
+        # Apply chain of thought if enabled
+        if self.enable_chain_of_thought and self.chain_of_thought:
+            state = self._apply_chain_of_thought(state)
+        
         # Add results as assistant message
         if results:
             messages.append({
@@ -269,6 +287,59 @@ class SchwabAgent:
             })
         
         state["messages"] = messages
+        return state
+    
+    def _apply_chain_of_thought(self, state: SchwabAgentState) -> SchwabAgentState:
+        """Apply chain of thought reasoning to process results.
+        
+        Args:
+            state: Current workflow state
+        
+        Returns:
+            Updated state with reasoning steps
+        """
+        if not self.chain_of_thought or not self.llm:
+            return state
+        
+        task = state.get("current_task", "")
+        results = state.get("tool_results", [])
+        
+        # Detect reasoning type based on task
+        reasoning_type = self.chain_of_thought.detect_reasoning_type(task)
+        
+        # Prepare data from tool results
+        data = {}
+        for result in results:
+            if isinstance(result, dict):
+                data.update(result)
+        
+        # Add portfolio context if available
+        portfolio_context = None
+        if state.get("positions"):
+            portfolio_context = state["positions"]
+        
+        # Generate CoT prompt
+        prompt = self.chain_of_thought.get_reasoning_prompt(
+            query=task,
+            data=data,
+            reasoning_type=reasoning_type,
+            portfolio_context=portfolio_context
+        )
+        
+        try:
+            # Get LLM response
+            response = self.llm.invoke(prompt)
+            response_text = response.content if hasattr(response, "content") else str(response)
+            
+            # Parse the response
+            parsed = self.chain_of_thought.parse_response(response_text)
+            
+            # Update state with reasoning
+            state["reasoning_steps"] = parsed.get("reasoning_steps", [])
+        except Exception:
+            # If CoT fails, continue without it
+            state["reasoning_steps"] = []
+        
         return state
     
     def _handle_error(self, state: SchwabAgentState) -> SchwabAgentState:

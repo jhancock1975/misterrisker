@@ -25,6 +25,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from src.mcp_servers.coinbase import CoinbaseMCPServer, CoinbaseAPIError
 from src.mcp_servers.schwab import SchwabMCPServer, SchwabAPIError
+from src.agents.coinbase_agent import CoinbaseAgent, CoinbaseAgentError
+from src.agents.schwab_agent import SchwabAgent, SchwabAgentError
+from src.agents.researcher_agent import ResearcherAgent, ResearcherAgentError
 
 # Load environment variables
 load_dotenv()
@@ -33,14 +36,39 @@ load_dotenv()
 class TradingChatBot:
     """Chat bot that uses LLM to interact with Coinbase and Schwab.
     
-    This bot interprets natural language requests and uses the
-    MCP Servers to execute trading operations.
+    This bot interprets natural language requests and uses either
+    LangGraph agents (with optional Chain of Thought reasoning) or
+    MCP Servers directly to execute trading operations.
+    
+    Attributes:
+        use_agents: Whether to use LangGraph agents instead of direct MCP calls
+        enable_chain_of_thought: Whether to enable CoT reasoning in agents
     """
     
-    def __init__(self):
-        """Initialize the chat bot."""
+    def __init__(
+        self,
+        use_agents: bool = False,
+        enable_chain_of_thought: bool = False
+    ):
+        """Initialize the chat bot.
+        
+        Args:
+            use_agents: Whether to use LangGraph agents (default: False for backward compat)
+            enable_chain_of_thought: Whether to enable CoT reasoning
+        """
+        # MCP Servers (used when use_agents=False or as fallback)
         self.coinbase_server: CoinbaseMCPServer | None = None
         self.schwab_server: SchwabMCPServer | None = None
+        
+        # LangGraph Agents (used when use_agents=True)
+        self.coinbase_agent: CoinbaseAgent | None = None
+        self.schwab_agent: SchwabAgent | None = None
+        self.researcher_agent: ResearcherAgent | None = None
+        
+        # Configuration
+        self.use_agents = use_agents
+        self.enable_chain_of_thought = enable_chain_of_thought
+        
         self.llm: ChatOpenAI | None = None
         self.conversation_history: list = []
         self.active_broker: str = "coinbase"  # Default broker
