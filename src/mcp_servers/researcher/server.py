@@ -560,51 +560,75 @@ class ResearcherMCPServer:
         domains = params.get("domains", [])
         
         # Build the web search request
-        tools = [{"type": "web_search"}]
+        tools = [{"type": "web_search_preview"}]
         
         # Add domain filtering if specified
         if domains:
-            tools[0]["web_search"] = {
+            tools[0]["web_search_preview"] = {
                 "search_context_size": "medium",
                 "user_location": {"type": "approximate", "approximate": {"country": "US"}}
             }
         
-        # Create the search request
-        response = await asyncio.to_thread(
-            self.openai_client.responses.create,
-            model="gpt-4o-search-preview",
-            tools=tools,
-            input=f"Search for: {query}"
-        )
-        
-        # Extract answer and citations
-        answer = ""
-        citations = []
-        
-        for output in response.output:
-            if output.get("type") == "message":
-                content = output.get("content", [])
-                for item in content:
-                    if item.get("type") == "output_text":
-                        answer = item.get("text", "")
-                        # Extract citations from annotations
-                        annotations = item.get("annotations", [])
-                        for annotation in annotations:
-                            if annotation.get("type") == "url_citation":
-                                citations.append({
-                                    "url": annotation.get("url"),
-                                    "title": annotation.get("title")
-                                })
-        
-        # Fallback to output_text if available
-        if not answer and hasattr(response, "output_text"):
-            answer = response.output_text
-        
-        return {
-            "query": query,
-            "answer": answer,
-            "citations": citations
-        }
+        try:
+            # Create the search request using the Responses API
+            response = await asyncio.to_thread(
+                self.openai_client.responses.create,
+                model="gpt-4o",
+                tools=tools,
+                input=f"Search the web for the latest information about: {query}"
+            )
+            
+            # Extract answer and citations from the response
+            answer = ""
+            citations = []
+            
+            # Handle different response formats
+            if hasattr(response, "output_text") and response.output_text:
+                answer = response.output_text
+            elif hasattr(response, "output"):
+                for output in response.output:
+                    if hasattr(output, "type"):
+                        if output.type == "message":
+                            content = getattr(output, "content", [])
+                            for item in content:
+                                item_type = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
+                                if item_type == "output_text":
+                                    answer = getattr(item, "text", "") or (item.get("text", "") if isinstance(item, dict) else "")
+                                    # Extract citations from annotations
+                                    annotations = getattr(item, "annotations", []) or (item.get("annotations", []) if isinstance(item, dict) else [])
+                                    for annotation in annotations:
+                                        ann_type = getattr(annotation, "type", None) or (annotation.get("type") if isinstance(annotation, dict) else None)
+                                        if ann_type == "url_citation":
+                                            citations.append({
+                                                "url": getattr(annotation, "url", "") or annotation.get("url", ""),
+                                                "title": getattr(annotation, "title", "") or annotation.get("title", "")
+                                            })
+                                elif item_type == "text":
+                                    answer = getattr(item, "text", "") or (item.get("text", "") if isinstance(item, dict) else "")
+                    elif isinstance(output, dict):
+                        if output.get("type") == "message":
+                            content = output.get("content", [])
+                            for item in content:
+                                if item.get("type") == "output_text":
+                                    answer = item.get("text", "")
+                                elif item.get("type") == "text":
+                                    answer = item.get("text", "")
+            
+            return {
+                "query": query,
+                "answer": answer if answer else f"Web search completed for: {query}",
+                "citations": citations
+            }
+        except Exception as e:
+            # Log the error and return a graceful fallback
+            import logging
+            logging.getLogger("mister_risker").warning(f"Web search failed: {e}")
+            return {
+                "query": query,
+                "answer": f"Unable to perform web search at this time. Query was: {query}",
+                "citations": [],
+                "error": str(e)
+            }
     
     # ===================
     # Composite Tool Handlers

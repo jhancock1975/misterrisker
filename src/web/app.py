@@ -7,10 +7,18 @@ to interpret natural language requests and execute trades via Coinbase and Schwa
 import os
 import json
 import asyncio
+import logging
 from typing import Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger("mister_risker")
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -120,10 +128,31 @@ When you need to call a tool, respond with a JSON object in this format:
 - get_movers: Get market movers (params: index like "$DJI")
 - get_market_hours: Get market hours (params: markets like "EQUITY")
 
+**Research Commands** (when research agent is available):
+- "research AAPL" or "analyze TSLA" - Get investment research with analyst recommendations
+- "compare AAPL vs MSFT" - Compare two stocks
+- "what are the risks of NVDA" - Get risk assessment
+
 If you don't need to call a tool, just respond normally with text."""
 
     async def initialize(self):
-        """Initialize the MCP servers and LLM."""
+        """Initialize the MCP servers, agents, and LLM."""
+        logger.info("Initializing TradingChatBot...")
+        logger.info(f"  use_agents={self.use_agents}, enable_chain_of_thought={self.enable_chain_of_thought}")
+        
+        # Initialize LLM first (needed for agents)
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if openai_api_key:
+            self.llm = ChatOpenAI(
+                model="gpt-4o-mini",
+                temperature=0.7,
+                api_key=openai_api_key,
+                use_responses_api=True,
+            )
+            logger.info("  ✓ LLM initialized (gpt-4o-mini)")
+        else:
+            logger.warning("  ✗ OPENAI_API_KEY not set. LLM features will be limited.")
+        
         # Initialize Coinbase
         coinbase_api_key = os.getenv("COINBASE_API_KEY")
         coinbase_api_secret = os.getenv("COINBASE_API_SECRET")
@@ -134,8 +163,17 @@ If you don't need to call a tool, just respond normally with text."""
                     api_key=coinbase_api_key,
                     api_secret=coinbase_api_secret
                 )
+                logger.info("  ✓ Coinbase MCP Server initialized")
+                # Create agent if use_agents is enabled
+                if self.use_agents:
+                    self.coinbase_agent = CoinbaseAgent(
+                        mcp_server=self.coinbase_server,
+                        llm=self.llm,
+                        enable_chain_of_thought=self.enable_chain_of_thought
+                    )
+                    logger.info("  ✓ Coinbase Agent initialized")
             except Exception as e:
-                print(f"Warning: Could not initialize Coinbase MCP Server: {e}")
+                logger.warning(f"  ✗ Could not initialize Coinbase: {e}")
         
         # Initialize Schwab - using new env var names with refresh token auth
         schwab_client_id = os.getenv("SCHWAB_CLIENT_ID", "")
@@ -159,20 +197,37 @@ If you don't need to call a tool, just respond normally with text."""
                     client_secret=schwab_client_secret,
                     refresh_token=schwab_refresh_token
                 )
+                logger.info("  ✓ Schwab MCP Server initialized")
+                # Create agent if use_agents is enabled
+                if self.use_agents:
+                    self.schwab_agent = SchwabAgent(
+                        mcp_server=self.schwab_server,
+                        llm=self.llm,
+                        enable_chain_of_thought=self.enable_chain_of_thought
+                    )
+                    logger.info("  ✓ Schwab Agent initialized")
             except Exception as e:
-                print(f"Warning: Could not initialize Schwab MCP Server: {e}")
-        
-        # Initialize LLM
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if openai_api_key:
-            self.llm = ChatOpenAI(
-                model="gpt-4o-mini",
-                temperature=0.7,
-                api_key=openai_api_key,
-                use_responses_api=True,
-            )
+                logger.warning(f"  ✗ Could not initialize Schwab: {e}")
         else:
-            print("Warning: OPENAI_API_KEY not set. LLM features will be limited.")
+            logger.info("  - Schwab credentials not configured (skipping)")
+        
+        # Initialize Researcher agent (for investment research)
+        finnhub_api_key = os.getenv("FINNHUB_API_KEY")
+        if self.use_agents and openai_api_key and finnhub_api_key:
+            try:
+                self.researcher_agent = ResearcherAgent(
+                    llm=self.llm,
+                    finnhub_api_key=finnhub_api_key,
+                    openai_api_key=openai_api_key,
+                    enable_chain_of_thought=self.enable_chain_of_thought
+                )
+                logger.info("  ✓ Researcher Agent initialized")
+            except Exception as e:
+                logger.warning(f"  ✗ Could not initialize Researcher Agent: {e}")
+        elif not finnhub_api_key:
+            logger.info("  - FINNHUB_API_KEY not set (Researcher Agent disabled)")
+        
+        logger.info("TradingChatBot initialization complete")
     
     async def process_message(self, user_message: str) -> str:
         """Process a user message and return a response.
@@ -183,19 +238,58 @@ If you don't need to call a tool, just respond normally with text."""
         Returns:
             The bot's response
         """
+        logger.info(f"Processing message: '{user_message[:100]}...' " if len(user_message) > 100 else f"Processing message: '{user_message}'")
+        
         if not self.llm:
+            logger.error("LLM not configured")
             return "Error: LLM not configured. Please set OPENAI_API_KEY in your .env file."
         
         # Check for broker switch commands
         lower_msg = user_message.lower()
         if "switch to schwab" in lower_msg or "use schwab" in lower_msg:
             self.active_broker = "schwab"
+            logger.info("Switched to Schwab broker")
             return "🔄 Switched to **Schwab** (stocks and options trading). How can I help you with your Schwab account?"
         elif "switch to coinbase" in lower_msg or "use coinbase" in lower_msg:
             self.active_broker = "coinbase"
+            logger.info("Switched to Coinbase broker")
             return "🔄 Switched to **Coinbase** (crypto trading). How can I help you with your crypto portfolio?"
         
+        # Check if this is a research query and we have the researcher agent
+        is_research = self._is_research_query(user_message)
+        logger.info(f"Query analysis: use_agents={self.use_agents}, researcher_agent={self.researcher_agent is not None}, is_research_query={is_research}")
+        
+        if self.use_agents and self.researcher_agent and is_research:
+            logger.info(">>> DELEGATING to Researcher Agent")
+            try:
+                research_result = await self._execute_research(user_message)
+                logger.info(f"Research result keys: {research_result.keys() if research_result else 'None'}")
+                
+                if "error" in research_result:
+                    logger.warning(f"Research returned error: {research_result.get('error')}")
+                    # Fall through to normal processing if research fails
+                else:
+                    response_text = research_result.get("response", "")
+                    reasoning_steps = research_result.get("reasoning_steps", [])
+                    logger.info(f"Research response length: {len(response_text)}, reasoning_steps: {len(reasoning_steps)}")
+                    
+                    # Add reasoning context if available
+                    if reasoning_steps and self.enable_chain_of_thought:
+                        reasoning_summary = "\n".join(f"• {step}" for step in reasoning_steps[:3])
+                        response_text = f"🔍 **Research Analysis:**\n\n{response_text}"
+                    
+                    # Add to conversation history
+                    self.conversation_history.append(HumanMessage(content=user_message))
+                    self.conversation_history.append(AIMessage(content=response_text))
+                    
+                    logger.info("<<< Researcher Agent completed successfully")
+                    return response_text
+            except Exception as e:
+                # Fall through to normal processing if research fails
+                logger.error(f"Research agent error: {e}", exc_info=True)
+        
         # Check if active broker is configured
+        logger.info(f"Using standard LLM flow with active_broker={self.active_broker}")
         if self.active_broker == "coinbase" and not self.coinbase_server:
             return "Error: Coinbase not configured. Please set COINBASE_API_KEY and COINBASE_API_SECRET in your .env file, or say 'switch to schwab'."
         elif self.active_broker == "schwab" and not self.schwab_server:
@@ -258,6 +352,9 @@ Current broker: {self.active_broker.upper()}
     async def _execute_tool(self, tool_name: str, params: dict) -> dict:
         """Execute a tool on the active broker.
         
+        Uses LangGraph agents if use_agents is enabled and agent is available,
+        otherwise falls back to direct MCP server calls.
+        
         Args:
             tool_name: Name of the tool to execute
             params: Parameters for the tool
@@ -267,14 +364,58 @@ Current broker: {self.active_broker.upper()}
         """
         try:
             if self.active_broker == "coinbase":
-                result = await self.coinbase_server.call_tool(tool_name, params)
+                # Try agent first if enabled
+                if self.use_agents and self.coinbase_agent:
+                    result = await self.coinbase_agent.execute_tool(tool_name, params)
+                elif self.coinbase_server:
+                    result = await self.coinbase_server.call_tool(tool_name, params)
+                else:
+                    return {"error": "Coinbase not configured"}
             else:  # schwab
-                result = await self.schwab_server.call_tool(tool_name, params)
+                # Try agent first if enabled
+                if self.use_agents and self.schwab_agent:
+                    result = await self.schwab_agent.execute_tool(tool_name, params)
+                elif self.schwab_server:
+                    result = await self.schwab_server.call_tool(tool_name, params)
+                else:
+                    return {"error": "Schwab not configured"}
             return result
-        except (CoinbaseAPIError, SchwabAPIError) as e:
+        except (CoinbaseAPIError, SchwabAPIError, CoinbaseAgentError, SchwabAgentError) as e:
             return {"error": str(e)}
         except Exception as e:
             return {"error": f"Tool execution failed: {str(e)}"}
+    
+    async def _execute_research(self, query: str) -> dict:
+        """Execute a research query using the Researcher agent.
+        
+        Args:
+            query: Research query from the user
+        
+        Returns:
+            Research result with response and optional reasoning steps
+        """
+        logger.info(f"  Executing research for query: '{query}'")
+        
+        if not self.researcher_agent:
+            logger.error("  Researcher agent not configured")
+            return {
+                "error": "Researcher agent not configured. Set FINNHUB_API_KEY in .env file."
+            }
+        
+        try:
+            logger.info("  Calling researcher_agent.run()...")
+            result = await self.researcher_agent.run(
+                query=query,
+                return_structured=True
+            )
+            logger.info(f"  Research completed. Status: {result.get('status')}, Response length: {len(result.get('response', ''))}")
+            return result
+        except ResearcherAgentError as e:
+            logger.error(f"  ResearcherAgentError: {e}")
+            return {"error": str(e)}
+        except Exception as e:
+            logger.error(f"  Research failed with exception: {e}", exc_info=True)
+            return {"error": f"Research failed: {str(e)}"}
     
     def clear_history(self):
         """Clear the conversation history and reset broker to default."""
@@ -369,10 +510,38 @@ Current broker: {self.active_broker.upper()}
             pass
         
         return None
+    
+    def _is_research_query(self, message: str) -> bool:
+        """Detect if a message is a research query that should use the researcher agent.
+        
+        Args:
+            message: User message
+        
+        Returns:
+            True if this is a research query
+        """
+        lower_msg = message.lower()
+        
+        # Research indicators
+        research_keywords = [
+            "research", "analyze", "analysis", "what do you think",
+            "should i buy", "should i sell", "should i invest",
+            "news", "latest", "what happened", "tell me about",
+            "compare", "vs", "versus", "which is better",
+            "risk", "outlook", "forecast", "prediction",
+            "earnings", "financials", "pe ratio", "market cap",
+            "recommendation", "analyst", "rating"
+        ]
+        
+        matched = [kw for kw in research_keywords if kw in lower_msg]
+        is_research = len(matched) > 0
+        logger.debug(f"  _is_research_query: matched_keywords={matched}, is_research={is_research}")
+        
+        return is_research
 
 
-# Global chatbot instance
-chatbot = TradingChatBot()
+# Global chatbot instance - agents enabled with Chain of Thought
+chatbot = TradingChatBot(use_agents=True, enable_chain_of_thought=True)
 
 
 @asynccontextmanager
@@ -406,6 +575,14 @@ HTML_TEMPLATE = """
     <title>Mister Risker</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="shortcut icon" type="image/svg+xml" href="/static/favicon.svg">
+    <!-- Markdown parser -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Syntax highlighting for code blocks -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/core.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/languages/javascript.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/languages/json.min.js"></script>
     <style>
         * {
             box-sizing: border-box;
@@ -425,7 +602,7 @@ HTML_TEMPLATE = """
         
         .container {
             width: 100%;
-            max-width: 800px;
+            max-width: 900px;
             background: #ffffff;
             border-radius: 16px;
             box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
@@ -481,7 +658,7 @@ HTML_TEMPLATE = """
         }
         
         .chat-container {
-            height: 500px;
+            height: 550px;
             overflow-y: auto;
             padding: 20px;
             background: #f8f9fa;
@@ -501,12 +678,64 @@ HTML_TEMPLATE = """
             align-items: flex-start;
         }
         
+        .message-wrapper {
+            max-width: 85%;
+            position: relative;
+        }
+        
         .message-content {
-            max-width: 80%;
-            padding: 12px 16px;
+            padding: 14px 18px;
             border-radius: 16px;
-            line-height: 1.5;
-            white-space: pre-wrap;
+            line-height: 1.6;
+        }
+        
+        /* Copy button styling */
+        .copy-btn {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 4px 8px;
+            cursor: pointer;
+            font-size: 14px;
+            opacity: 0;
+            transition: opacity 0.2s, background 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            color: #666;
+            z-index: 10;
+        }
+        
+        .message-wrapper:hover .copy-btn {
+            opacity: 1;
+        }
+        
+        .copy-btn:hover {
+            background: #f0f0f0;
+            color: #333;
+        }
+        
+        .copy-btn.copied {
+            background: #00d4aa;
+            color: white;
+            border-color: #00d4aa;
+        }
+        
+        .message.user .copy-btn {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.3);
+            color: white;
+        }
+        
+        .message.user .copy-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .message.user .copy-btn.copied {
+            background: rgba(255, 255, 255, 0.5);
         }
         
         .message.user .message-content {
@@ -520,6 +749,126 @@ HTML_TEMPLATE = """
             color: #333;
             border-bottom-left-radius: 4px;
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+        
+        /* Markdown content styling */
+        .message-content h1, .message-content h2, .message-content h3 {
+            margin: 12px 0 8px 0;
+            color: #1a1a2e;
+        }
+        .message-content h1 { font-size: 1.4rem; }
+        .message-content h2 { font-size: 1.2rem; }
+        .message-content h3 { font-size: 1.1rem; }
+        
+        .message-content p {
+            margin: 8px 0;
+        }
+        
+        .message-content ul, .message-content ol {
+            margin: 8px 0;
+            padding-left: 24px;
+        }
+        
+        .message-content li {
+            margin: 4px 0;
+        }
+        
+        .message-content strong {
+            color: #0052ff;
+            font-weight: 600;
+        }
+        
+        .message.user .message-content strong {
+            color: #fff;
+        }
+        
+        .message-content em {
+            font-style: italic;
+            color: #666;
+        }
+        
+        .message-content code {
+            background: #f0f0f0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 0.9em;
+            color: #d63384;
+        }
+        
+        .message.user .message-content code {
+            background: rgba(255,255,255,0.2);
+            color: #fff;
+        }
+        
+        .message-content pre {
+            background: #1e1e1e;
+            border-radius: 8px;
+            padding: 12px;
+            margin: 10px 0;
+            overflow-x: auto;
+        }
+        
+        .message-content pre code {
+            background: none;
+            padding: 0;
+            color: #d4d4d4;
+            font-size: 0.85em;
+        }
+        
+        .message-content blockquote {
+            border-left: 4px solid #00d4aa;
+            padding-left: 16px;
+            margin: 12px 0;
+            color: #555;
+            font-style: italic;
+        }
+        
+        .message-content table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 12px 0;
+            font-size: 0.9em;
+        }
+        
+        .message-content th, .message-content td {
+            border: 1px solid #ddd;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        
+        .message-content th {
+            background: #f5f5f5;
+            font-weight: 600;
+        }
+        
+        .message-content a {
+            color: #0052ff;
+            text-decoration: none;
+        }
+        
+        .message-content a:hover {
+            text-decoration: underline;
+        }
+        
+        .message-content hr {
+            border: none;
+            border-top: 1px solid #e0e0e0;
+            margin: 16px 0;
+        }
+        
+        /* Research badge */
+        .research-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-bottom: 10px;
         }
         
         .message-label {
@@ -667,25 +1016,7 @@ HTML_TEMPLATE = """
         <div class="chat-container" id="chatContainer">
             <div class="message assistant">
                 <span class="message-label">Mister Risker</span>
-                <div class="message-content">
-                    👋 Hello! I'm Mister Risker, your multi-broker trading assistant.
-
-I can help you trade on both **Coinbase** (crypto) and **Schwab** (stocks/options).
-
-**Coinbase (Currently Active):**
-• Check crypto balances and prices
-• Buy/sell Bitcoin, Ethereum, and more
-• View your crypto portfolio
-
-**Schwab:**
-• Check stock account balances
-• Get stock quotes and option chains
-• Place equity and options orders
-
-Say "switch to schwab" or "switch to coinbase" to change brokers.
-
-What would you like to do today?
-                </div>
+                <div class="message-content" id="welcomeMessage"></div>
             </div>
         </div>
         
@@ -694,7 +1025,8 @@ What would you like to do today?
             <span class="suggestion" onclick="sendSuggestion('What is the current price of Bitcoin?')">₿ BTC Price</span>
             <span class="suggestion" onclick="sendSuggestion('Show my portfolio')">💼 Portfolio</span>
             <span class="suggestion broker-switch" onclick="sendSuggestion('Switch to Schwab')">🔄 Switch to Schwab</span>
-            <span class="suggestion" onclick="sendSuggestion('What are the market movers today?')">📈 Market Movers</span>
+            <span class="suggestion" onclick="sendSuggestion('Tell me the latest market news')">📰 Latest News</span>
+            <span class="suggestion" onclick="sendSuggestion('What do you think about AAPL?')">🔍 Research AAPL</span>
         </div>
         
         <div class="input-container">
@@ -704,25 +1036,81 @@ What would you like to do today?
     </div>
     
     <script>
+        // Configure marked.js
+        marked.setOptions({
+            breaks: true,
+            gfm: true,
+            highlight: function(code, lang) {
+                if (lang && hljs.getLanguage(lang)) {
+                    try {
+                        return hljs.highlight(code, { language: lang }).value;
+                    } catch (e) {}
+                }
+                return code;
+            }
+        });
+        
         const chatContainer = document.getElementById('chatContainer');
         const messageInput = document.getElementById('messageInput');
         const sendBtn = document.getElementById('sendBtn');
         const brokerIndicator = document.getElementById('brokerIndicator');
         const brokerSwitchBtn = document.querySelector('.broker-switch');
         
+        // Welcome message content
+        const welcomeMarkdown = `👋 Hello! I'm **Mister Risker**, your multi-broker trading assistant.
+
+I can help you trade on both **Coinbase** (crypto) and **Schwab** (stocks/options).
+
+### 🪙 Coinbase (Currently Active)
+- Check crypto balances and prices
+- Buy/sell Bitcoin, Ethereum, and more
+- View your crypto portfolio
+
+### 📈 Schwab
+- Check stock account balances
+- Get stock quotes and option chains
+- Place equity and options orders
+
+### 🔍 Research
+- Ask me to **analyze any stock** (e.g., "What do you think about TSLA?")
+- Get the **latest market news**
+- Compare stocks and get recommendations
+
+> Say "switch to schwab" or "switch to coinbase" to change brokers.
+
+What would you like to do today?`;
+
+        // Render welcome message
+        document.getElementById('welcomeMessage').innerHTML = marked.parse(welcomeMarkdown);
+        
         function updateBrokerUI(text) {
             const lowerText = text.toLowerCase();
-            if (lowerText.includes('switched to schwab') || lowerText.includes('🔄 switched to **schwab**')) {
+            if (lowerText.includes('switched to schwab') || lowerText.includes('switched to **schwab**')) {
                 brokerIndicator.textContent = 'Schwab';
                 brokerIndicator.className = 'broker-indicator broker-schwab';
                 brokerSwitchBtn.textContent = '🔄 Switch to Coinbase';
                 brokerSwitchBtn.onclick = function() { sendSuggestion('Switch to Coinbase'); };
-            } else if (lowerText.includes('switched to coinbase') || lowerText.includes('🔄 switched to **coinbase**')) {
+            } else if (lowerText.includes('switched to coinbase') || lowerText.includes('switched to **coinbase**')) {
                 brokerIndicator.textContent = 'Coinbase';
                 brokerIndicator.className = 'broker-indicator broker-coinbase';
                 brokerSwitchBtn.textContent = '🔄 Switch to Schwab';
                 brokerSwitchBtn.onclick = function() { sendSuggestion('Switch to Schwab'); };
             }
+        }
+        
+        function renderMarkdown(text) {
+            // Check if it's a research response
+            const isResearch = text.startsWith('🔍');
+            
+            // Parse markdown
+            let html = marked.parse(text);
+            
+            // Add research badge if applicable
+            if (isResearch) {
+                html = '<div class="research-badge">🔍 Research Analysis</div>' + html.replace('🔍 **Research Analysis:**', '').replace('🔍', '');
+            }
+            
+            return html;
         }
         
         function addMessage(content, isUser) {
@@ -735,7 +1123,18 @@ What would you like to do today?
             
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
-            contentDiv.textContent = content;
+            
+            if (isUser) {
+                // User messages as plain text
+                contentDiv.textContent = content;
+            } else {
+                // Bot messages rendered as Markdown
+                contentDiv.innerHTML = renderMarkdown(content);
+                // Highlight code blocks
+                contentDiv.querySelectorAll('pre code').forEach((block) => {
+                    hljs.highlightElement(block);
+                });
+            }
             
             messageDiv.appendChild(label);
             messageDiv.appendChild(contentDiv);
@@ -811,33 +1210,15 @@ What would you like to do today?
                 await fetch('/clear', { method: 'POST' });
                 brokerIndicator.textContent = 'Coinbase';
                 brokerIndicator.className = 'broker-indicator broker-coinbase';
-                // Reset broker switch button
                 brokerSwitchBtn.textContent = '🔄 Switch to Schwab';
                 brokerSwitchBtn.onclick = function() { sendSuggestion('Switch to Schwab'); };
                 chatContainer.innerHTML = `
                     <div class="message assistant">
                         <span class="message-label">Mister Risker</span>
-                        <div class="message-content">
-                    👋 Hello! I'm Mister Risker, your multi-broker trading assistant.
-
-I can help you trade on both **Coinbase** (crypto) and **Schwab** (stocks/options).
-
-**Coinbase (Currently Active):**
-• Check crypto balances and prices
-• Buy/sell Bitcoin, Ethereum, and more
-• View your crypto portfolio
-
-**Schwab:**
-• Check stock account balances
-• Get stock quotes and option chains
-• Place equity and options orders
-
-Say "switch to schwab" or "switch to coinbase" to change brokers.
-
-What would you like to do today?
-                        </div>
+                        <div class="message-content" id="welcomeMessage"></div>
                     </div>
                 `;
+                document.getElementById('welcomeMessage').innerHTML = marked.parse(welcomeMarkdown);
             } catch (error) {
                 console.error('Error clearing chat:', error);
             }

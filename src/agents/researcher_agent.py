@@ -16,6 +16,37 @@ from src.mcp_servers.researcher import ResearcherMCPServer, ResearcherAPIError
 from src.agents.chain_of_thought import ChainOfThought, ReasoningType
 
 
+def _extract_content(content) -> str:
+    """Extract text content from LLM response.
+    
+    The OpenAI Responses API returns content as a list of content blocks,
+    not a simple string. This handles both formats.
+    
+    Args:
+        content: Response content (string or list)
+    
+    Returns:
+        Extracted text as a string
+    """
+    if content is None:
+        return ""
+    
+    if isinstance(content, str):
+        return content
+    
+    if isinstance(content, list):
+        # Responses API returns list of content blocks
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        return "".join(text_parts)
+    
+    return str(content)
+
+
 class ResearcherAgentError(Exception):
     """Exception raised by the Researcher Agent.
     
@@ -249,19 +280,29 @@ class ResearcherAgent:
                         "params": {"symbol": symbol, "include_web_search": False}
                     })
         
-        # Check for market news request
-        if any(word in query_lower for word in ["market", "general news", "what's happening"]):
-            state["tool_calls"].append({
-                "tool": "get_market_news",
-                "params": {"category": "general", "limit": 10}
-            })
+        # Check for market/general news request (no specific symbol)
+        news_keywords = ["news", "latest", "recent", "happening", "today", "market", "headlines"]
+        if any(word in query_lower for word in news_keywords):
+            # Add market news if not already getting company-specific news
+            if not any(tc.get("tool") == "get_company_news" for tc in state["tool_calls"]):
+                state["tool_calls"].append({
+                    "tool": "get_market_news",
+                    "params": {"category": "general", "limit": 10}
+                })
+            # Also do a web search for more context
+            if not any(tc.get("tool") == "web_search" for tc in state["tool_calls"]):
+                state["tool_calls"].append({
+                    "tool": "web_search",
+                    "params": {"query": query}
+                })
         
         # Check for web search request
         if any(word in query_lower for word in ["search", "find", "look up", "outlook", "opinion"]):
-            state["tool_calls"].append({
-                "tool": "web_search",
-                "params": {"query": query}
-            })
+            if not any(tc.get("tool") == "web_search" for tc in state["tool_calls"]):
+                state["tool_calls"].append({
+                    "tool": "web_search",
+                    "params": {"query": query}
+                })
         
         return state
     
@@ -465,7 +506,8 @@ class ResearcherAgent:
             try:
                 prompt = self._build_response_prompt(query, research_data)
                 response = self.llm.invoke(prompt)
-                state["response"] = response.content if hasattr(response, "content") else str(response)
+                raw_content = response.content if hasattr(response, "content") else str(response)
+                state["response"] = _extract_content(raw_content)
             except Exception as e:
                 state["response"] = self._generate_fallback_response(research_data)
         else:
@@ -548,7 +590,8 @@ that this is not financial advice and they should consult a professional."""
         try:
             # Get LLM response
             response = self.llm.invoke(prompt)
-            response_text = response.content if hasattr(response, "content") else str(response)
+            raw_content = response.content if hasattr(response, "content") else str(response)
+            response_text = _extract_content(raw_content)
             
             # Parse the response
             parsed = self.chain_of_thought.parse_response(response_text)
@@ -702,6 +745,10 @@ that this is not financial advice and they should consult a professional."""
             "status": state.get("status", "success"),
             "response": state.get("response", "")
         }
+        
+        # Include reasoning steps if available
+        if state.get("reasoning_steps"):
+            result["reasoning_steps"] = state["reasoning_steps"]
         
         if return_state:
             result["state"] = state

@@ -586,17 +586,21 @@ class TestResearcherErrorHandling:
 
     @pytest.mark.asyncio
     async def test_handles_openai_api_error(self, researcher_server, mock_openai_client, log):
-        """Should handle OpenAI API errors gracefully."""
-        from mcp_servers.researcher import ResearcherAPIError
-        
+        """Should handle OpenAI API errors gracefully by returning error message."""
         log.info("Testing OpenAI API error handling")
         
         mock_openai_client.responses.create.side_effect = Exception("API error")
         
-        with pytest.raises(ResearcherAPIError):
-            await researcher_server.call_tool("web_search", {"query": "test"})
+        # web_search now catches errors and returns a dict with error info instead of raising
+        result = await researcher_server.call_tool("web_search", {"query": "test"})
         
-        log.info("RESULT: OpenAI API error handled correctly")
+        # Verify the error is captured and returned in the result dict
+        assert result is not None
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "Unable to perform web search" in result.get("answer", "")
+        
+        log.info(f"RESULT: OpenAI API error handled correctly, returned error: {result.get('error')}")
 
     @pytest.mark.asyncio
     async def test_handles_missing_api_key(self, log):
