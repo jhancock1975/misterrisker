@@ -681,40 +681,43 @@ HTML_TEMPLATE = """
         .message-wrapper {
             max-width: 85%;
             position: relative;
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+        }
+        
+        .message.user .message-wrapper {
+            flex-direction: row-reverse;
         }
         
         .message-content {
             padding: 14px 18px;
             border-radius: 16px;
             line-height: 1.6;
+            flex: 1;
         }
         
-        /* Copy button styling */
+        /* Copy button styling - square icon outside the message */
         .copy-btn {
-            position: absolute;
-            top: 8px;
-            right: 8px;
-            background: rgba(255, 255, 255, 0.9);
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
-            padding: 4px 8px;
+            flex-shrink: 0;
+            width: 32px;
+            height: 32px;
+            background: #f5f5f5;
+            border: 1px solid #ddd;
+            border-radius: 4px;
             cursor: pointer;
-            font-size: 14px;
-            opacity: 0;
-            transition: opacity 0.2s, background 0.2s;
+            font-size: 16px;
             display: flex;
             align-items: center;
-            gap: 4px;
+            justify-content: center;
             color: #666;
-            z-index: 10;
-        }
-        
-        .message-wrapper:hover .copy-btn {
-            opacity: 1;
+            transition: background 0.2s, border-color 0.2s, color 0.2s;
+            margin-top: 4px;
         }
         
         .copy-btn:hover {
-            background: #f0f0f0;
+            background: #e8e8e8;
+            border-color: #ccc;
             color: #333;
         }
         
@@ -723,28 +726,12 @@ HTML_TEMPLATE = """
             color: white;
             border-color: #00d4aa;
         }
-        
-        .message.user .copy-btn {
-            background: rgba(255, 255, 255, 0.2);
-            border-color: rgba(255, 255, 255, 0.3);
-            color: white;
-        }
-        
-        .message.user .copy-btn:hover {
-            background: rgba(255, 255, 255, 0.3);
-        }
-        
-        .message.user .copy-btn.copied {
-            background: rgba(255, 255, 255, 0.5);
-        }
-        
+
         .message.user .message-content {
             background: linear-gradient(135deg, #00d4aa 0%, #0052ff 100%);
             color: white;
             border-bottom-right-radius: 4px;
-        }
-        
-        .message.assistant .message-content {
+        }        .message.assistant .message-content {
             background: white;
             color: #333;
             border-bottom-left-radius: 4px;
@@ -1113,6 +1100,54 @@ What would you like to do today?`;
             return html;
         }
         
+        // SVG icons for copy button
+        const copyIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+        const checkIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+        
+        function copyToClipboard(text, button) {
+            // Try modern clipboard API first, fallback to execCommand
+            function showSuccess() {
+                const originalHTML = button.innerHTML;
+                button.innerHTML = checkIcon;
+                button.classList.add('copied');
+                button.title = 'Copied!';
+                setTimeout(() => {
+                    button.innerHTML = originalHTML;
+                    button.classList.remove('copied');
+                    button.title = 'Copy to clipboard';
+                }, 2000);
+            }
+            
+            function fallbackCopy(text) {
+                const textArea = document.createElement('textarea');
+                textArea.value = text;
+                textArea.style.position = 'fixed';
+                textArea.style.left = '-9999px';
+                textArea.style.top = '-9999px';
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    showSuccess();
+                } catch (err) {
+                    console.error('Fallback copy failed:', err);
+                }
+                document.body.removeChild(textArea);
+            }
+            
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(() => {
+                    showSuccess();
+                }).catch(err => {
+                    console.warn('Clipboard API failed, using fallback:', err);
+                    fallbackCopy(text);
+                });
+            } else {
+                fallbackCopy(text);
+            }
+        }
+        
         function addMessage(content, isUser) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${isUser ? 'user' : 'assistant'}`;
@@ -1121,8 +1156,19 @@ What would you like to do today?`;
             label.className = 'message-label';
             label.textContent = isUser ? 'You' : 'Mister Risker';
             
+            // Wrapper for content and copy button
+            const wrapperDiv = document.createElement('div');
+            wrapperDiv.className = 'message-wrapper';
+            
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
+            
+            // Create copy button with square icon
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'copy-btn';
+            copyBtn.innerHTML = copyIcon;
+            copyBtn.title = 'Copy to clipboard';
+            copyBtn.onclick = () => copyToClipboard(content, copyBtn);
             
             if (isUser) {
                 // User messages as plain text
@@ -1136,8 +1182,10 @@ What would you like to do today?`;
                 });
             }
             
+            wrapperDiv.appendChild(contentDiv);
+            wrapperDiv.appendChild(copyBtn);
             messageDiv.appendChild(label);
-            messageDiv.appendChild(contentDiv);
+            messageDiv.appendChild(wrapperDiv);
             chatContainer.appendChild(messageDiv);
             
             chatContainer.scrollTop = chatContainer.scrollHeight;
