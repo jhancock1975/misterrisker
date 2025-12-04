@@ -175,7 +175,8 @@ If you don't need to call a tool, just respond normally with text."""
                     self.coinbase_agent = CoinbaseAgent(
                         mcp_server=self.coinbase_server,
                         llm=self.llm,
-                        enable_chain_of_thought=self.enable_chain_of_thought
+                        enable_chain_of_thought=self.enable_chain_of_thought,
+                        checkpointer=self.checkpointer
                     )
                     logger.info("  ✓ Coinbase Agent initialized")
             except Exception as e:
@@ -209,7 +210,8 @@ If you don't need to call a tool, just respond normally with text."""
                     self.schwab_agent = SchwabAgent(
                         mcp_server=self.schwab_server,
                         llm=self.llm,
-                        enable_chain_of_thought=self.enable_chain_of_thought
+                        enable_chain_of_thought=self.enable_chain_of_thought,
+                        checkpointer=self.checkpointer
                     )
                     logger.info("  ✓ Schwab Agent initialized")
             except Exception as e:
@@ -225,7 +227,8 @@ If you don't need to call a tool, just respond normally with text."""
                     llm=self.llm,
                     finnhub_api_key=finnhub_api_key,
                     openai_api_key=openai_api_key,
-                    enable_chain_of_thought=self.enable_chain_of_thought
+                    enable_chain_of_thought=self.enable_chain_of_thought,
+                    checkpointer=self.checkpointer
                 )
                 logger.info("  ✓ Researcher Agent initialized")
             except Exception as e:
@@ -502,8 +505,14 @@ Current active broker: {self.active_broker.upper()}"""
         
         try:
             logger.info("  Calling researcher_agent.run()...")
+            # Pass conversation history for context
+            messages = self._format_history_for_agent()
+            config = self._get_agent_config()
+            
             result = await self.researcher_agent.run(
                 query=query,
+                messages=messages,
+                config=config,
                 return_structured=True
             )
             logger.info(f"  Research completed. Status: {result.get('status')}, Response length: {len(result.get('response', ''))}")

@@ -77,6 +77,7 @@ class SchwabAgent:
         enable_chain_of_thought: Whether CoT reasoning is enabled
         chain_of_thought: ChainOfThought instance for structured reasoning
         _workflow: The compiled LangGraph workflow
+        checkpointer: Optional checkpointer for state persistence
     """
     
     def __init__(
@@ -88,7 +89,8 @@ class SchwabAgent:
         mcp_server: SchwabMCPServer | None = None,
         default_account_hash: str | None = None,
         llm: Any | None = None,
-        enable_chain_of_thought: bool = False
+        enable_chain_of_thought: bool = False,
+        checkpointer: Any | None = None
     ):
         """Initialize the Schwab Agent.
         
@@ -101,6 +103,7 @@ class SchwabAgent:
             default_account_hash: Default account hash to use
             llm: Language model for reasoning (optional)
             enable_chain_of_thought: Whether to enable CoT reasoning
+            checkpointer: Optional checkpointer for state persistence
         """
         if mcp_server is not None:
             self.mcp_server = mcp_server
@@ -116,6 +119,7 @@ class SchwabAgent:
         self.llm = llm
         self.enable_chain_of_thought = enable_chain_of_thought
         self.chain_of_thought = ChainOfThought() if enable_chain_of_thought else None
+        self.checkpointer = checkpointer
         
         self._workflow = self._build_workflow()
         self._available_tools: list[str] | None = None
@@ -176,6 +180,9 @@ class SchwabAgent:
         workflow.add_edge("process_results", END)
         workflow.add_edge("handle_error", END)
         
+        # Compile with checkpointer if provided
+        if self.checkpointer is not None:
+            return workflow.compile(checkpointer=self.checkpointer)
         return workflow.compile()
     
     def _analyze_task(self, state: SchwabAgentState) -> SchwabAgentState:

@@ -204,6 +204,9 @@ class ResearcherAgent:
         workflow.add_edge("generate_response", END)
         workflow.add_edge("handle_error", END)
         
+        # Compile with checkpointer if provided
+        if self.checkpointer is not None:
+            return workflow.compile(checkpointer=self.checkpointer)
         return workflow.compile()
     
     def _analyze_query(self, state: ResearcherAgentState) -> ResearcherAgentState:
@@ -504,6 +507,7 @@ class ResearcherAgent:
         """
         research_data = state.get("research_data", {})
         query = state.get("query", "")
+        messages = state.get("messages", [])
         
         # Apply chain of thought if enabled
         if self.enable_chain_of_thought and self.chain_of_thought:
@@ -512,7 +516,7 @@ class ResearcherAgent:
         # If we have an LLM, use it to generate a response
         if self.llm:
             try:
-                prompt = self._build_response_prompt(query, research_data)
+                prompt = self._build_response_prompt(query, research_data, messages)
                 response = self.llm.invoke(prompt)
                 raw_content = response.content if hasattr(response, "content") else str(response)
                 state["response"] = _extract_content(raw_content)
@@ -539,12 +543,13 @@ class ResearcherAgent:
         
         return state
     
-    def _build_response_prompt(self, query: str, research_data: dict) -> str:
+    def _build_response_prompt(self, query: str, research_data: dict, messages: list = None) -> str:
         """Build a prompt for the LLM to generate a response.
         
         Args:
             query: User query
             research_data: Gathered research data
+            messages: Optional conversation history for context
         
         Returns:
             Prompt string
@@ -558,8 +563,19 @@ class ResearcherAgent:
                 reasoning_type=reasoning_type
             )
         
+        # Build conversation history context
+        history_context = ""
+        if messages:
+            history_lines = []
+            for msg in messages[-10:]:  # Last 10 messages for context
+                role = msg.get("role", "user")
+                content = msg.get("content", "")[:200]  # Truncate long messages
+                history_lines.append(f"{role}: {content}")
+            if history_lines:
+                history_context = f"\n\nPrevious conversation context:\n" + "\n".join(history_lines)
+        
         return f"""Based on the following research data, answer the user's question.
-
+{history_context}
 User Question: {query}
 
 Research Data:
@@ -568,7 +584,9 @@ Research Data:
 Please provide a clear, helpful response that addresses the user's question.
 Include relevant data points and be specific with numbers when available.
 If the user is asking for investment advice, provide analysis but remind them
-that this is not financial advice and they should consult a professional."""
+that this is not financial advice and they should consult a professional.
+If the user is asking about something from earlier in the conversation, refer to
+the conversation context above."""
     
     def _apply_chain_of_thought(self, state: ResearcherAgentState) -> ResearcherAgentState:
         """Apply chain of thought reasoning to generate structured response.
@@ -702,7 +720,10 @@ that this is not financial advice and they should consult a professional."""
         context: dict[str, Any] | None = None,
         return_state: bool = False,
         return_structured: bool = False,
-        trade_context: dict[str, Any] | None = None
+        trade_context: dict[str, Any] | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        config: dict[str, Any] | None = None,
+        conversation_history: list[dict[str, Any]] | None = None  # Alias for messages
     ) -> dict[str, Any]:
         """Run the research agent with a query.
         
@@ -712,14 +733,20 @@ that this is not financial advice and they should consult a professional."""
             return_state: Whether to include full state in response
             return_structured: Whether to return structured research data
             trade_context: Optional trade context for relevant research
+            messages: Conversation history for context
+            config: LangGraph config with thread_id for checkpointer
+            conversation_history: Alias for messages parameter
         
         Returns:
             Response dictionary with status, response, and optional data
         """
+        # Support both messages and conversation_history parameter names
+        history = messages or conversation_history or []
+        
         # Build initial state
         initial_state: ResearcherAgentState = {
             "query": query,
-            "messages": [],
+            "messages": history,  # Include conversation history
             "tool_calls": [],
             "tool_results": [],
             "research_data": {},
