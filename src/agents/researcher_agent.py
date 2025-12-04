@@ -106,6 +106,7 @@ class ResearcherAgent:
         enable_chain_of_thought: Whether CoT reasoning is enabled
         chain_of_thought: ChainOfThought instance for structured reasoning
         _workflow: The compiled LangGraph workflow
+        checkpointer: Optional checkpointer for state persistence
     """
     
     def __init__(
@@ -114,7 +115,9 @@ class ResearcherAgent:
         llm: Any | None = None,
         finnhub_api_key: str | None = None,
         openai_api_key: str | None = None,
-        enable_chain_of_thought: bool = False
+        enable_chain_of_thought: bool = False,
+        checkpointer: Any | None = None,
+        mcp_server: Any | None = None  # Alias for researcher_server
     ):
         """Initialize the Researcher Agent.
         
@@ -124,9 +127,13 @@ class ResearcherAgent:
             finnhub_api_key: Finnhub API key (optional if server provided)
             openai_api_key: OpenAI API key (optional if server provided)
             enable_chain_of_thought: Whether to enable CoT reasoning
+            checkpointer: Optional checkpointer for state persistence
+            mcp_server: Alias for researcher_server (for consistency with other agents)
         """
-        if researcher_server is not None:
-            self.researcher_server = researcher_server
+        # Support both researcher_server and mcp_server parameter names
+        server = researcher_server or mcp_server
+        if server is not None:
+            self.researcher_server = server
         else:
             self.researcher_server = ResearcherMCPServer(
                 finnhub_api_key=finnhub_api_key,
@@ -136,6 +143,7 @@ class ResearcherAgent:
         self.llm = llm
         self.enable_chain_of_thought = enable_chain_of_thought
         self.chain_of_thought = ChainOfThought() if enable_chain_of_thought else None
+        self.checkpointer = checkpointer
         self._workflow = self._build_workflow()
     
     def get_tools(self) -> list[dict[str, Any]]:

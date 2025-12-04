@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import InMemorySaver
+import uuid
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -80,6 +82,10 @@ class TradingChatBot:
         self.llm: ChatOpenAI | None = None
         self.conversation_history: list = []
         self.active_broker: str = "coinbase"  # Default broker
+        
+        # Memory/checkpointing for agent state persistence
+        self.checkpointer = InMemorySaver()
+        self.thread_id = str(uuid.uuid4())
         
         # System prompt for the LLM
         self.system_prompt = """You are Mister Risker, a helpful multi-broker trading assistant. You can help users trade on both Coinbase (crypto) and Schwab (stocks/options).
@@ -255,6 +261,33 @@ If you don't need to call a tool, just respond normally with text."""
             logger.info("Switched to Coinbase broker")
             return "🔄 Switched to **Coinbase** (crypto trading). How can I help you with your crypto portfolio?"
         
+        # Check if this is an image generation request
+        if self._is_image_generation_request(user_message):
+            logger.info(">>> IMAGE GENERATION request detected")
+            try:
+                image_result = await self.generate_image(user_message)
+                
+                if image_result.get("type") == "error":
+                    logger.warning(f"Image generation failed: {image_result.get('content')}")
+                    # Fall through to normal processing
+                else:
+                    # Wrap the content for frontend rendering
+                    response_text = self._wrap_generated_content(
+                        image_result["type"],
+                        image_result["content"],
+                        image_result.get("description", "")
+                    )
+                    
+                    # Add to conversation history
+                    self.conversation_history.append(HumanMessage(content=user_message))
+                    self.conversation_history.append(AIMessage(content=response_text))
+                    
+                    logger.info(f"<<< Image generation completed: type={image_result['type']}")
+                    return response_text
+            except Exception as e:
+                logger.error(f"Image generation error: {e}", exc_info=True)
+                # Fall through to normal processing
+        
         # Check if this is a research query and we have the researcher agent
         is_research = self._is_research_query(user_message)
         logger.info(f"Query analysis: use_agents={self.use_agents}, researcher_agent={self.researcher_agent is not None}, is_research_query={is_research}")
@@ -349,6 +382,71 @@ Current broker: {self.active_broker.upper()}
             self.conversation_history.append(AIMessage(content=error_msg))
             return error_msg
     
+    async def process_message_with_image(self, user_message: str, image_data: str) -> str:
+        """Process a user message with an attached image using vision capabilities.
+        
+        Args:
+            user_message: The user's text message
+            image_data: Base64-encoded image data URL (data:image/png;base64,...)
+        
+        Returns:
+            The bot's response
+        """
+        logger.info(f"Processing message with image: '{user_message[:50]}...' " if len(user_message) > 50 else f"Processing message with image: '{user_message}'")
+        
+        if not self.llm:
+            logger.error("LLM not configured")
+            return "Error: LLM not configured. Please set OPENAI_API_KEY in your .env file."
+        
+        try:
+            # Use OpenAI's vision model directly for image analysis
+            from openai import OpenAI
+            
+            client = OpenAI()
+            
+            # Build the message with image
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"""You are Mister Risker, a helpful trading assistant specializing in cryptocurrency and stock trading.
+You can analyze images including charts, screenshots of trading platforms, financial documents, and more.
+Provide helpful insights about any trading-related images the user shares.
+Current active broker: {self.active_broker.upper()}"""
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_message or "What can you tell me about this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_data
+                            }
+                        }
+                    ]
+                }
+            ]
+            
+            # Use gpt-4o for vision capabilities
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                max_tokens=1000
+            )
+            
+            response_text = response.choices[0].message.content
+            
+            # Add to conversation history (text only for history)
+            self.conversation_history.append(HumanMessage(content=f"{user_message} [with image]"))
+            self.conversation_history.append(AIMessage(content=response_text))
+            
+            return response_text
+            
+        except Exception as e:
+            error_msg = f"Error processing image: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return error_msg
+    
     async def _execute_tool(self, tool_name: str, params: dict) -> dict:
         """Execute a tool on the active broker.
         
@@ -418,9 +516,49 @@ Current broker: {self.active_broker.upper()}
             return {"error": f"Research failed: {str(e)}"}
     
     def clear_history(self):
-        """Clear the conversation history and reset broker to default."""
+        """Clear the conversation history, reset broker, and generate new thread_id."""
         self.conversation_history = []
         self.active_broker = "coinbase"
+        # Generate new thread_id for fresh memory context
+        self.thread_id = str(uuid.uuid4())
+    
+    # Alias for backward compatibility
+    def clear_conversation(self):
+        """Alias for clear_history."""
+        self.clear_history()
+    
+    def _get_agent_config(self) -> dict:
+        """Get configuration dict for agent invocations with thread_id.
+        
+        Returns:
+            Config dict with thread_id for checkpointer
+        """
+        return {
+            "configurable": {
+                "thread_id": self.thread_id
+            }
+        }
+    
+    def _format_history_for_agent(self) -> list[dict]:
+        """Format conversation history for agent state.
+        
+        Converts LangChain message objects to dicts with role/content.
+        
+        Returns:
+            List of message dicts
+        """
+        formatted = []
+        for msg in self.conversation_history:
+            if isinstance(msg, HumanMessage):
+                formatted.append({"role": "user", "content": msg.content})
+            elif isinstance(msg, AIMessage):
+                formatted.append({"role": "assistant", "content": msg.content})
+            elif isinstance(msg, SystemMessage):
+                formatted.append({"role": "system", "content": msg.content})
+            else:
+                # Fallback for other message types
+                formatted.append({"role": "user", "content": str(msg.content)})
+        return formatted
     
     def _extract_content(self, content) -> str:
         """Extract text content from LLM response.
@@ -538,6 +676,135 @@ Current broker: {self.active_broker.upper()}
         logger.debug(f"  _is_research_query: matched_keywords={matched}, is_research={is_research}")
         
         return is_research
+    
+    def _is_image_generation_request(self, message: str) -> bool:
+        """Detect if a message is requesting image/visual content generation.
+        
+        Args:
+            message: User message
+        
+        Returns:
+            True if this is an image generation request
+        """
+        lower_msg = message.lower()
+        
+        # Image generation indicators
+        image_keywords = [
+            "draw", "sketch", "create an image", "create a picture",
+            "generate an svg", "generate svg", "make an svg", "make svg",
+            "create an animation", "make an animation", "animate",
+            "visualization", "visualize", "create a graphic", "make a graphic",
+            "show me a graphic", "show me a picture", "show me an image",
+            "design", "illustrate", "render"
+        ]
+        
+        # Check for keyword matches
+        for keyword in image_keywords:
+            if keyword in lower_msg:
+                return True
+        
+        return False
+    
+    async def generate_image(self, prompt: str) -> dict:
+        """Generate an image (SVG or animation) based on the user's prompt.
+        
+        Args:
+            prompt: User's request for image generation
+        
+        Returns:
+            Dict with type, content, and optional description
+        """
+        logger.info(f"Generating image for prompt: '{prompt[:50]}...' " if len(prompt) > 50 else f"Generating image for prompt: '{prompt}'")
+        
+        if not self.llm:
+            return {"type": "error", "content": "LLM not configured", "description": ""}
+        
+        try:
+            # Determine if user wants animation or static SVG
+            lower_prompt = prompt.lower()
+            is_animation = any(kw in lower_prompt for kw in ["animation", "animate", "moving", "bouncing", "spinning"])
+            
+            if is_animation:
+                system_prompt = """You are a creative assistant that generates interactive HTML/JavaScript animations.
+When asked to create an animation, respond with ONLY the HTML code (including inline CSS and JavaScript).
+The animation should be self-contained and work in an iframe.
+Use canvas or CSS animations. Keep the code compact but functional.
+Do NOT include any explanation text - ONLY output the HTML code.
+Start directly with <!DOCTYPE html> or <html> or <div>."""
+            else:
+                system_prompt = """You are a creative assistant that generates SVG images.
+When asked to draw or create an image, respond with ONLY the SVG code.
+Create colorful, visually appealing SVGs.
+Do NOT include any explanation text - ONLY output the SVG code.
+Start directly with <svg and end with </svg>."""
+            
+            from langchain_core.messages import SystemMessage, HumanMessage as LCHumanMessage
+            
+            messages = [
+                SystemMessage(content=system_prompt),
+                LCHumanMessage(content=prompt)
+            ]
+            
+            response = await self.llm.ainvoke(messages)
+            content = self._extract_content(response.content)
+            
+            # Determine the type based on content
+            if "<svg" in content.lower():
+                content_type = "svg"
+                # Clean up - extract just the SVG if there's extra text
+                svg_start = content.lower().find("<svg")
+                svg_end = content.lower().rfind("</svg>") + 6
+                if svg_start != -1 and svg_end > svg_start:
+                    content = content[svg_start:svg_end]
+            elif "<script>" in content.lower() or "<canvas" in content.lower() or "requestanimationframe" in content.lower():
+                content_type = "animation"
+            elif "<html" in content.lower() or "<!doctype" in content.lower():
+                content_type = "animation"
+            else:
+                # LLM didn't generate proper image content
+                content_type = "text"
+            
+            return {
+                "type": content_type,
+                "content": content,
+                "description": prompt
+            }
+            
+        except Exception as e:
+            logger.error(f"Image generation failed: {e}", exc_info=True)
+            return {"type": "error", "content": str(e), "description": prompt}
+    
+    def _wrap_generated_content(self, content_type: str, content: str, description: str) -> str:
+        """Wrap generated content with markers for frontend detection.
+        
+        Args:
+            content_type: Type of content (svg, animation, html)
+            content: The raw generated content
+            description: Description of what was generated
+        
+        Returns:
+            Wrapped content string
+        """
+        if content_type == "svg":
+            return f"""<!--GENERATED_IMAGE:svg-->
+Here's the image you requested:
+
+```svg
+{content}
+```
+
+{description}"""
+        elif content_type == "animation":
+            return f"""<!--GENERATED_IMAGE:animation-->
+Here's the animation you requested:
+
+```html
+{content}
+```
+
+{description}"""
+        else:
+            return content
 
 
 # Global chatbot instance - agents enabled with Chain of Thought
@@ -566,7 +833,7 @@ if static_dir.exists():
 
 
 # HTML template for the chat interface
-HTML_TEMPLATE = """
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -577,6 +844,8 @@ HTML_TEMPLATE = """
     <link rel="shortcut icon" type="image/svg+xml" href="/static/favicon.svg">
     <!-- Markdown parser -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- html2canvas for exporting chat to image -->
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <!-- Syntax highlighting for code blocks -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css">
     <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/core.min.js"></script>
@@ -617,6 +886,7 @@ HTML_TEMPLATE = """
             align-items: center;
             gap: 12px;
             position: relative;
+            z-index: 100;
         }
         
         .header-logo {
@@ -640,8 +910,14 @@ HTML_TEMPLATE = """
             background-clip: text;
         }
         
-        .broker-indicator {
+        .header-right {
             margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .broker-indicator {
             padding: 6px 12px;
             border-radius: 20px;
             font-size: 0.75rem;
@@ -660,8 +936,11 @@ HTML_TEMPLATE = """
         .chat-container {
             height: 550px;
             overflow-y: auto;
+            overflow-x: hidden;
             padding: 20px;
             background: #f8f9fa;
+            position: relative;
+            z-index: 1;
         }
         
         .message {
@@ -858,6 +1137,53 @@ HTML_TEMPLATE = """
             margin-bottom: 10px;
         }
         
+        /* Generated image/animation badge */
+        .generated-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+        
+        /* Generated image containers */
+        .generated-image {
+            margin: 12px 0;
+            border-radius: 12px;
+            overflow: hidden;
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+        }
+        
+        .generated-image.svg-container {
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: white;
+        }
+        
+        .generated-image.svg-container svg {
+            max-width: 100%;
+            height: auto;
+        }
+        
+        .generated-image.animation-container {
+            min-height: 200px;
+        }
+        
+        .generated-image.animation-container iframe {
+            width: 100%;
+            min-height: 250px;
+            border: none;
+            background: white;
+        }
+        
         .message-label {
             font-size: 0.75rem;
             color: #666;
@@ -973,21 +1299,123 @@ HTML_TEMPLATE = """
         }
         
         .clear-btn {
-            position: absolute;
-            top: 50%;
-            right: 20px;
-            transform: translateY(-50%);
-            padding: 8px 16px;
+            padding: 6px 12px;
             background: rgba(255,255,255,0.2);
             color: white;
             border: none;
             border-radius: 8px;
-            font-size: 0.875rem;
+            font-size: 0.75rem;
             cursor: pointer;
         }
         
         .clear-btn:hover {
             background: rgba(255,255,255,0.3);
+        }
+        
+        .export-btn {
+            padding: 6px 12px;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .export-btn:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        
+        .export-btn.copying {
+            background: #00d4aa;
+        }
+        
+        .export-btn svg {
+            width: 14px;
+            height: 14px;
+        }
+        
+        /* Image preview styling */
+        .image-preview-container {
+            display: none;
+            padding: 10px 20px;
+            background: #f8f9fa;
+            border-top: 1px solid #e9ecef;
+        }
+        
+        .image-preview-container.has-image {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .image-preview {
+            max-width: 120px;
+            max-height: 80px;
+            border-radius: 8px;
+            border: 2px solid #e9ecef;
+            object-fit: cover;
+        }
+        
+        .image-preview-info {
+            flex: 1;
+            font-size: 0.875rem;
+            color: #666;
+        }
+        
+        .image-preview-info .filename {
+            font-weight: 600;
+            color: #333;
+        }
+        
+        .remove-image-btn {
+            width: 28px;
+            height: 28px;
+            background: #ff4757;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+        }
+        
+        .remove-image-btn:hover {
+            background: #ff3344;
+        }
+        
+        .input-container input::placeholder {
+            color: #999;
+        }
+        
+        .message-image {
+            display: block;
+            max-width: 300px;
+            max-height: 200px;
+            border-radius: 8px;
+            margin-top: 10px;
+            cursor: pointer;
+        }
+        
+        .message-image:hover {
+            opacity: 0.9;
+        }
+        
+        /* Ensure text and image stack properly in user messages */
+        .message.user .message-content {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+        
+        .message-text {
+            margin-bottom: 0;
         }
     </style>
 </head>
@@ -996,8 +1424,17 @@ HTML_TEMPLATE = """
         <div class="header">
             <div class="header-logo">M</div>
             <h1>Mister Risker</h1>
-            <span class="broker-indicator broker-coinbase" id="brokerIndicator">Coinbase</span>
-            <button class="clear-btn" onclick="clearChat()">Clear</button>
+            <div class="header-right">
+                <span class="broker-indicator broker-coinbase" id="brokerIndicator">Coinbase</span>
+                <button class="export-btn" onclick="exportChatToClipboard()" title="Copy conversation as image">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                    </svg>
+                    Export
+                </button>
+                <button class="clear-btn" onclick="clearChat()">Clear</button>
+            </div>
         </div>
         
         <div class="chat-container" id="chatContainer">
@@ -1016,8 +1453,17 @@ HTML_TEMPLATE = """
             <span class="suggestion" onclick="sendSuggestion('What do you think about AAPL?')">🔍 Research AAPL</span>
         </div>
         
+        <div class="image-preview-container" id="imagePreviewContainer">
+            <img id="imagePreview" class="image-preview" src="" alt="Preview">
+            <div class="image-preview-info">
+                <div class="filename" id="imageFilename">image.png</div>
+                <div>Ready to send with your message</div>
+            </div>
+            <button class="remove-image-btn" onclick="removeImage()" title="Remove image">×</button>
+        </div>
+        
         <div class="input-container">
-            <input type="text" id="messageInput" placeholder="Ask me anything about trading..." onkeypress="handleKeyPress(event)">
+            <input type="text" id="messageInput" placeholder="Ask me anything about trading... (paste image with Ctrl+V)" onkeypress="handleKeyPress(event)">
             <button id="sendBtn" onclick="sendMessage()">Send</button>
         </div>
     </div>
@@ -1042,6 +1488,44 @@ HTML_TEMPLATE = """
         const sendBtn = document.getElementById('sendBtn');
         const brokerIndicator = document.getElementById('brokerIndicator');
         const brokerSwitchBtn = document.querySelector('.broker-switch');
+        const imagePreviewContainer = document.getElementById('imagePreviewContainer');
+        const imagePreview = document.getElementById('imagePreview');
+        const imageFilename = document.getElementById('imageFilename');
+        
+        // Store the current image data
+        let currentImageData = null;
+        
+        // Handle paste events for images
+        document.addEventListener('paste', function(e) {
+            const items = e.clipboardData?.items;
+            if (!items) return;
+            
+            for (let i = 0; i < items.length; i++) {
+                if (items[i].type.indexOf('image') !== -1) {
+                    e.preventDefault();
+                    const blob = items[i].getAsFile();
+                    const reader = new FileReader();
+                    
+                    reader.onload = function(event) {
+                        currentImageData = event.target.result;
+                        imagePreview.src = currentImageData;
+                        imageFilename.textContent = blob.name || 'Pasted image';
+                        imagePreviewContainer.classList.add('has-image');
+                        messageInput.focus();
+                    };
+                    
+                    reader.readAsDataURL(blob);
+                    break;
+                }
+            }
+        });
+        
+        function removeImage() {
+            currentImageData = null;
+            imagePreview.src = '';
+            imagePreviewContainer.classList.remove('has-image');
+            messageInput.focus();
+        }
         
         // Welcome message content
         const welcomeMarkdown = `👋 Hello! I'm **Mister Risker**, your multi-broker trading assistant.
@@ -1089,8 +1573,41 @@ What would you like to do today?`;
             // Check if it's a research response
             const isResearch = text.startsWith('🔍');
             
+            // Check if it contains generated image content
+            const hasSvg = text.includes('<!--GENERATED_IMAGE:svg-->') || text.includes('```svg');
+            const hasAnimation = text.includes('<!--GENERATED_IMAGE:animation-->') || (text.includes('```html') && (text.includes('<script>') || text.includes('<canvas')));
+            
             // Parse markdown
             let html = marked.parse(text);
+            
+            // Handle SVG content - render inline
+            if (hasSvg) {
+                // Extract SVG from code block and render it directly
+                html = html.replace(/<pre><code class="language-svg">([\s\S]*?)<\/code><\/pre>/g, function(match, svgCode) {
+                    // Decode HTML entities
+                    const textarea = document.createElement('textarea');
+                    textarea.innerHTML = svgCode;
+                    const decodedSvg = textarea.value;
+                    return '<div class="generated-image svg-container">' + decodedSvg + '</div>';
+                });
+                // Remove the comment marker
+                html = html.replace(/<!--GENERATED_IMAGE:svg-->/g, '<div class="generated-badge">🎨 Generated Image</div>');
+            }
+            
+            // Handle animation content - render in iframe
+            if (hasAnimation) {
+                html = html.replace(/<pre><code class="language-html">([\s\S]*?)<\/code><\/pre>/g, function(match, htmlCode) {
+                    // Decode HTML entities
+                    const textarea = document.createElement('textarea');
+                    textarea.innerHTML = htmlCode;
+                    const decodedHtml = textarea.value;
+                    // Create a data URL for the iframe
+                    const dataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(decodedHtml);
+                    return '<div class="generated-image animation-container"><iframe src="' + dataUrl + '" sandbox="allow-scripts" frameborder="0"></iframe></div>';
+                });
+                // Remove the comment marker
+                html = html.replace(/<!--GENERATED_IMAGE:animation-->/g, '<div class="generated-badge">🎬 Generated Animation</div>');
+            }
             
             // Add research badge if applicable
             if (isResearch) {
@@ -1171,8 +1688,11 @@ What would you like to do today?`;
             copyBtn.onclick = () => copyToClipboard(content, copyBtn);
             
             if (isUser) {
-                // User messages as plain text
-                contentDiv.textContent = content;
+                // User messages as plain text - wrap in span for proper layout with images
+                const textSpan = document.createElement('span');
+                textSpan.className = 'message-text';
+                textSpan.textContent = content;
+                contentDiv.appendChild(textSpan);
             } else {
                 // Bot messages rendered as Markdown
                 contentDiv.innerHTML = renderMarkdown(content);
@@ -1180,6 +1700,15 @@ What would you like to do today?`;
                 contentDiv.querySelectorAll('pre code').forEach((block) => {
                     hljs.highlightElement(block);
                 });
+            }
+            
+            // Add image if provided
+            if (arguments[2]) {
+                const img = document.createElement('img');
+                img.src = arguments[2];
+                img.className = 'message-image';
+                img.onclick = () => window.open(arguments[2], '_blank');
+                contentDiv.appendChild(img);
             }
             
             wrapperDiv.appendChild(contentDiv);
@@ -1216,18 +1745,27 @@ What would you like to do today?`;
         
         async function sendMessage() {
             const message = messageInput.value.trim();
-            if (!message) return;
+            if (!message && !currentImageData) return;
             
-            addMessage(message, true);
+            // Show user message with image if present
+            addMessage(message || '[Image]', true, currentImageData);
+            
+            const imageToSend = currentImageData;
             messageInput.value = '';
+            removeImage();
             sendBtn.disabled = true;
             showTyping();
             
             try {
+                const payload = { message: message || 'What is in this image?' };
+                if (imageToSend) {
+                    payload.image = imageToSend;
+                }
+                
                 const response = await fetch('/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message })
+                    body: JSON.stringify(payload)
                 });
                 
                 const data = await response.json();
@@ -1272,6 +1810,83 @@ What would you like to do today?`;
             }
         }
         
+        async function exportChatToClipboard() {
+            const exportBtn = document.querySelector('.export-btn');
+            const originalHTML = exportBtn.innerHTML;
+            
+            try {
+                // Show loading state
+                exportBtn.innerHTML = '⏳ Capturing...';
+                exportBtn.classList.add('copying');
+                
+                // Store current scroll position and height
+                const originalScrollTop = chatContainer.scrollTop;
+                const originalHeight = chatContainer.style.height;
+                const originalOverflow = chatContainer.style.overflow;
+                
+                // Temporarily expand the container to show all content
+                chatContainer.style.height = 'auto';
+                chatContainer.style.maxHeight = 'none';
+                chatContainer.style.overflow = 'visible';
+                
+                // Wait for layout to update
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                // Capture the chat container
+                const canvas = await html2canvas(chatContainer, {
+                    backgroundColor: '#f8f9fa',
+                    scale: 2, // Higher quality
+                    useCORS: true,
+                    allowTaint: true,
+                    logging: false
+                });
+                
+                // Restore original dimensions
+                chatContainer.style.height = originalHeight;
+                chatContainer.style.maxHeight = '';
+                chatContainer.style.overflow = originalOverflow;
+                chatContainer.scrollTop = originalScrollTop;
+                
+                // Convert canvas to PNG blob
+                const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+                
+                // Use the Clipboard API with ClipboardItem - this is the ONLY way to copy
+                // an actual image to clipboard. On localhost/HTTP, browsers block this.
+                // So we need to just download the file directly.
+                try {
+                    await navigator.clipboard.write([
+                        new ClipboardItem({ 'image/png': blob })
+                    ]);
+                    exportBtn.innerHTML = '✓ Copied!';
+                    setTimeout(() => {
+                        exportBtn.innerHTML = originalHTML;
+                        exportBtn.classList.remove('copying');
+                    }, 2000);
+                } catch (clipboardError) {
+                    console.log('Clipboard API blocked (requires HTTPS). Downloading instead.');
+                    // Download is the only reliable fallback on HTTP
+                    const link = document.createElement('a');
+                    link.download = 'mister-risker-chat-' + new Date().toISOString().slice(0,10) + '.png';
+                    link.href = URL.createObjectURL(blob);
+                    link.click();
+                    URL.revokeObjectURL(link.href);
+                    exportBtn.innerHTML = '⬇️ Downloaded!';
+                    setTimeout(() => {
+                        exportBtn.innerHTML = originalHTML;
+                        exportBtn.classList.remove('copying');
+                    }, 2000);
+                }
+                
+            } catch (error) {
+                console.error('Export failed:', error);
+                exportBtn.innerHTML = '❌ Failed';
+                setTimeout(() => {
+                    exportBtn.innerHTML = originalHTML;
+                    exportBtn.classList.remove('copying');
+                }, 2000);
+            }
+        }
+        
         messageInput.focus();
     </script>
 </body>
@@ -1287,14 +1902,19 @@ async def get_chat_page():
 
 @app.post("/chat")
 async def chat(request: Request):
-    """Process a chat message."""
+    """Process a chat message, optionally with an image."""
     data = await request.json()
     message = data.get("message", "")
+    image_data = data.get("image", None)
     
-    if not message:
+    if not message and not image_data:
         return {"response": "Please enter a message."}
     
-    response = await chatbot.process_message(message)
+    # If there's an image, include it in the prompt for vision models
+    if image_data:
+        response = await chatbot.process_message_with_image(message, image_data)
+    else:
+        response = await chatbot.process_message(message)
     return {"response": response}
 
 
