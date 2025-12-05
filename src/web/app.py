@@ -38,6 +38,7 @@ from src.mcp_servers.schwab import SchwabMCPServer, SchwabAPIError
 from src.agents.coinbase_agent import CoinbaseAgent, CoinbaseAgentError
 from src.agents.schwab_agent import SchwabAgent, SchwabAgentError
 from src.agents.researcher_agent import ResearcherAgent, ResearcherAgentError
+from src.agents.supervisor_agent import SupervisorAgent, SupervisorAgentError
 
 # Load environment variables
 load_dotenv()
@@ -74,6 +75,7 @@ class TradingChatBot:
         self.coinbase_agent: CoinbaseAgent | None = None
         self.schwab_agent: SchwabAgent | None = None
         self.researcher_agent: ResearcherAgent | None = None
+        self.supervisor_agent: SupervisorAgent | None = None
         
         # Configuration
         self.use_agents = use_agents
@@ -86,6 +88,10 @@ class TradingChatBot:
         # Memory/checkpointing for agent state persistence
         self.checkpointer = InMemorySaver()
         self.thread_id = str(uuid.uuid4())
+        
+        # Store last supervisor logs for frontend debugging
+        self.last_supervisor_logs: list = []
+        self.last_agent_used: str = ""
         
         # System prompt for the LLM
         self.system_prompt = """You are Mister Risker, a helpful multi-broker trading assistant. You can help users trade on both Coinbase (crypto) and Schwab (stocks/options).
@@ -236,10 +242,28 @@ If you don't need to call a tool, just respond normally with text."""
         elif not finnhub_api_key:
             logger.info("  - FINNHUB_API_KEY not set (Researcher Agent disabled)")
         
+        # Initialize Supervisor Agent (Mister Risker as orchestrator)
+        if self.use_agents and self.llm:
+            try:
+                self.supervisor_agent = SupervisorAgent(
+                    llm=self.llm,
+                    coinbase_agent=self.coinbase_agent,
+                    schwab_agent=self.schwab_agent,
+                    researcher_agent=self.researcher_agent,
+                    checkpointer=self.checkpointer,
+                    enable_chain_of_thought=self.enable_chain_of_thought
+                )
+                logger.info("  ✓ Supervisor Agent (Mister Risker) initialized")
+            except Exception as e:
+                logger.warning(f"  ✗ Could not initialize Supervisor Agent: {e}")
+        
         logger.info("TradingChatBot initialization complete")
     
     async def process_message(self, user_message: str) -> str:
         """Process a user message and return a response.
+        
+        Uses the Supervisor Agent pattern where Mister Risker decides which
+        sub-agent to delegate to based on the query content.
         
         Args:
             user_message: The user's message
@@ -253,18 +277,31 @@ If you don't need to call a tool, just respond normally with text."""
             logger.error("LLM not configured")
             return "Error: LLM not configured. Please set OPENAI_API_KEY in your .env file."
         
-        # Check for broker switch commands
-        lower_msg = user_message.lower()
-        if "switch to schwab" in lower_msg or "use schwab" in lower_msg:
+        # Handle explicit broker switching commands (legacy support)
+        lower_message = user_message.lower().strip()
+        if "switch to schwab" in lower_message:
             self.active_broker = "schwab"
-            logger.info("Switched to Schwab broker")
-            return "🔄 Switched to **Schwab** (stocks and options trading). How can I help you with your Schwab account?"
-        elif "switch to coinbase" in lower_msg or "use coinbase" in lower_msg:
-            self.active_broker = "coinbase"
-            logger.info("Switched to Coinbase broker")
-            return "🔄 Switched to **Coinbase** (crypto trading). How can I help you with your crypto portfolio?"
+            self.last_agent_used = "direct"
+            self.last_supervisor_logs = ["[SUPERVISOR] Direct broker switch to Schwab"]
+            logger.info(">>> BROKER SWITCH: Switched to Schwab")
+            # Add to conversation history
+            self.conversation_history.append(HumanMessage(content=user_message))
+            response = "Switched to **Schwab**! I'll now focus on stock and options trading. How can I help you with your Schwab account?"
+            self.conversation_history.append(AIMessage(content=response))
+            return response
         
-        # Check if this is an image generation request
+        if "switch to coinbase" in lower_message:
+            self.active_broker = "coinbase"
+            self.last_agent_used = "direct"
+            self.last_supervisor_logs = ["[SUPERVISOR] Direct broker switch to Coinbase"]
+            logger.info(">>> BROKER SWITCH: Switched to Coinbase")
+            # Add to conversation history
+            self.conversation_history.append(HumanMessage(content=user_message))
+            response = "Switched to **Coinbase**! I'll now focus on cryptocurrency trading. How can I help you with your Coinbase account?"
+            self.conversation_history.append(AIMessage(content=response))
+            return response
+        
+        # Check if this is an image generation request (handle separately)
         if self._is_image_generation_request(user_message):
             logger.info(">>> IMAGE GENERATION request detected")
             try:
@@ -291,45 +328,95 @@ If you don't need to call a tool, just respond normally with text."""
                 logger.error(f"Image generation error: {e}", exc_info=True)
                 # Fall through to normal processing
         
-        # Check if this is a research query and we have the researcher agent
-        is_research = self._is_research_query(user_message)
-        logger.info(f"Query analysis: use_agents={self.use_agents}, researcher_agent={self.researcher_agent is not None}, is_research_query={is_research}")
-        
-        if self.use_agents and self.researcher_agent and is_research:
-            logger.info(">>> DELEGATING to Researcher Agent")
+        # === SUPERVISOR AGENT PATTERN ===
+        # Mister Risker (supervisor) decides which sub-agent to use
+        if self.use_agents and self.supervisor_agent:
+            logger.info(">>> SUPERVISOR AGENT routing query")
             try:
-                research_result = await self._execute_research(user_message)
-                logger.info(f"Research result keys: {research_result.keys() if research_result else 'None'}")
+                # Format conversation history for the supervisor
+                history = self._format_history_for_agent()
+                config = self._get_agent_config()
                 
-                if "error" in research_result:
-                    logger.warning(f"Research returned error: {research_result.get('error')}")
-                    # Fall through to normal processing if research fails
-                else:
-                    response_text = research_result.get("response", "")
-                    reasoning_steps = research_result.get("reasoning_steps", [])
-                    logger.info(f"Research response length: {len(response_text)}, reasoning_steps: {len(reasoning_steps)}")
-                    
-                    # Add reasoning context if available
-                    if reasoning_steps and self.enable_chain_of_thought:
-                        reasoning_summary = "\n".join(f"• {step}" for step in reasoning_steps[:3])
-                        response_text = f"🔍 **Research Analysis:**\n\n{response_text}"
-                    
-                    # Add to conversation history
-                    self.conversation_history.append(HumanMessage(content=user_message))
+                # Execute supervisor workflow - it will route to appropriate sub-agent
+                result = await self.supervisor_agent.execute(
+                    user_message=user_message,
+                    conversation_history=history,
+                    config=config
+                )
+                
+                response_text = result.get("response", "")
+                agent_used = result.get("agent_used", "unknown")
+                reasoning = result.get("reasoning", "")
+                logs = result.get("logs", [])
+                
+                # Store logs for frontend debugging
+                self.last_supervisor_logs = logs
+                self.last_agent_used = agent_used
+                
+                # Log the delegation details
+                logger.info(f"[SUPERVISOR] Delegated to: {agent_used}")
+                logger.info(f"[SUPERVISOR] Reasoning: {reasoning}")
+                for log_entry in logs:
+                    logger.info(log_entry)
+                
+                # Add to conversation history
+                self.conversation_history.append(HumanMessage(content=user_message))
+                self.conversation_history.append(AIMessage(content=response_text))
+                
+                logger.info(f"<<< SUPERVISOR completed via {agent_used}")
+                return response_text
+                
+            except SupervisorAgentError as e:
+                logger.error(f"Supervisor agent error: {e}")
+                # Fall through to legacy handling
+            except Exception as e:
+                logger.error(f"Supervisor error: {e}", exc_info=True)
+                # Fall through to legacy handling
+        
+        # === LEGACY FALLBACK (when supervisor not available) ===
+        logger.info(f"Using legacy flow (supervisor not available)")
+        
+        # Early check for broker availability on trading-related queries
+        trading_keywords = ["balance", "buy", "sell", "order", "position", "account", "portfolio", "trade"]
+        if any(kw in lower_message for kw in trading_keywords):
+            if self.active_broker == "coinbase":
+                if not self.coinbase_server and not self.coinbase_agent:
+                    other_broker_msg = " (Schwab is available - say 'switch to schwab' to use it)" if self.schwab_server or self.schwab_agent else ""
+                    return f"Error: Coinbase not configured. Please set your Coinbase API credentials in the .env file.{other_broker_msg}"
+            elif self.active_broker == "schwab":
+                if not self.schwab_server and not self.schwab_agent:
+                    other_broker_msg = " (Coinbase is available - say 'switch to coinbase' to use it)" if self.coinbase_server or self.coinbase_agent else ""
+                    return f"Error: Schwab not configured. Please set your Schwab API credentials in the .env file.{other_broker_msg}"
+        
+        # Check for research-related queries and delegate to researcher agent
+        research_keywords = ["news", "research", "analyze", "analysis", "earnings", "financials", "recommend", "recommendation"]
+        if self.researcher_agent and any(kw in lower_message for kw in research_keywords):
+            logger.info(">>> LEGACY: Delegating to Researcher Agent")
+            try:
+                # Add to conversation history
+                self.conversation_history.append(HumanMessage(content=user_message))
+                
+                # Execute research
+                result = await self.researcher_agent.run(
+                    query=user_message,
+                    messages=self._format_history_for_agent(),
+                    config=self._get_agent_config()
+                )
+                
+                if result.get("status") == "success":
+                    response_text = result.get("response", "Research completed.")
                     self.conversation_history.append(AIMessage(content=response_text))
-                    
-                    logger.info("<<< Researcher Agent completed successfully")
+                    self.last_agent_used = "researcher"
+                    self.last_supervisor_logs = [
+                        f"[LEGACY] Detected research query",
+                        f"[LEGACY] Delegated to Researcher Agent",
+                        f"[LEGACY] Research completed successfully"
+                    ]
+                    logger.info("<<< LEGACY: Research delegation completed")
                     return response_text
             except Exception as e:
-                # Fall through to normal processing if research fails
-                logger.error(f"Research agent error: {e}", exc_info=True)
-        
-        # Check if active broker is configured
-        logger.info(f"Using standard LLM flow with active_broker={self.active_broker}")
-        if self.active_broker == "coinbase" and not self.coinbase_server:
-            return "Error: Coinbase not configured. Please set COINBASE_API_KEY and COINBASE_API_SECRET in your .env file, or say 'switch to schwab'."
-        elif self.active_broker == "schwab" and not self.schwab_server:
-            return "Error: Schwab not configured. Please set SCHWAB_CLIENT_ID, SCHWAB_CLIENT_SECRET, and SCHWAB_REFRESH_TOKEN in your .env file, or say 'switch to coinbase'."
+                logger.error(f"Research delegation error: {e}", exc_info=True)
+                # Fall through to normal processing
         
         # Add user message to history
         self.conversation_history.append(HumanMessage(content=user_message))
@@ -926,22 +1013,6 @@ HTML_TEMPLATE = r"""
             gap: 10px;
         }
         
-        .broker-indicator {
-            padding: 6px 12px;
-            border-radius: 20px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            text-transform: uppercase;
-        }
-        
-        .broker-coinbase {
-            background: linear-gradient(135deg, #0052ff 0%, #0039b3 100%);
-        }
-        
-        .broker-schwab {
-            background: linear-gradient(135deg, #00a0dc 0%, #006b99 100%);
-        }
-        
         .chat-container {
             height: 550px;
             overflow-y: auto;
@@ -1302,11 +1373,6 @@ HTML_TEMPLATE = r"""
             border-color: transparent;
         }
         
-        .suggestion.broker-switch {
-            border-color: #00d4aa;
-            color: #00d4aa;
-        }
-        
         .clear-btn {
             padding: 6px 12px;
             background: rgba(255,255,255,0.2);
@@ -1434,7 +1500,6 @@ HTML_TEMPLATE = r"""
             <div class="header-logo">M</div>
             <h1>Mister Risker</h1>
             <div class="header-right">
-                <span class="broker-indicator broker-coinbase" id="brokerIndicator">Coinbase</span>
                 <button class="export-btn" onclick="exportChatToClipboard()" title="Copy conversation as image">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
@@ -1457,7 +1522,6 @@ HTML_TEMPLATE = r"""
             <span class="suggestion" onclick="sendSuggestion('What are my account balances?')">💰 Balances</span>
             <span class="suggestion" onclick="sendSuggestion('What is the current price of Bitcoin?')">₿ BTC Price</span>
             <span class="suggestion" onclick="sendSuggestion('Show my portfolio')">💼 Portfolio</span>
-            <span class="suggestion broker-switch" onclick="sendSuggestion('Switch to Schwab')">🔄 Switch to Schwab</span>
             <span class="suggestion" onclick="sendSuggestion('Tell me the latest market news')">📰 Latest News</span>
             <span class="suggestion" onclick="sendSuggestion('What do you think about AAPL?')">🔍 Research AAPL</span>
         </div>
@@ -1495,8 +1559,7 @@ HTML_TEMPLATE = r"""
         const chatContainer = document.getElementById('chatContainer');
         const messageInput = document.getElementById('messageInput');
         const sendBtn = document.getElementById('sendBtn');
-        const brokerIndicator = document.getElementById('brokerIndicator');
-        const brokerSwitchBtn = document.querySelector('.broker-switch');
+
         const imagePreviewContainer = document.getElementById('imagePreviewContainer');
         const imagePreview = document.getElementById('imagePreview');
         const imageFilename = document.getElementById('imageFilename');
@@ -1537,46 +1600,32 @@ HTML_TEMPLATE = r"""
         }
         
         // Welcome message content
-        const welcomeMarkdown = `👋 Hello! I'm **Mister Risker**, your multi-broker trading assistant.
+        const welcomeMarkdown = `👋 Hello! I'm **Mister Risker**, your AI trading assistant.
 
-I can help you trade on both **Coinbase** (crypto) and **Schwab** (stocks/options).
+I can help you with:
 
-### 🪙 Coinbase (Currently Active)
+### 🪙 Cryptocurrency (Coinbase)
 - Check crypto balances and prices
 - Buy/sell Bitcoin, Ethereum, and more
 - View your crypto portfolio
 
-### 📈 Schwab
+### 📈 Stocks & Options (Schwab)
 - Check stock account balances
 - Get stock quotes and option chains
 - Place equity and options orders
 
-### 🔍 Research
-- Ask me to **analyze any stock** (e.g., "What do you think about TSLA?")
-- Get the **latest market news**
+### 🔍 Research & Analysis
+- Analyze any stock (e.g., "What do you think about TSLA?")
+- Get the latest market news
 - Compare stocks and get recommendations
 
-> Say "switch to schwab" or "switch to coinbase" to change brokers.
+### 🎨 Creative
+- Generate images, diagrams, and visualizations
 
 What would you like to do today?`;
 
         // Render welcome message
         document.getElementById('welcomeMessage').innerHTML = marked.parse(welcomeMarkdown);
-        
-        function updateBrokerUI(text) {
-            const lowerText = text.toLowerCase();
-            if (lowerText.includes('switched to schwab') || lowerText.includes('switched to **schwab**')) {
-                brokerIndicator.textContent = 'Schwab';
-                brokerIndicator.className = 'broker-indicator broker-schwab';
-                brokerSwitchBtn.textContent = '🔄 Switch to Coinbase';
-                brokerSwitchBtn.onclick = function() { sendSuggestion('Switch to Coinbase'); };
-            } else if (lowerText.includes('switched to coinbase') || lowerText.includes('switched to **coinbase**')) {
-                brokerIndicator.textContent = 'Coinbase';
-                brokerIndicator.className = 'broker-indicator broker-coinbase';
-                brokerSwitchBtn.textContent = '🔄 Switch to Schwab';
-                brokerSwitchBtn.onclick = function() { sendSuggestion('Switch to Schwab'); };
-            }
-        }
         
         function renderMarkdown(text) {
             // Check if it's a research response
@@ -1727,10 +1776,6 @@ What would you like to do today?`;
             chatContainer.appendChild(messageDiv);
             
             chatContainer.scrollTop = chatContainer.scrollHeight;
-            
-            if (!isUser) {
-                updateBrokerUI(content);
-            }
         }
         
         function showTyping() {
@@ -1756,6 +1801,10 @@ What would you like to do today?`;
             const message = messageInput.value.trim();
             if (!message && !currentImageData) return;
             
+            // Log to console for debugging
+            console.log('[MISTER RISKER] User message:', message);
+            console.log('[MISTER RISKER] Sending to supervisor agent for routing...');
+            
             // Show user message with image if present
             addMessage(message || '[Image]', true, currentImageData);
             
@@ -1771,6 +1820,9 @@ What would you like to do today?`;
                     payload.image = imageToSend;
                 }
                 
+                console.log('[MISTER RISKER] Sending request to /chat endpoint...');
+                const startTime = performance.now();
+                
                 const response = await fetch('/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1778,9 +1830,23 @@ What would you like to do today?`;
                 });
                 
                 const data = await response.json();
+                const elapsed = (performance.now() - startTime).toFixed(0);
+                
+                console.log('[MISTER RISKER] Response received in', elapsed, 'ms');
+                console.log('[MISTER RISKER] Agent used:', data.agent_used || 'unknown');
+                console.log('[MISTER RISKER] Response preview:', data.response?.substring(0, 100) + '...');
+                
+                // Log supervisor delegation info if available
+                if (data.logs && Array.isArray(data.logs)) {
+                    console.group('[MISTER RISKER] Supervisor Logs:');
+                    data.logs.forEach(log => console.log(log));
+                    console.groupEnd();
+                }
+                
                 hideTyping();
                 addMessage(data.response, false);
             } catch (error) {
+                console.error('[MISTER RISKER] Error:', error);
                 hideTyping();
                 addMessage('Sorry, there was an error processing your request.', false);
             }
@@ -1803,10 +1869,6 @@ What would you like to do today?`;
         async function clearChat() {
             try {
                 await fetch('/clear', { method: 'POST' });
-                brokerIndicator.textContent = 'Coinbase';
-                brokerIndicator.className = 'broker-indicator broker-coinbase';
-                brokerSwitchBtn.textContent = '🔄 Switch to Schwab';
-                brokerSwitchBtn.onclick = function() { sendSuggestion('Switch to Schwab'); };
                 chatContainer.innerHTML = `
                     <div class="message assistant">
                         <span class="message-label">Mister Risker</span>
@@ -1924,7 +1986,13 @@ async def chat(request: Request):
         response = await chatbot.process_message_with_image(message, image_data)
     else:
         response = await chatbot.process_message(message)
-    return {"response": response}
+    
+    # Include supervisor logs for frontend debugging
+    return {
+        "response": response,
+        "agent_used": chatbot.last_agent_used,
+        "logs": chatbot.last_supervisor_logs
+    }
 
 
 @app.post("/clear")

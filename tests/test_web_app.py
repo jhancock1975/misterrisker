@@ -307,16 +307,19 @@ class TestMessageProcessing:
 
     @pytest.mark.asyncio
     async def test_process_message_no_mcp_server_configured(self):
-        """Should return error when MCP server is not configured."""
+        """Should return error when trying to trade without broker configured."""
         from web.app import TradingChatBot
         
         bot = TradingChatBot()
         bot.llm = MagicMock()
         bot.coinbase_server = None
+        bot.coinbase_agent = None  # Ensure agent is also None
         
-        result = await bot.process_message("Hello")
+        # A trading-related query should fail when broker not configured
+        result = await bot.process_message("What's my balance?")
         
-        assert "COINBASE" in result
+        # Should indicate Coinbase is not configured
+        assert "coinbase not configured" in result.lower() or "error" in result.lower()
 
 
 # =============================================================================

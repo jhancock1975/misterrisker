@@ -1,0 +1,367 @@
+"""Mister Risker Supervisor Agent - Orchestrates sub-agents for trading tasks.
+
+This module implements the supervisor pattern where Mister Risker acts as the main
+orchestrator agent, delegating tasks to specialized sub-agents:
+- CoinbaseAgent: For cryptocurrency trading (buy/sell crypto, check balances)
+- SchwabAgent: For stock/options trading (quotes, orders, account info)
+- ResearcherAgent: For investment research and analysis
+
+The supervisor decides which agent(s) to invoke based on the user's query,
+without requiring manual broker switching.
+"""
+
+import logging
+from typing import Any, Literal, Optional
+from dataclasses import dataclass
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+# Configure logging
+logger = logging.getLogger("mister_risker.supervisor")
+
+
+class SupervisorAgentError(Exception):
+    """Exception raised by the Supervisor Agent."""
+    pass
+
+
+class RoutingDecision(BaseModel):
+    """Schema for the supervisor's routing decision."""
+    agent: Literal["coinbase", "schwab", "researcher", "direct"] = Field(
+        description="Which agent should handle this request. 'direct' means respond without delegation."
+    )
+    reasoning: str = Field(
+        description="Brief explanation of why this agent was chosen."
+    )
+    query_for_agent: str = Field(
+        description="The query or instruction to pass to the sub-agent, or direct response if agent='direct'."
+    )
+
+
+class SupervisorState(MessagesState):
+    """State for the supervisor agent workflow."""
+    routing_decision: Optional[dict] = None
+    agent_response: Optional[str] = None
+    sub_agent_logs: list[str] = []
+
+
+class SupervisorAgent:
+    """Mister Risker - The main supervisor agent that orchestrates sub-agents.
+    
+    This agent receives all user queries and decides which specialized sub-agent
+    should handle them. It implements the "tool calling" multi-agent pattern
+    where sub-agents are treated as tools.
+    
+    Attributes:
+        llm: The language model for decision making
+        coinbase_agent: Sub-agent for crypto trading
+        schwab_agent: Sub-agent for stock/options trading
+        researcher_agent: Sub-agent for investment research
+    """
+    
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        coinbase_agent: Any = None,
+        schwab_agent: Any = None,
+        researcher_agent: Any = None,
+        checkpointer: Optional[InMemorySaver] = None,
+        enable_chain_of_thought: bool = True
+    ):
+        """Initialize the Supervisor Agent.
+        
+        Args:
+            llm: Language model for routing decisions
+            coinbase_agent: CoinbaseAgent instance (optional)
+            schwab_agent: SchwabAgent instance (optional)
+            researcher_agent: ResearcherAgent instance (optional)
+            checkpointer: State persistence (optional)
+            enable_chain_of_thought: Whether to log reasoning steps
+        """
+        self.llm = llm
+        self.coinbase_agent = coinbase_agent
+        self.schwab_agent = schwab_agent
+        self.researcher_agent = researcher_agent
+        self.checkpointer = checkpointer or InMemorySaver()
+        self.enable_chain_of_thought = enable_chain_of_thought
+        
+        # Build routing decision maker with structured output
+        self.router = llm.with_structured_output(RoutingDecision)
+        
+        # Track available agents for routing
+        self.available_agents = self._get_available_agents()
+        
+        logger.info(f"SupervisorAgent initialized with sub-agents: {list(self.available_agents.keys())}")
+    
+    def _get_available_agents(self) -> dict[str, Any]:
+        """Get dictionary of available sub-agents."""
+        agents = {}
+        if self.coinbase_agent:
+            agents["coinbase"] = self.coinbase_agent
+        if self.schwab_agent:
+            agents["schwab"] = self.schwab_agent
+        if self.researcher_agent:
+            agents["researcher"] = self.researcher_agent
+        return agents
+    
+    def _build_routing_prompt(self) -> str:
+        """Build the system prompt for routing decisions."""
+        agent_descriptions = []
+        
+        if self.coinbase_agent:
+            agent_descriptions.append("""
+**Coinbase Agent** (agent="coinbase"):
+- Check cryptocurrency balances and portfolio
+- Get current crypto prices (Bitcoin, Ethereum, etc.)
+- Place buy/sell orders for cryptocurrencies
+- View open orders and transaction history
+- Use for ANY crypto-related queries""")
+        
+        if self.schwab_agent:
+            agent_descriptions.append("""
+**Schwab Agent** (agent="schwab"):
+- Check stock account balances and positions
+- Get stock quotes and option chains
+- Place equity and options orders
+- View market movers and market hours
+- Use for ANY stock/options/equity-related queries""")
+        
+        if self.researcher_agent:
+            agent_descriptions.append("""
+**Researcher Agent** (agent="researcher"):
+- Investment research and analysis
+- Stock/company analysis with news and sentiment
+- Compare investments
+- Risk assessment and recommendations
+- Analyst ratings and financial metrics
+- Use for questions asking for opinions, analysis, or research""")
+        
+        agents_section = "\n".join(agent_descriptions)
+        
+        return f"""You are Mister Risker, a multi-broker trading assistant supervisor.
+Your job is to analyze user requests and route them to the appropriate specialized sub-agent.
+
+## Available Sub-Agents:
+{agents_section}
+
+## Routing Guidelines:
+1. **Coinbase**: Route here for crypto balances, crypto prices, crypto orders, Bitcoin, Ethereum, etc.
+2. **Schwab**: Route here for stock quotes, stock orders, options, equity positions, market hours, etc.
+3. **Researcher**: Route here for analysis, opinions, news, comparisons, "what do you think", recommendations
+4. **Direct**: Only use for greetings, general chat, or when no agent is appropriate
+
+## Important Rules:
+- If user mentions "Schwab account", "stock balance", or stock symbols like AAPL/TSLA → use Schwab
+- If user mentions "Coinbase", "crypto", "Bitcoin", "ETH" → use Coinbase
+- If user asks "what do you think", "analyze", "research", or wants opinions → use Researcher
+- NEVER ask the user to "switch brokers" - YOU decide which agent to use
+- Pass the full context needed to the sub-agent in query_for_agent
+
+Analyze the user's message and decide which agent should handle it."""
+    
+    async def route_query(
+        self, 
+        user_message: str, 
+        conversation_history: list[dict] = None
+    ) -> RoutingDecision:
+        """Route a user query to the appropriate sub-agent.
+        
+        Args:
+            user_message: The user's query
+            conversation_history: Previous conversation context
+        
+        Returns:
+            RoutingDecision with agent choice and reasoning
+        """
+        logger.info(f"[SUPERVISOR] Routing query: '{user_message[:80]}...'")
+        
+        # Build routing messages
+        messages = [
+            SystemMessage(content=self._build_routing_prompt())
+        ]
+        
+        # Add relevant conversation context
+        if conversation_history:
+            for msg in conversation_history[-5:]:  # Last 5 messages for context
+                if msg.get("role") == "user":
+                    messages.append(HumanMessage(content=msg["content"]))
+                elif msg.get("role") == "assistant":
+                    messages.append(AIMessage(content=msg["content"]))
+        
+        # Add current query
+        messages.append(HumanMessage(content=user_message))
+        
+        try:
+            decision = await self.router.ainvoke(messages)
+            logger.info(f"[SUPERVISOR] Routing decision: agent={decision.agent}, reason={decision.reasoning}")
+            return decision
+        except Exception as e:
+            logger.error(f"[SUPERVISOR] Routing error: {e}")
+            # Default to direct response on error
+            return RoutingDecision(
+                agent="direct",
+                reasoning=f"Routing error: {e}",
+                query_for_agent="I apologize, I had trouble processing your request. Could you please rephrase it?"
+            )
+    
+    async def execute(
+        self,
+        user_message: str,
+        conversation_history: list[dict] = None,
+        config: dict = None
+    ) -> dict:
+        """Execute the supervisor workflow.
+        
+        Args:
+            user_message: The user's query
+            conversation_history: Previous messages for context
+            config: LangGraph config with thread_id
+        
+        Returns:
+            Dict with response, agent_used, and logs
+        """
+        logs = []
+        logs.append(f"[SUPERVISOR] Received query: {user_message}")
+        
+        # Step 1: Route the query
+        decision = await self.route_query(user_message, conversation_history)
+        logs.append(f"[SUPERVISOR] Routing to: {decision.agent} (reason: {decision.reasoning})")
+        
+        # Step 2: Execute on chosen agent
+        if decision.agent == "direct":
+            # Supervisor responds directly without delegation
+            logs.append(f"[SUPERVISOR] Responding directly without delegation")
+            response = decision.query_for_agent
+            
+        elif decision.agent == "coinbase":
+            if not self.coinbase_agent:
+                logs.append(f"[SUPERVISOR] ERROR: Coinbase agent not available")
+                response = "I'd like to help with your Coinbase request, but the Coinbase integration is not configured. Please check your API credentials."
+            else:
+                logs.append(f"[SUPERVISOR] Delegating to Coinbase Agent")
+                try:
+                    result = await self._call_coinbase_agent(decision.query_for_agent, config)
+                    response = result.get("response", str(result))
+                    logs.append(f"[COINBASE AGENT] Completed: {len(response)} chars")
+                except Exception as e:
+                    logs.append(f"[COINBASE AGENT] Error: {e}")
+                    response = f"I encountered an error with the Coinbase agent: {e}"
+        
+        elif decision.agent == "schwab":
+            if not self.schwab_agent:
+                logs.append(f"[SUPERVISOR] ERROR: Schwab agent not available")
+                response = "I'd like to help with your Schwab request, but the Schwab integration is not configured. Please check your API credentials."
+            else:
+                logs.append(f"[SUPERVISOR] Delegating to Schwab Agent")
+                try:
+                    result = await self._call_schwab_agent(decision.query_for_agent, config)
+                    response = result.get("response", str(result))
+                    logs.append(f"[SCHWAB AGENT] Completed: {len(response)} chars")
+                except Exception as e:
+                    logs.append(f"[SCHWAB AGENT] Error: {e}")
+                    response = f"I encountered an error with the Schwab agent: {e}"
+        
+        elif decision.agent == "researcher":
+            if not self.researcher_agent:
+                logs.append(f"[SUPERVISOR] ERROR: Researcher agent not available")
+                response = "I'd like to help with your research request, but the Researcher agent is not configured. Please check your FINNHUB_API_KEY."
+            else:
+                logs.append(f"[SUPERVISOR] Delegating to Researcher Agent")
+                try:
+                    result = await self._call_researcher_agent(decision.query_for_agent, conversation_history, config)
+                    response = result.get("response", str(result))
+                    logs.append(f"[RESEARCHER AGENT] Completed: {len(response)} chars")
+                except Exception as e:
+                    logs.append(f"[RESEARCHER AGENT] Error: {e}")
+                    response = f"I encountered an error with the Researcher agent: {e}"
+        
+        else:
+            logs.append(f"[SUPERVISOR] Unknown agent: {decision.agent}")
+            response = f"I'm not sure how to handle this request. Could you please rephrase?"
+        
+        # Log all steps
+        for log in logs:
+            logger.info(log)
+        
+        return {
+            "response": response,
+            "agent_used": decision.agent,
+            "reasoning": decision.reasoning,
+            "logs": logs
+        }
+    
+    async def _call_coinbase_agent(self, query: str, config: dict = None) -> dict:
+        """Call the Coinbase sub-agent.
+        
+        Args:
+            query: Query to pass to the agent
+            config: LangGraph config
+        
+        Returns:
+            Agent response dict
+        """
+        logger.info(f"[COINBASE AGENT] Processing: {query[:60]}...")
+        
+        # The CoinbaseAgent expects a natural language query
+        # We need to process it through the agent's workflow
+        try:
+            result = await self.coinbase_agent.run(query, config=config)
+            return result if isinstance(result, dict) else {"response": str(result)}
+        except Exception as e:
+            logger.error(f"[COINBASE AGENT] Error: {e}")
+            raise
+    
+    async def _call_schwab_agent(self, query: str, config: dict = None) -> dict:
+        """Call the Schwab sub-agent.
+        
+        Args:
+            query: Query to pass to the agent
+            config: LangGraph config
+        
+        Returns:
+            Agent response dict
+        """
+        logger.info(f"[SCHWAB AGENT] Processing: {query[:60]}...")
+        
+        try:
+            result = await self.schwab_agent.run(query, config=config)
+            return result if isinstance(result, dict) else {"response": str(result)}
+        except Exception as e:
+            logger.error(f"[SCHWAB AGENT] Error: {e}")
+            raise
+    
+    async def _call_researcher_agent(
+        self, 
+        query: str, 
+        conversation_history: list[dict] = None,
+        config: dict = None
+    ) -> dict:
+        """Call the Researcher sub-agent.
+        
+        Args:
+            query: Query to pass to the agent
+            conversation_history: Conversation context
+            config: LangGraph config
+        
+        Returns:
+            Agent response dict
+        """
+        logger.info(f"[RESEARCHER AGENT] Processing: {query[:60]}...")
+        
+        try:
+            result = await self.researcher_agent.run(
+                query=query,
+                messages=conversation_history or [],
+                config=config,
+                return_structured=True
+            )
+            return result if isinstance(result, dict) else {"response": str(result)}
+        except Exception as e:
+            logger.error(f"[RESEARCHER AGENT] Error: {e}")
+            raise
