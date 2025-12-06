@@ -419,7 +419,18 @@ When responding to the user:
         # Generate response using LLM
         try:
             response = await self.llm.ainvoke(messages)
-            return response.content
+            # Extract content safely - response.content might be a string or a list
+            content = response.content if hasattr(response, "content") else str(response)
+            if isinstance(content, list):
+                # Handle list of content blocks (e.g., from Claude)
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                return "".join(text_parts) if text_parts else str(content)
+            return content if isinstance(content, str) else str(content)
         except Exception as e:
             logger.error(f"[SUPERVISOR] Error generating direct response: {e}")
             return f"I apologize, I had trouble processing that. Could you please rephrase your question?"

@@ -512,7 +512,7 @@ class TestAgentErrorHandling:
 
     @pytest.mark.asyncio
     async def test_handles_ambiguous_query(self, researcher_agent, log):
-        """Should handle ambiguous queries."""
+        """Should handle ambiguous queries and always return a string response."""
         log.info("Testing ambiguous query handling")
         
         result = await researcher_agent.run("Tell me about the stock")
@@ -520,9 +520,30 @@ class TestAgentErrorHandling:
         log.info(f"Result: {result}")
         
         assert "response" in result
-        # Agent should ask for clarification or make reasonable assumptions
+        # Response must always be a string, never an object or None
+        assert isinstance(result["response"], str), f"response must be a string, got {type(result['response'])}"
+        assert len(result["response"]) > 0, "response must not be empty"
         
-        log.info("RESULT: Ambiguous query handled")
+        log.info("RESULT: Ambiguous query handled with string response")
+
+    @pytest.mark.asyncio
+    async def test_handles_non_financial_query(self, researcher_agent, log):
+        """Should handle non-financial queries gracefully with a string response."""
+        log.info("Testing non-financial query handling")
+        
+        # This query has no stock symbols and no financial keywords
+        result = await researcher_agent.run("Why do cats purr?")
+        
+        log.info(f"Result: {result}")
+        
+        assert "response" in result
+        # Response must always be a string, never an object or None
+        assert isinstance(result["response"], str), f"response must be a string, got {type(result['response'])}"
+        assert len(result["response"]) > 0, "response must not be empty"
+        # Should NOT contain the lazy cop-out message
+        assert "I couldn't find any specific stocks" not in result["response"]
+        
+        log.info("RESULT: Non-financial query handled with string response")
 
 
 # =============================================================================

@@ -542,6 +542,72 @@ class ResearcherAgent:
         })
         
         return state
+
+    async def _generate_conversational_response(self, state: ResearcherAgentState) -> ResearcherAgentState:
+        """Generate a helpful conversational response when no research tools are needed.
+        
+        This is used when the query doesn't require stock lookups or web searches,
+        but we still want to provide a thoughtful, context-aware response.
+        
+        Args:
+            state: Current workflow state
+        
+        Returns:
+            Updated state with response
+        """
+        query = state.get("query", "")
+        messages = state.get("messages", [])
+        
+        if not self.llm:
+            state["response"] = "I can help you with investment research, stock analysis, and market news. What would you like to know?"
+            return state
+        
+        # Build conversation context
+        history_context = ""
+        if messages:
+            history_lines = []
+            for msg in messages[-10:]:  # Last 10 messages for context
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                history_lines.append(f"{role}: {content}")
+            if history_lines:
+                history_context = "Previous conversation:\n" + "\n".join(history_lines)
+        
+        prompt = f"""You are Mister Risker, an AI trading and investment assistant.
+You have access to tools for:
+- Stock quotes and analysis (Finnhub)
+- Company financials and news
+- Web search for current information
+- Coinbase for crypto trading
+- Schwab for stocks/options trading
+
+The user has asked a question that may not require looking up specific data.
+Use the conversation history to provide a helpful, intelligent response.
+
+{history_context}
+
+Current question: {query}
+
+Instructions:
+- If the user is asking about something from earlier in the conversation, answer based on that context
+- If they're asking a general question you can answer, answer it directly
+- If they're asking something that would benefit from research, explain what you can look up for them
+- Be conversational, helpful, and never just echo their question back
+- Keep your response concise but complete"""
+
+        try:
+            from langchain_core.messages import HumanMessage
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            state["response"] = response.content if hasattr(response, "content") else str(response)
+        except Exception as e:
+            state["response"] = f"I can help you with investment research, stock analysis, and market news. Please let me know what you'd like to explore!"
+        
+        state["history"].append({
+            "step": "conversational_response",
+            "response_length": len(state["response"])
+        })
+        
+        return state
     
     def _build_response_prompt(self, query: str, research_data: dict, messages: list = None) -> str:
         """Build a prompt for the LLM to generate a response.
@@ -772,8 +838,10 @@ the conversation context above."""
             state = self._synthesize_results(state)
             state = self._generate_response(state)
         else:
+            # No specific tools needed - use LLM to generate a helpful response
+            # based on conversation history and the user's query
+            state = await self._generate_conversational_response(state)
             state["status"] = "success"
-            state["response"] = "I couldn't find any specific stocks or research topics in your query. Please specify a stock symbol or topic."
         
         # Build response
         result = {

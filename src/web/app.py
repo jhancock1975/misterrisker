@@ -2034,6 +2034,20 @@ async def chat(request: Request):
     else:
         response = await chatbot.process_message(message)
     
+    # Ensure response is always a string
+    if not isinstance(response, str):
+        if isinstance(response, list):
+            # Handle list of content blocks
+            text_parts = []
+            for block in response:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            response = "".join(text_parts) if text_parts else str(response)
+        else:
+            response = str(response) if response else "Sorry, there was an error processing your request."
+    
     # Include supervisor logs for frontend debugging
     return {
         "response": response,
