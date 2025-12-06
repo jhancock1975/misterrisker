@@ -421,8 +421,11 @@ class CoinbaseAgent:
             query_lower = query.lower()
             
             # Route to appropriate tool based on query content
-            # Check for order/trade requests FIRST (before price checks)
-            if any(word in query_lower for word in ["limit order", "place.*order", "order"]):
+            # Check for cancel requests FIRST
+            if "cancel" in query_lower:
+                response = await self._handle_cancel_request(query)
+            # Check for order/trade requests (before price checks)
+            elif any(word in query_lower for word in ["limit order", "place.*order", "order"]):
                 response = await self._handle_order_request(query)
             elif any(word in query_lower for word in ["buy", "purchase"]) and any(word in query_lower for word in ["$", "usd", "dollar"]):
                 response = await self._handle_buy_request(query)
@@ -507,6 +510,34 @@ class CoinbaseAgent:
             return cleaned[0], None
         return None, None
 
+    def _extract_order_id(self, result: dict[str, Any]) -> str:
+        """Extract order ID from a Coinbase API response.
+        
+        The order ID can be in different places depending on the response structure:
+        - Directly at result['order_id']
+        - Nested in result['success_response']['order_id']
+        
+        Args:
+            result: API response dictionary
+            
+        Returns:
+            Order ID string or 'unknown' if not found
+        """
+        # Try direct order_id first
+        if result.get("order_id"):
+            return result["order_id"]
+        
+        # Try nested in success_response
+        success_response = result.get("success_response")
+        if success_response:
+            if isinstance(success_response, dict):
+                if success_response.get("order_id"):
+                    return success_response["order_id"]
+            elif hasattr(success_response, "order_id") and success_response.order_id:
+                return success_response.order_id
+        
+        return "unknown"
+
     async def _handle_order_request(self, query: str) -> str:
         """Handle order placement requests."""
         query_lower = query.lower()
@@ -524,18 +555,32 @@ class CoinbaseAgent:
         try:
             if is_limit and limit_price:
                 # Place limit order
-                order_type = "buy" if is_buy else "sell"
-                result = await self.execute_tool("limit_order_gtc", {
-                    "product_id": product_id,
-                    "side": order_type.upper(),
-                    "base_size": str(float(amount) / float(limit_price)),  # Convert USD to crypto amount
-                    "limit_price": limit_price
-                })
-                if result.get("success") or result.get("order_id"):
-                    order_id = result.get("order_id", "unknown")
-                    return f"✅ Limit {order_type} order placed for ${amount} of {crypto} at ${limit_price}\\nOrder ID: {order_id}"
+                # Calculate base_size with 2 decimal precision (Coinbase requirement)
+                base_size = round(float(amount) / float(limit_price), 8)  # Use 8 decimals for crypto
+                base_size_str = f"{base_size:.8f}".rstrip('0').rstrip('.')
+                # Ensure at least some precision
+                if '.' not in base_size_str:
+                    base_size_str = f"{base_size:.2f}"
+                
+                if is_buy:
+                    result = await self.execute_tool("limit_order_gtc_buy", {
+                        "product_id": product_id,
+                        "base_size": base_size_str,
+                        "limit_price": limit_price
+                    })
                 else:
-                    return f"❌ Failed to place limit order: {result}"
+                    result = await self.execute_tool("limit_order_gtc_sell", {
+                        "product_id": product_id,
+                        "base_size": base_size_str,
+                        "limit_price": limit_price
+                    })
+                order_type = "buy" if is_buy else "sell"
+                if result.get("success") or result.get("order_id"):
+                    order_id = self._extract_order_id(result)
+                    return f"✅ Limit {order_type} order placed for ${amount} of {crypto} at ${limit_price}\nOrder ID: {order_id}"
+                else:
+                    error_msg = result.get("error_response", {}).get("message", str(result))
+                    return f"❌ Failed to place limit order: {error_msg}"
             else:
                 # Place market order
                 if is_buy:
@@ -544,9 +589,9 @@ class CoinbaseAgent:
                     result = await self.place_market_sell(product_id, amount)
                 
                 if result.get("success") or result.get("order_id"):
-                    order_id = result.get("order_id", "unknown")
+                    order_id = self._extract_order_id(result)
                     action = "bought" if is_buy else "sold"
-                    return f"✅ Market order placed: {action} ${amount} of {crypto}\\nOrder ID: {order_id}"
+                    return f"✅ Market order placed: {action} ${amount} of {crypto}\nOrder ID: {order_id}"
                 else:
                     return f"❌ Failed to place market order: {result}"
         except Exception as e:
@@ -568,8 +613,8 @@ class CoinbaseAgent:
         try:
             result = await self.place_market_buy(f"{crypto}-USD", amount)
             if result.get("success") or result.get("order_id"):
-                order_id = result.get("order_id", "unknown")
-                return f"✅ Market buy order placed for ${amount} of {crypto}\\nOrder ID: {order_id}"
+                order_id = self._extract_order_id(result)
+                return f"✅ Market buy order placed for ${amount} of {crypto}\nOrder ID: {order_id}"
             else:
                 return f"❌ Failed to place buy order: {result}"
         except Exception as e:
@@ -586,12 +631,53 @@ class CoinbaseAgent:
         try:
             result = await self.place_market_sell(f"{crypto}-USD", amount)
             if result.get("success") or result.get("order_id"):
-                order_id = result.get("order_id", "unknown")
-                return f"✅ Market sell order placed for ${amount} of {crypto}\\nOrder ID: {order_id}"
+                order_id = self._extract_order_id(result)
+                return f"✅ Market sell order placed for ${amount} of {crypto}\nOrder ID: {order_id}"
             else:
                 return f"❌ Failed to place sell order: {result}"
         except Exception as e:
             return f"❌ Error placing sell order: {str(e)}"
+
+    async def _handle_cancel_request(self, query: str) -> str:
+        """Handle order cancellation requests."""
+        import re
+        
+        # Extract order ID (UUID format)
+        uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+        matches = re.findall(uuid_pattern, query.lower())
+        
+        if not matches:
+            return "Please provide the order ID to cancel (e.g., 'cancel order 3fd79d98-efff-4327-94be-dd02f986a85b')."
+        
+        order_ids = matches
+        
+        try:
+            result = await self.execute_tool("cancel_orders", {"order_ids": order_ids})
+            
+            # Check the result
+            results = result.get("results", [])
+            if results:
+                successes = [r for r in results if r.get("success")]
+                failures = [r for r in results if not r.get("success")]
+                
+                response_parts = []
+                if successes:
+                    for s in successes:
+                        response_parts.append(f"✅ Order {s.get('order_id', 'unknown')} cancelled")
+                if failures:
+                    for f in failures:
+                        reason = f.get("failure_reason", {}).get("message", "Unknown error")
+                        response_parts.append(f"❌ Failed to cancel {f.get('order_id', 'unknown')}: {reason}")
+                
+                return "\n".join(response_parts) if response_parts else "Order cancellation processed."
+            else:
+                # Simple success/failure check
+                if result.get("success"):
+                    return f"✅ Order(s) cancelled: {', '.join(order_ids)}"
+                else:
+                    return f"❌ Failed to cancel order(s): {result}"
+        except Exception as e:
+            return f"❌ Error cancelling order: {str(e)}"
     
     def _format_portfolio(self, data: dict[str, Any]) -> str:
         """Format portfolio data for display."""

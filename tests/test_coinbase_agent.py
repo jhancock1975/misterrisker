@@ -57,9 +57,13 @@ def mock_mcp_server():
                 "success": True,
                 "order_id": "order-124"
             },
-            "limit_order_gtc": {
+            "limit_order_gtc_buy": {
                 "success": True,
                 "order_id": "order-125"
+            },
+            "limit_order_gtc_sell": {
+                "success": True,
+                "order_id": "order-126"
             },
             "get_order": {
                 "order": {"order_id": "order-123", "status": "FILLED"}
@@ -93,7 +97,8 @@ def mock_mcp_server():
         {"name": "get_best_bid_ask", "description": "Get best bid/ask"},
         {"name": "market_order_buy", "description": "Market buy"},
         {"name": "market_order_sell", "description": "Market sell"},
-        {"name": "limit_order_gtc", "description": "Limit order GTC"},
+        {"name": "limit_order_gtc_buy", "description": "Limit order GTC buy"},
+        {"name": "limit_order_gtc_sell", "description": "Limit order GTC sell"},
         {"name": "get_order", "description": "Get order"},
         {"name": "list_orders", "description": "List orders"},
         {"name": "cancel_orders", "description": "Cancel orders"},
