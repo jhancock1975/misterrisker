@@ -8,10 +8,13 @@ import os
 import json
 import asyncio
 import logging
+import base64
+import time
 from typing import Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import FileResponse
 
 # Configure logging
 logging.basicConfig(
@@ -1894,6 +1897,7 @@ What would you like to do today?`;
                 const originalScrollTop = chatContainer.scrollTop;
                 const originalHeight = chatContainer.style.height;
                 const originalOverflow = chatContainer.style.overflow;
+                const originalMaxHeight = chatContainer.style.maxHeight;
                 
                 // Temporarily expand the container to show all content
                 chatContainer.style.height = 'auto';
@@ -1914,39 +1918,82 @@ What would you like to do today?`;
                 
                 // Restore original dimensions
                 chatContainer.style.height = originalHeight;
-                chatContainer.style.maxHeight = '';
+                chatContainer.style.maxHeight = originalMaxHeight;
                 chatContainer.style.overflow = originalOverflow;
                 chatContainer.scrollTop = originalScrollTop;
                 
-                // Convert canvas to PNG blob
-                const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+                // Save the image to /tmp via API and open in new window
+                const dataUrl = canvas.toDataURL('image/png');
                 
-                // Use the Clipboard API with ClipboardItem - this is the ONLY way to copy
-                // an actual image to clipboard. On localhost/HTTP, browsers block this.
-                // So we need to just download the file directly.
-                try {
-                    await navigator.clipboard.write([
-                        new ClipboardItem({ 'image/png': blob })
-                    ]);
-                    exportBtn.innerHTML = '✓ Copied!';
-                    setTimeout(() => {
-                        exportBtn.innerHTML = originalHTML;
-                        exportBtn.classList.remove('copying');
-                    }, 2000);
-                } catch (clipboardError) {
-                    console.log('Clipboard API blocked (requires HTTPS). Downloading instead.');
-                    // Download is the only reliable fallback on HTTP
+                // Send to server to save as file
+                const saveResponse = await fetch('/save-export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: dataUrl })
+                });
+                const saveResult = await saveResponse.json();
+                
+                if (saveResult.error) {
+                    throw new Error(saveResult.error);
+                }
+                
+                // Open the saved image in a new window
+                const imageUrl = '/export/' + saveResult.filename;
+                const newWindow = window.open('', '_blank');
+                if (newWindow) {
+                    newWindow.document.write(`
+                        <!DOCTYPE html>
+                        <html>
+                        <head>
+                            <title>Mister Risker Chat Export</title>
+                            <style>
+                                body { 
+                                    margin: 0; 
+                                    padding: 20px; 
+                                    background: #333; 
+                                    display: flex; 
+                                    justify-content: center;
+                                    font-family: Arial, sans-serif;
+                                }
+                                img { 
+                                    max-width: 100%; 
+                                    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+                                    border-radius: 8px;
+                                }
+                                .instructions {
+                                    position: fixed;
+                                    top: 10px;
+                                    left: 50%;
+                                    transform: translateX(-50%);
+                                    background: rgba(0,0,0,0.8);
+                                    color: white;
+                                    padding: 10px 20px;
+                                    border-radius: 20px;
+                                    font-size: 14px;
+                                }
+                            </style>
+                        </head>
+                        <body>
+                            <div class="instructions">Right-click the image and select "Save image as..." or "Copy image"<br>File saved to: ${saveResult.filepath}</div>
+                            <img src="${imageUrl}" alt="Mister Risker Chat Export">
+                        </body>
+                        </html>
+                    `);
+                    newWindow.document.close();
+                    exportBtn.innerHTML = '✓ Opened!';
+                } else {
+                    // Fallback: download the file
                     const link = document.createElement('a');
                     link.download = 'mister-risker-chat-' + new Date().toISOString().slice(0,10) + '.png';
-                    link.href = URL.createObjectURL(blob);
+                    link.href = dataUrl;
                     link.click();
-                    URL.revokeObjectURL(link.href);
                     exportBtn.innerHTML = '⬇️ Downloaded!';
-                    setTimeout(() => {
-                        exportBtn.innerHTML = originalHTML;
-                        exportBtn.classList.remove('copying');
-                    }, 2000);
                 }
+                
+                setTimeout(() => {
+                    exportBtn.innerHTML = originalHTML;
+                    exportBtn.classList.remove('copying');
+                }, 2000);
                 
             } catch (error) {
                 console.error('Export failed:', error);
@@ -2000,6 +2047,46 @@ async def clear_chat():
     """Clear the chat history."""
     chatbot.clear_history()
     return {"status": "ok"}
+
+
+@app.post("/save-export")
+async def save_export(request: Request):
+    """Save the exported chat image to /tmp and return the filename."""
+    data = await request.json()
+    image_data = data.get("image", "")
+    
+    if not image_data:
+        return {"error": "No image data provided"}
+    
+    # Remove the data:image/png;base64, prefix if present
+    if "," in image_data:
+        image_data = image_data.split(",")[1]
+    
+    # Decode the base64 image
+    try:
+        image_bytes = base64.b64decode(image_data)
+    except Exception as e:
+        return {"error": f"Invalid base64 image: {e}"}
+    
+    # Generate a unique filename
+    timestamp = int(time.time() * 1000)
+    filename = f"mister-risker-export-{timestamp}.png"
+    filepath = f"/tmp/{filename}"
+    
+    # Save the image
+    with open(filepath, "wb") as f:
+        f.write(image_bytes)
+    
+    return {"filename": filename, "filepath": filepath}
+
+
+@app.get("/export/{filename}")
+async def get_export(filename: str):
+    """Serve an exported image from /tmp."""
+    filepath = f"/tmp/{filename}"
+    if not os.path.exists(filepath):
+        return {"error": "File not found"}
+    return FileResponse(filepath, media_type="image/png")
 
 
 if __name__ == "__main__":

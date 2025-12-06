@@ -153,34 +153,32 @@ class TestExportJavaScriptFunction:
         
         assert 'html2canvas(chatContainer' in HTML_TEMPLATE
     
-    def test_converts_to_png_blob(self, log):
-        """Should convert canvas to PNG blob."""
+    def test_converts_to_png_data_url(self, log):
+        """Should convert canvas to PNG data URL."""
         from web.app import HTML_TEMPLATE
         
-        log.info("Testing PNG blob conversion")
+        log.info("Testing PNG data URL conversion")
         
-        assert "canvas.toBlob(resolve, 'image/png')" in HTML_TEMPLATE
+        assert "canvas.toDataURL('image/png')" in HTML_TEMPLATE
     
-    def test_attempts_clipboard_api_first(self, log):
-        """Should try ClipboardItem API for copying image."""
+    def test_opens_image_in_new_window(self, log):
+        """Should open the screenshot in a new window."""
         from web.app import HTML_TEMPLATE
         
-        log.info("Testing Clipboard API attempt")
+        log.info("Testing new window open")
         
-        assert 'navigator.clipboard.write' in HTML_TEMPLATE
-        assert 'ClipboardItem' in HTML_TEMPLATE
-        assert "'image/png'" in HTML_TEMPLATE
+        assert 'window.open' in HTML_TEMPLATE
+        assert 'newWindow.document.write' in HTML_TEMPLATE
+        assert '✓ Opened!' in HTML_TEMPLATE
     
-    def test_falls_back_to_download(self, log):
-        """Should fall back to downloading the file on clipboard error."""
+    def test_saves_image_to_server(self, log):
+        """Should save the image to server via POST request."""
         from web.app import HTML_TEMPLATE
         
-        log.info("Testing download fallback")
+        log.info("Testing server save")
         
-        # Should create a download link
-        assert "link.download = 'mister-risker-chat-'" in HTML_TEMPLATE
-        assert '.png' in HTML_TEMPLATE
-        assert 'link.click()' in HTML_TEMPLATE
+        assert "fetch('/save-export'" in HTML_TEMPLATE
+        assert "'/export/' + saveResult.filename" in HTML_TEMPLATE
     
     def test_shows_loading_state(self, log):
         """Should show loading state while capturing."""
@@ -191,12 +189,12 @@ class TestExportJavaScriptFunction:
         assert '⏳ Capturing...' in HTML_TEMPLATE
     
     def test_shows_success_state(self, log):
-        """Should show success state after copying."""
+        """Should show success state after opening."""
         from web.app import HTML_TEMPLATE
         
         log.info("Testing success state")
         
-        assert '✓ Copied!' in HTML_TEMPLATE
+        assert '✓ Opened!' in HTML_TEMPLATE
     
     def test_shows_download_state(self, log):
         """Should show download state when falling back."""

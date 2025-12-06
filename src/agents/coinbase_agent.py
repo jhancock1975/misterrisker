@@ -396,17 +396,152 @@ class CoinbaseAgent:
         result = self._workflow.invoke(initial_state)
         return result
     
+    async def process_query(
+        self,
+        query: str,
+        config: dict[str, Any] | None = None,
+        conversation_history: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        """Process a natural language query through the agent workflow.
+        
+        This is the high-level interface used by the Supervisor Agent for delegation.
+        It accepts a query string and optional config, builds the appropriate state,
+        and returns a structured response.
+        
+        Args:
+            query: Natural language query from the user
+            config: LangGraph config with thread_id for checkpointing (optional)
+            conversation_history: Previous messages for context (optional)
+        
+        Returns:
+            Dict with 'response' and 'status' keys
+        """
+        try:
+            # Determine what tool to call based on the query
+            query_lower = query.lower()
+            
+            # Route to appropriate tool based on query content
+            if any(word in query_lower for word in ["balance", "account", "cash", "value", "worth", "portfolio"]):
+                result = await self.get_portfolio_summary()
+                response = f"Here's your Coinbase portfolio:\n{self._format_portfolio(result)}"
+            elif any(word in query_lower for word in ["price", "quote", "how much", "cost"]):
+                # Extract crypto from query
+                crypto = self._extract_crypto(query)
+                if crypto:
+                    result = await self.get_price(crypto)
+                    response = f"{self._format_price(crypto, result)}"
+                else:
+                    # Default to Bitcoin
+                    result = await self.get_price("BTC")
+                    response = f"{self._format_price('BTC', result)}"
+            elif any(word in query_lower for word in ["buy", "purchase"]):
+                crypto = self._extract_crypto(query) or "BTC"
+                response = f"To buy {crypto}, please use the trading interface or specify an amount."
+            elif any(word in query_lower for word in ["sell"]):
+                crypto = self._extract_crypto(query) or "BTC"
+                response = f"To sell {crypto}, please use the trading interface or specify an amount."
+            else:
+                # Default to portfolio summary
+                result = await self.get_portfolio_summary()
+                response = f"Here's your Coinbase account:\n{self._format_portfolio(result)}"
+            
+            return {
+                "response": response,
+                "status": "success"
+            }
+        except CoinbaseAgentError as e:
+            return {
+                "response": f"Error accessing Coinbase: {str(e)}",
+                "status": "error"
+            }
+        except Exception as e:
+            return {
+                "response": f"An error occurred: {str(e)}",
+                "status": "error"
+            }
+    
+    def _extract_crypto(self, query: str) -> str | None:
+        """Extract cryptocurrency name/symbol from a query string."""
+        query_lower = query.lower()
+        
+        crypto_map = {
+            "bitcoin": "BTC", "btc": "BTC",
+            "ethereum": "ETH", "eth": "ETH",
+            "solana": "SOL", "sol": "SOL",
+            "dogecoin": "DOGE", "doge": "DOGE",
+            "litecoin": "LTC", "ltc": "LTC",
+            "ripple": "XRP", "xrp": "XRP",
+            "cardano": "ADA", "ada": "ADA",
+        }
+        
+        for name, symbol in crypto_map.items():
+            if name in query_lower:
+                return symbol
+        return None
+    
+    def _format_portfolio(self, data: dict[str, Any]) -> str:
+        """Format portfolio data for display."""
+        if not data or not data.get("accounts"):
+            return "No portfolio data available."
+        
+        lines = []
+        
+        # Filter to accounts with non-zero balances
+        for account in data.get("accounts", []):
+            name = account.get("name", "Account")
+            available = account.get("available_balance", {})
+            amount = float(available.get("value", 0) or 0)
+            currency = available.get("currency", "USD")
+            
+            # Only show accounts with balance > 0
+            if amount > 0:
+                # Format nicely based on size
+                if amount >= 1:
+                    formatted = f"{amount:,.2f}"
+                else:
+                    formatted = f"{amount:.6f}".rstrip('0').rstrip('.')
+                lines.append(f"• {name}: {formatted} {currency}")
+        
+        if not lines:
+            return "No accounts with balances found."
+        
+        return "\n".join(lines)
+    
+    def _format_price(self, crypto: str, data: dict[str, Any]) -> str:
+        """Format price data for display."""
+        if not data:
+            return f"Could not get price for {crypto}."
+        
+        price = data.get("amount", data.get("price", "Unknown"))
+        currency = data.get("currency", "USD")
+        return f"💰 {crypto} is currently ${price} {currency}"
+    
     async def get_portfolio_summary(self) -> dict[str, Any]:
         """Get a summary of the portfolio.
         
         Returns:
             Portfolio summary including balances and positions
         """
-        accounts = await self.execute_tool("get_accounts", {})
+        # Fetch all accounts using pagination to get complete portfolio
+        all_accounts = []
+        cursor = None
+        
+        for _ in range(5):  # Max 5 pages to prevent infinite loops
+            params = {"limit": 50}
+            if cursor:
+                params["cursor"] = cursor
+            
+            result = await self.execute_tool("get_accounts", params)
+            accounts = result.get("accounts", [])
+            all_accounts.extend(accounts)
+            
+            if not result.get("has_next"):
+                break
+            cursor = result.get("cursor")
         
         summary = {
-            "accounts": accounts.get("accounts", []),
-            "total_positions": len(accounts.get("accounts", []))
+            "accounts": all_accounts,
+            "total_positions": len(all_accounts)
         }
         
         return summary

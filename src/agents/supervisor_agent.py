@@ -135,12 +135,14 @@ class SupervisorAgent:
         if self.researcher_agent:
             agent_descriptions.append("""
 **Researcher Agent** (agent="researcher"):
+- Web search and internet queries (weather, news, general information)
 - Investment research and analysis
 - Stock/company analysis with news and sentiment
 - Compare investments
 - Risk assessment and recommendations
 - Analyst ratings and financial metrics
-- Use for questions asking for opinions, analysis, or research""")
+- ANY question requiring external information or web search
+- Use for questions asking for opinions, analysis, research, or general knowledge""")
         
         agents_section = "\n".join(agent_descriptions)
         
@@ -153,14 +155,17 @@ Your job is to analyze user requests and route them to the appropriate specializ
 ## Routing Guidelines:
 1. **Coinbase**: Route here for crypto balances, crypto prices, crypto orders, Bitcoin, Ethereum, etc.
 2. **Schwab**: Route here for stock quotes, stock orders, options, equity positions, market hours, etc.
-3. **Researcher**: Route here for analysis, opinions, news, comparisons, "what do you think", recommendations
-4. **Direct**: Only use for greetings, general chat, or when no agent is appropriate
+3. **Researcher**: Route here for analysis, opinions, news, comparisons, "what do you think", recommendations, web search, weather, general questions, or ANY query that needs external information
+4. **Direct**: ONLY use for simple greetings like "hi" or "hello", or questions about YOUR capabilities
 
 ## Important Rules:
 - If user mentions "Schwab account", "stock balance", or stock symbols like AAPL/TSLA → use Schwab
 - If user mentions "Coinbase", "crypto", "Bitcoin", "ETH" → use Coinbase
-- If user asks "what do you think", "analyze", "research", or wants opinions → use Researcher
+- If user asks "what do you think", "analyze", "research", "search", "look up", or wants opinions → use Researcher
+- If user asks about weather, news, or general information → use Researcher
+- For ANY question that requires looking something up or external knowledge → use Researcher
 - NEVER ask the user to "switch brokers" - YOU decide which agent to use
+- AVOID using "direct" unless it's a simple greeting - when in doubt, use Researcher
 - Pass the full context needed to the sub-agent in query_for_agent
 
 Analyze the user's message and decide which agent should handle it."""
@@ -235,9 +240,10 @@ Analyze the user's message and decide which agent should handle it."""
         
         # Step 2: Execute on chosen agent
         if decision.agent == "direct":
-            # Supervisor responds directly without delegation
-            logs.append(f"[SUPERVISOR] Responding directly without delegation")
-            response = decision.query_for_agent
+            # Supervisor responds directly using LLM with conversation context
+            logs.append(f"[SUPERVISOR] Generating direct response with conversation context")
+            response = await self._generate_direct_response(user_message, conversation_history)
+            logs.append(f"[SUPERVISOR] Direct response: {len(response)} chars")
             
         elif decision.agent == "coinbase":
             if not self.coinbase_agent:
@@ -308,10 +314,8 @@ Analyze the user's message and decide which agent should handle it."""
         """
         logger.info(f"[COINBASE AGENT] Processing: {query[:60]}...")
         
-        # The CoinbaseAgent expects a natural language query
-        # We need to process it through the agent's workflow
         try:
-            result = await self.coinbase_agent.run(query, config=config)
+            result = await self.coinbase_agent.process_query(query, config=config)
             return result if isinstance(result, dict) else {"response": str(result)}
         except Exception as e:
             logger.error(f"[COINBASE AGENT] Error: {e}")
@@ -330,7 +334,7 @@ Analyze the user's message and decide which agent should handle it."""
         logger.info(f"[SCHWAB AGENT] Processing: {query[:60]}...")
         
         try:
-            result = await self.schwab_agent.run(query, config=config)
+            result = await self.schwab_agent.process_query(query, config=config)
             return result if isinstance(result, dict) else {"response": str(result)}
         except Exception as e:
             logger.error(f"[SCHWAB AGENT] Error: {e}")
@@ -365,3 +369,57 @@ Analyze the user's message and decide which agent should handle it."""
         except Exception as e:
             logger.error(f"[RESEARCHER AGENT] Error: {e}")
             raise
+
+    async def _generate_direct_response(
+        self,
+        user_message: str,
+        conversation_history: list[dict] = None
+    ) -> str:
+        """Generate an intelligent direct response using LLM with conversation context.
+        
+        This is used when no sub-agent is needed, but we still want to provide
+        a thoughtful, context-aware response rather than just echoing the question.
+        
+        Args:
+            user_message: The user's current message
+            conversation_history: Previous messages for context
+        
+        Returns:
+            An intelligent response string
+        """
+        logger.info(f"[SUPERVISOR] Generating direct response for: {user_message[:60]}...")
+        
+        # Build messages list with conversation history
+        messages = [
+            SystemMessage(content="""You are Mister Risker, a helpful AI trading assistant.
+You have access to Coinbase for crypto trading, Schwab for stocks/options, and research tools.
+
+When responding to the user:
+- Be helpful, friendly, and conversational
+- If they ask about something from earlier in the conversation, refer to the chat history
+- If they ask a question you can answer from context, answer it directly
+- If they need trading/research capabilities, let them know what you can do
+- Never just echo their question back - always provide a thoughtful response
+- Keep responses concise but complete""")
+        ]
+        
+        # Add conversation history for context
+        if conversation_history:
+            for msg in conversation_history[-10:]:  # Last 10 messages for context
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "user":
+                    messages.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    messages.append(AIMessage(content=content))
+        
+        # Add the current user message
+        messages.append(HumanMessage(content=user_message))
+        
+        # Generate response using LLM
+        try:
+            response = await self.llm.ainvoke(messages)
+            return response.content
+        except Exception as e:
+            logger.error(f"[SUPERVISOR] Error generating direct response: {e}")
+            return f"I apologize, I had trouble processing that. Could you please rephrase your question?"

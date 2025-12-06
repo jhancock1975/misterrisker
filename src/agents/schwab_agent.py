@@ -425,6 +425,142 @@ class SchwabAgent:
         result = self._workflow.invoke(initial_state)
         return result
     
+    async def process_query(
+        self,
+        query: str,
+        config: dict[str, Any] | None = None,
+        conversation_history: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        """Process a natural language query through the agent workflow.
+        
+        This is the high-level interface used by the Supervisor Agent for delegation.
+        It accepts a query string and optional config, builds the appropriate state,
+        and returns a structured response.
+        
+        Args:
+            query: Natural language query from the user
+            config: LangGraph config with thread_id for checkpointing (optional)
+            conversation_history: Previous messages for context (optional)
+        
+        Returns:
+            Dict with 'response' and 'status' keys
+        """
+        try:
+            # Determine what tool to call based on the query
+            query_lower = query.lower()
+            
+            # Route to appropriate tool based on query content
+            if any(word in query_lower for word in ["balance", "account", "cash", "value", "worth"]):
+                result = await self.get_account_summary()
+                response = f"Here's your Schwab account summary:\n{self._format_account_summary(result)}"
+            elif any(word in query_lower for word in ["position", "holding", "portfolio", "stock", "own"]):
+                result = await self.get_positions()
+                response = f"Here are your current positions:\n{self._format_positions(result)}"
+            elif any(word in query_lower for word in ["quote", "price"]):
+                # Extract symbol from query (basic extraction)
+                symbols = self._extract_symbols(query)
+                if symbols:
+                    result = await self.get_quote(symbols[0])
+                    response = f"Quote for {symbols[0]}:\n{self._format_quote(result)}"
+                else:
+                    response = "Please specify a stock symbol to get a quote."
+            elif any(word in query_lower for word in ["order", "trade"]):
+                result = await self.get_orders()
+                response = f"Here are your recent orders:\n{self._format_orders(result)}"
+            else:
+                # Default to account summary
+                result = await self.get_account_summary()
+                response = f"Here's your Schwab account information:\n{self._format_account_summary(result)}"
+            
+            return {
+                "response": response,
+                "status": "success"
+            }
+        except SchwabAgentError as e:
+            return {
+                "response": f"Error accessing Schwab: {str(e)}",
+                "status": "error"
+            }
+        except Exception as e:
+            return {
+                "response": f"An error occurred: {str(e)}",
+                "status": "error"
+            }
+    
+    def _extract_symbols(self, query: str) -> list[str]:
+        """Extract stock symbols from a query string."""
+        import re
+        # Match uppercase words that look like stock symbols (1-5 letters)
+        matches = re.findall(r'\b[A-Z]{1,5}\b', query)
+        return matches if matches else []
+    
+    def _format_account_summary(self, data: dict[str, Any]) -> str:
+        """Format account summary data for display."""
+        if not data:
+            return "No account data available."
+        
+        lines = []
+        
+        # Navigate to the correct nested structure
+        securities_account = data.get("securitiesAccount", data)
+        current_balances = securities_account.get("currentBalances", {})
+        
+        if current_balances:
+            cash_available = current_balances.get('cashAvailableForTrading', 0) or 0
+            cash_balance = current_balances.get('cashBalance', 0) or 0
+            liquidation_value = current_balances.get('liquidationValue', 0) or 0
+            equity = current_balances.get('equity', 0) or 0
+            long_market_value = current_balances.get('longMarketValue', 0) or 0
+            buying_power = current_balances.get('buyingPower', 0) or 0
+            
+            lines.append("### 💰 Account Balances")
+            lines.append(f"• **Cash Available for Trading:** ${cash_available:,.2f}")
+            lines.append(f"• **Cash Balance:** ${cash_balance:,.2f}")
+            lines.append(f"• **Account Value:** ${liquidation_value:,.2f}")
+            lines.append(f"• **Equity:** ${equity:,.2f}")
+            lines.append(f"• **Long Market Value:** ${long_market_value:,.2f}")
+            lines.append(f"• **Buying Power:** ${buying_power:,.2f}")
+        else:
+            return "Could not find balance information in account data."
+        
+        return "\n".join(lines)
+    
+    def _format_positions(self, data: list[dict[str, Any]]) -> str:
+        """Format positions data for display."""
+        if not data:
+            return "No positions found."
+        
+        lines = []
+        for pos in data[:10]:  # Limit to first 10
+            symbol = pos.get("instrument", {}).get("symbol", "Unknown")
+            qty = pos.get("longQuantity", 0) or pos.get("shortQuantity", 0)
+            value = pos.get("marketValue", 0)
+            lines.append(f"• {symbol}: {qty} shares (${value:,.2f})")
+        return "\n".join(lines)
+    
+    def _format_quote(self, data: dict[str, Any]) -> str:
+        """Format quote data for display."""
+        if not data:
+            return "No quote data available."
+        
+        quote = data.get("quote", data)
+        price = quote.get("lastPrice", quote.get("mark", 0))
+        change = quote.get("netChange", 0)
+        pct = quote.get("netPercentChangeInDouble", 0)
+        return f"• Price: ${price:,.2f}\n• Change: ${change:+,.2f} ({pct:+.2f}%)"
+    
+    def _format_orders(self, data: list[dict[str, Any]]) -> str:
+        """Format orders data for display."""
+        if not data:
+            return "No recent orders found."
+        
+        lines = []
+        for order in data[:5]:  # Limit to first 5
+            status = order.get("status", "Unknown")
+            symbol = order.get("orderLegCollection", [{}])[0].get("instrument", {}).get("symbol", "Unknown")
+            lines.append(f"• {symbol}: {status}")
+        return "\n".join(lines)
+    
     async def _get_account_hash(self, account_hash: str | None = None) -> str:
         """Get account hash, using default or fetching first available.
         
