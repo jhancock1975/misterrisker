@@ -57,6 +57,10 @@ def mock_mcp_server():
                 "success": True,
                 "order_id": "order-124"
             },
+            "limit_order_gtc": {
+                "success": True,
+                "order_id": "order-125"
+            },
             "get_order": {
                 "order": {"order_id": "order-123", "status": "FILLED"}
             },
@@ -89,6 +93,7 @@ def mock_mcp_server():
         {"name": "get_best_bid_ask", "description": "Get best bid/ask"},
         {"name": "market_order_buy", "description": "Market buy"},
         {"name": "market_order_sell", "description": "Market sell"},
+        {"name": "limit_order_gtc", "description": "Limit order GTC"},
         {"name": "get_order", "description": "Get order"},
         {"name": "list_orders", "description": "List orders"},
         {"name": "cancel_orders", "description": "Cancel orders"},
@@ -343,23 +348,20 @@ class TestCoinbaseAgentWorkflow:
 
     @pytest.mark.asyncio
     async def test_workflow_handles_price_check(self, coinbase_agent, log):
-        """Workflow should handle price check requests."""
-        log.info("Testing workflow price check handling")
-        log.info("Input params: message='What is the current price of ETH?', current_task='check_price'")
-        from agents.coinbase_agent import CoinbaseAgentState
+        """Workflow should handle price check requests via process_query."""
+        log.info("Testing workflow price check handling via process_query")
+        log.info("Input params: query='What is the current price of ETH?'")
         
-        initial_state = CoinbaseAgentState(
-            messages=[{"role": "user", "content": "What is the current price of ETH?"}],
-            tool_calls=[],
-            tool_results=[],
-            current_task="check_price"
-        )
-        
-        result = await coinbase_agent.run(initial_state)
+        # Test process_query which is what the supervisor uses
+        result = await coinbase_agent.process_query("What is the current price of ETH?")
         
         log.info(f"Result: {result}")
         assert result is not None
-        log.info("RESULT: Workflow handled price check successfully")
+        assert "response" in result
+        assert isinstance(result["response"], str)
+        # Should not contain error messages
+        assert "error" not in result["response"].lower() or result.get("status") == "success"
+        log.info("RESULT: Workflow handled price check successfully via process_query")
 
 
 # =============================================================================

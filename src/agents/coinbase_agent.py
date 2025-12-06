@@ -421,25 +421,32 @@ class CoinbaseAgent:
             query_lower = query.lower()
             
             # Route to appropriate tool based on query content
-            if any(word in query_lower for word in ["balance", "account", "cash", "value", "worth", "portfolio"]):
+            # Check for order/trade requests FIRST (before price checks)
+            if any(word in query_lower for word in ["limit order", "place.*order", "order"]):
+                response = await self._handle_order_request(query)
+            elif any(word in query_lower for word in ["buy", "purchase"]) and any(word in query_lower for word in ["$", "usd", "dollar"]):
+                response = await self._handle_buy_request(query)
+            elif any(word in query_lower for word in ["sell"]) and any(word in query_lower for word in ["$", "usd", "dollar"]):
+                response = await self._handle_sell_request(query)
+            elif any(word in query_lower for word in ["balance", "account", "cash", "value", "worth", "portfolio"]):
                 result = await self.get_portfolio_summary()
                 response = f"Here's your Coinbase portfolio:\n{self._format_portfolio(result)}"
             elif any(word in query_lower for word in ["price", "quote", "how much", "cost"]):
                 # Extract crypto from query
                 crypto = self._extract_crypto(query)
                 if crypto:
-                    result = await self.get_price(crypto)
+                    result = await self.get_market_data(f"{crypto}-USD")
                     response = f"{self._format_price(crypto, result)}"
                 else:
                     # Default to Bitcoin
-                    result = await self.get_price("BTC")
+                    result = await self.get_market_data("BTC-USD")
                     response = f"{self._format_price('BTC', result)}"
             elif any(word in query_lower for word in ["buy", "purchase"]):
                 crypto = self._extract_crypto(query) or "BTC"
-                response = f"To buy {crypto}, please use the trading interface or specify an amount."
+                response = f"To buy {crypto}, please specify an amount (e.g., 'buy $100 of BTC')."
             elif any(word in query_lower for word in ["sell"]):
                 crypto = self._extract_crypto(query) or "BTC"
-                response = f"To sell {crypto}, please use the trading interface or specify an amount."
+                response = f"To sell {crypto}, please specify an amount."
             else:
                 # Default to portfolio summary
                 result = await self.get_portfolio_summary()
@@ -478,6 +485,113 @@ class CoinbaseAgent:
             if name in query_lower:
                 return symbol
         return None
+
+    def _extract_amount(self, query: str) -> tuple[str | None, str | None]:
+        """Extract dollar amount and limit price from a query string.
+        
+        Returns:
+            Tuple of (amount, limit_price) or (None, None) if not found
+        """
+        import re
+        
+        # Look for dollar amounts like $200, $83,000, etc.
+        amounts = re.findall(r'\$[\d,]+(?:\.\d+)?', query)
+        
+        # Clean up the amounts (remove $ and commas)
+        cleaned = [a.replace('$', '').replace(',', '') for a in amounts]
+        
+        if len(cleaned) >= 2:
+            # First amount is usually the order size, second is limit price
+            return cleaned[0], cleaned[1]
+        elif len(cleaned) == 1:
+            return cleaned[0], None
+        return None, None
+
+    async def _handle_order_request(self, query: str) -> str:
+        """Handle order placement requests."""
+        query_lower = query.lower()
+        crypto = self._extract_crypto(query) or "BTC"
+        amount, limit_price = self._extract_amount(query)
+        
+        is_buy = "buy" in query_lower or "purchase" in query_lower
+        is_limit = "limit" in query_lower
+        
+        if not amount:
+            return f"Please specify an amount for your {crypto} order (e.g., 'buy $200 of BTC at $83,000')."
+        
+        product_id = f"{crypto}-USD"
+        
+        try:
+            if is_limit and limit_price:
+                # Place limit order
+                order_type = "buy" if is_buy else "sell"
+                result = await self.execute_tool("limit_order_gtc", {
+                    "product_id": product_id,
+                    "side": order_type.upper(),
+                    "base_size": str(float(amount) / float(limit_price)),  # Convert USD to crypto amount
+                    "limit_price": limit_price
+                })
+                if result.get("success") or result.get("order_id"):
+                    order_id = result.get("order_id", "unknown")
+                    return f"✅ Limit {order_type} order placed for ${amount} of {crypto} at ${limit_price}\\nOrder ID: {order_id}"
+                else:
+                    return f"❌ Failed to place limit order: {result}"
+            else:
+                # Place market order
+                if is_buy:
+                    result = await self.place_market_buy(product_id, amount)
+                else:
+                    result = await self.place_market_sell(product_id, amount)
+                
+                if result.get("success") or result.get("order_id"):
+                    order_id = result.get("order_id", "unknown")
+                    action = "bought" if is_buy else "sold"
+                    return f"✅ Market order placed: {action} ${amount} of {crypto}\\nOrder ID: {order_id}"
+                else:
+                    return f"❌ Failed to place market order: {result}"
+        except Exception as e:
+            return f"❌ Error placing order: {str(e)}"
+
+    async def _handle_buy_request(self, query: str) -> str:
+        """Handle buy requests with amounts."""
+        crypto = self._extract_crypto(query) or "BTC"
+        amount, limit_price = self._extract_amount(query)
+        
+        if not amount:
+            return f"Please specify an amount to buy (e.g., 'buy $100 of {crypto}')."
+        
+        if limit_price:
+            # This is a limit order
+            return await self._handle_order_request(query)
+        
+        # Market buy
+        try:
+            result = await self.place_market_buy(f"{crypto}-USD", amount)
+            if result.get("success") or result.get("order_id"):
+                order_id = result.get("order_id", "unknown")
+                return f"✅ Market buy order placed for ${amount} of {crypto}\\nOrder ID: {order_id}"
+            else:
+                return f"❌ Failed to place buy order: {result}"
+        except Exception as e:
+            return f"❌ Error placing buy order: {str(e)}"
+
+    async def _handle_sell_request(self, query: str) -> str:
+        """Handle sell requests with amounts."""
+        crypto = self._extract_crypto(query) or "BTC"
+        amount, _ = self._extract_amount(query)
+        
+        if not amount:
+            return f"Please specify an amount to sell (e.g., 'sell $100 of {crypto}')."
+        
+        try:
+            result = await self.place_market_sell(f"{crypto}-USD", amount)
+            if result.get("success") or result.get("order_id"):
+                order_id = result.get("order_id", "unknown")
+                return f"✅ Market sell order placed for ${amount} of {crypto}\\nOrder ID: {order_id}"
+            else:
+                return f"❌ Failed to place sell order: {result}"
+        except Exception as e:
+            return f"❌ Error placing sell order: {str(e)}"
     
     def _format_portfolio(self, data: dict[str, Any]) -> str:
         """Format portfolio data for display."""
@@ -512,9 +626,26 @@ class CoinbaseAgent:
         if not data:
             return f"Could not get price for {crypto}."
         
-        price = data.get("amount", data.get("price", "Unknown"))
-        currency = data.get("currency", "USD")
-        return f"💰 {crypto} is currently ${price} {currency}"
+        # Handle nested structure from get_market_data
+        if "product" in data:
+            product = data.get("product", {})
+            price = product.get("price", "Unknown")
+        else:
+            price = data.get("amount", data.get("price", "Unknown"))
+        
+        # Try to get bid/ask for more info
+        bid_ask = data.get("bid_ask", {})
+        if bid_ask and "pricebooks" in bid_ask:
+            pricebooks = bid_ask.get("pricebooks", [])
+            if pricebooks:
+                bids = pricebooks[0].get("bids", [])
+                asks = pricebooks[0].get("asks", [])
+                bid = bids[0].get("price") if bids else None
+                ask = asks[0].get("price") if asks else None
+                if bid and ask:
+                    return f"💰 {crypto}: ${price} USD (Bid: ${bid} / Ask: ${ask})"
+        
+        return f"💰 {crypto} is currently ${price} USD"
     
     async def get_portfolio_summary(self) -> dict[str, Any]:
         """Get a summary of the portfolio.
