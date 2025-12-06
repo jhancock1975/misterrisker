@@ -182,12 +182,15 @@ If you don't need to call a tool, just respond normally with text."""
                 # Create agent if use_agents is enabled
                 if self.use_agents:
                     self.coinbase_agent = CoinbaseAgent(
+                        api_key=coinbase_api_key,
+                        api_secret=coinbase_api_secret,
                         mcp_server=self.coinbase_server,
                         llm=self.llm,
                         enable_chain_of_thought=self.enable_chain_of_thought,
-                        checkpointer=self.checkpointer
+                        checkpointer=self.checkpointer,
+                        enable_websocket=True  # Enable WebSocket candle monitoring
                     )
-                    logger.info("  ✓ Coinbase Agent initialized")
+                    logger.info("  ✓ Coinbase Agent initialized (with WebSocket monitoring)")
             except Exception as e:
                 logger.warning(f"  ✗ Could not initialize Coinbase: {e}")
         
@@ -1603,29 +1606,11 @@ HTML_TEMPLATE = r"""
         }
         
         // Welcome message content
-        const welcomeMarkdown = `👋 Hello! I'm **Mister Risker**, your AI trading assistant.
+        const welcomeMarkdown = `👋 **Mister Risker** - Your AI Trading Assistant
 
-I can help you with:
+🪙 **Crypto** • 📈 **Stocks & Options** • 🔍 **Research** • 🎨 **Charts**
 
-### 🪙 Cryptocurrency (Coinbase)
-- Check crypto balances and prices
-- Buy/sell Bitcoin, Ethereum, and more
-- View your crypto portfolio
-
-### 📈 Stocks & Options (Schwab)
-- Check stock account balances
-- Get stock quotes and option chains
-- Place equity and options orders
-
-### 🔍 Research & Analysis
-- Analyze any stock (e.g., "What do you think about TSLA?")
-- Get the latest market news
-- Compare stocks and get recommendations
-
-### 🎨 Creative
-- Generate images, diagrams, and visualizations
-
-What would you like to do today?`;
+Ask me anything about trading!`;
 
         // Render welcome message
         document.getElementById('welcomeMessage').innerHTML = marked.parse(welcomeMarkdown);

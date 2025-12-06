@@ -5,6 +5,7 @@ Server tools to execute trading operations.
 """
 
 import asyncio
+import logging
 import os
 from typing import Any, Literal, TypedDict
 from dataclasses import dataclass
@@ -14,6 +15,11 @@ from langgraph.graph.state import CompiledStateGraph
 
 from src.mcp_servers.coinbase import CoinbaseMCPServer, CoinbaseAPIError
 from src.agents.chain_of_thought import ChainOfThought, ReasoningType
+from src.services.blockchain_data import BlockchainDataService
+from src.services.coinbase_websocket import CoinbaseWebSocketService
+
+# Configure logger for this module
+logger = logging.getLogger(__name__)
 
 
 class CoinbaseAgentError(Exception):
@@ -79,7 +85,8 @@ class CoinbaseAgent:
         mcp_server: CoinbaseMCPServer | None = None,
         llm: Any | None = None,
         enable_chain_of_thought: bool = False,
-        checkpointer: Any | None = None
+        checkpointer: Any | None = None,
+        enable_websocket: bool = True
     ):
         """Initialize the Coinbase Agent.
         
@@ -90,22 +97,65 @@ class CoinbaseAgent:
             llm: Language model for reasoning (optional)
             enable_chain_of_thought: Whether to enable CoT reasoning
             checkpointer: Optional checkpointer for state persistence
+            enable_websocket: Whether to enable WebSocket candle monitoring (default: True)
         """
+        # Store credentials for WebSocket
+        self._api_key = api_key or os.getenv("COINBASE_API_KEY", "")
+        self._api_secret = api_secret or os.getenv("COINBASE_API_SECRET", "")
+        
         if mcp_server is not None:
             self.mcp_server = mcp_server
         else:
             self.mcp_server = CoinbaseMCPServer(
-                api_key=api_key or os.getenv("COINBASE_API_KEY", ""),
-                api_secret=api_secret or os.getenv("COINBASE_API_SECRET", "")
+                api_key=self._api_key,
+                api_secret=self._api_secret
             )
         
         self.llm = llm
         self.enable_chain_of_thought = enable_chain_of_thought
         self.chain_of_thought = ChainOfThought() if enable_chain_of_thought else None
         self.checkpointer = checkpointer
+        self.blockchain_data_service = BlockchainDataService()
+        
+        # Initialize WebSocket service for candle monitoring
+        self.enable_websocket = enable_websocket
+        self.websocket_service: CoinbaseWebSocketService | None = None
+        if enable_websocket:
+            self.websocket_service = CoinbaseWebSocketService(
+                api_key=self._api_key,
+                api_secret=self._api_secret,
+            )
+            # Auto-start WebSocket in background
+            self._start_websocket_monitoring()
         
         self._workflow = self._build_workflow()
         self._available_tools: list[str] | None = None
+    
+    def _start_websocket_monitoring(self) -> None:
+        """Start WebSocket monitoring in the background.
+        
+        This schedules the WebSocket connection to start when an event loop is available.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, schedule the coroutine
+            asyncio.create_task(self._async_start_websocket())
+        except RuntimeError:
+            # No event loop running, we'll start it later when one is available
+            logger.info("📊 WebSocket monitoring will start when event loop is available")
+    
+    async def _async_start_websocket(self) -> None:
+        """Async helper to start the WebSocket service."""
+        if self.websocket_service and not self.websocket_service.is_running:
+            await self.websocket_service.start()
+    
+    async def ensure_websocket_started(self) -> None:
+        """Ensure WebSocket monitoring is started.
+        
+        Call this method when you have an event loop available.
+        """
+        if self.websocket_service and not self.websocket_service.is_running:
+            await self.websocket_service.start()
     
     def get_available_tools(self) -> list[dict[str, Any]]:
         """Get list of available tools from the MCP server.
@@ -424,6 +474,9 @@ class CoinbaseAgent:
             # Check for cancel requests FIRST
             if "cancel" in query_lower:
                 response = await self._handle_cancel_request(query)
+            # Check for blockchain data queries (transactions, blocks, on-chain data)
+            elif any(word in query_lower for word in ["blockchain", "transaction", "transactions", "block ", "blocks", "on-chain", "onchain", "ledger"]):
+                response = await self._handle_blockchain_query(query)
             # Check for order/trade requests (before price checks)
             elif any(word in query_lower for word in ["limit order", "place.*order", "order"]):
                 response = await self._handle_order_request(query)
@@ -678,6 +731,168 @@ class CoinbaseAgent:
                     return f"❌ Failed to cancel order(s): {result}"
         except Exception as e:
             return f"❌ Error cancelling order: {str(e)}"
+
+    async def _handle_blockchain_query(self, query: str) -> str:
+        """Handle blockchain data queries (transactions, blocks, stats).
+        
+        Args:
+            query: User query about blockchain data
+            
+        Returns:
+            Formatted response with blockchain data
+        """
+        import re
+        query_lower = query.lower()
+        
+        # Detect which chain
+        chain = None
+        chain_keywords = {
+            "bitcoin": "bitcoin",
+            "btc": "bitcoin",
+            "ethereum": "ethereum",
+            "eth": "ethereum",
+            "ripple": "ripple",
+            "xrp": "ripple",
+            "solana": "solana",
+            "sol": "solana",
+            "zcash": "zcash",
+            "zec": "zcash",
+        }
+        
+        for keyword, chain_name in chain_keywords.items():
+            if keyword in query_lower:
+                chain = chain_name
+                break
+        
+        if not chain:
+            # Default to bitcoin if no chain specified
+            chain = "bitcoin"
+        
+        # Detect query type
+        is_transaction_query = any(word in query_lower for word in ["transaction", "transactions", "tx", "txs"])
+        is_block_query = any(word in query_lower for word in ["block ", "blocks", "latest block"])
+        is_stats_query = any(word in query_lower for word in ["stats", "statistics", "info", "network"])
+        
+        # Extract limit if specified
+        limit_match = re.search(r'(\d+)\s*(?:recent|last|latest)?', query_lower)
+        limit = int(limit_match.group(1)) if limit_match else 10
+        limit = min(limit, 25)  # Cap at 25 for readability
+        
+        try:
+            if is_transaction_query:
+                result = await self.blockchain_data_service.get_recent_transactions(chain, limit=limit)
+                if result["status"] == "success":
+                    return self._format_blockchain_transactions(result)
+                else:
+                    return f"❌ {result.get('message', 'Failed to fetch transactions')}"
+            elif is_block_query:
+                result = await self.blockchain_data_service.get_latest_block(chain)
+                if result["status"] == "success":
+                    return self._format_blockchain_block(result)
+                else:
+                    return f"❌ {result.get('message', 'Failed to fetch block info')}"
+            else:
+                # Default to stats
+                result = await self.blockchain_data_service.get_blockchain_stats(chain)
+                if result["status"] == "success":
+                    return self._format_blockchain_stats(result)
+                else:
+                    return f"❌ {result.get('message', 'Failed to fetch stats')}"
+        except Exception as e:
+            return f"❌ Error fetching blockchain data: {str(e)}"
+
+    def _format_blockchain_transactions(self, result: dict[str, Any]) -> str:
+        """Format blockchain transaction data for display."""
+        chain = result.get("chain", "unknown").capitalize()
+        transactions = result.get("transactions", [])
+        count = result.get("count", len(transactions))
+        
+        if not transactions:
+            return f"No recent transactions found for {chain}."
+        
+        lines = [f"📋 **Recent {chain} Transactions** ({count} shown)\n"]
+        
+        for i, tx in enumerate(transactions[:10], 1):  # Limit display to 10
+            if chain.lower() == "solana":
+                sig = tx.get("signature", "")[:20] + "..."
+                slot = tx.get("slot", "")
+                lines.append(f"{i}. Slot {slot}: `{sig}`")
+            else:
+                tx_hash = tx.get("hash", "")
+                if len(tx_hash) > 20:
+                    tx_hash = tx_hash[:20] + "..."
+                block = tx.get("block", tx.get("ledger_index", ""))
+                time = tx.get("time", "")
+                
+                # Add value info if available
+                value_str = ""
+                if "input_total_btc" in tx:
+                    value_str = f" ({tx['input_total_btc']:.6f} BTC)"
+                elif "value_eth" in tx:
+                    value_str = f" ({tx['value_eth']:.6f} ETH)"
+                elif "input_total_zec" in tx:
+                    value_str = f" ({tx['input_total_zec']:.6f} ZEC)"
+                
+                lines.append(f"{i}. Block {block}: `{tx_hash}`{value_str}")
+        
+        lines.append(f"\n🔗 View more at blockchair.com/{chain.lower()}")
+        return "\n".join(lines)
+
+    def _format_blockchain_block(self, result: dict[str, Any]) -> str:
+        """Format blockchain block info for display."""
+        chain = result.get("chain", "unknown").capitalize()
+        block = result.get("block", {})
+        
+        if chain.lower() == "solana":
+            lines = [f"🔲 **Latest {chain} Slot**\n"]
+            lines.append(f"• Slot: {block.get('slot', 'N/A'):,}")
+            lines.append(f"• Epoch: {block.get('epoch', 'N/A')}")
+            lines.append(f"• Slot Index: {block.get('slot_index', 'N/A'):,} / {block.get('slots_in_epoch', 'N/A'):,}")
+        else:
+            lines = [f"🔲 **Latest {chain} Block**\n"]
+            lines.append(f"• Height: {block.get('height', 'N/A'):,}")
+            if block.get('hash'):
+                hash_display = block['hash'][:20] + "..." if len(block.get('hash', '')) > 20 else block.get('hash')
+                lines.append(f"• Hash: `{hash_display}`")
+            if block.get('time'):
+                lines.append(f"• Time: {block['time']}")
+            if block.get('total_transactions'):
+                lines.append(f"• Total Transactions: {block['total_transactions']:,}")
+        
+        return "\n".join(lines)
+
+    def _format_blockchain_stats(self, result: dict[str, Any]) -> str:
+        """Format blockchain statistics for display."""
+        chain = result.get("chain", "unknown").capitalize()
+        stats = result.get("stats", {})
+        
+        lines = [f"📊 **{chain} Network Statistics**\n"]
+        
+        if chain.lower() == "solana":
+            lines.append(f"• Current Epoch: {stats.get('epoch', 'N/A')}")
+            lines.append(f"• Slot Height: {stats.get('slot_height', 0):,}")
+            lines.append(f"• Block Height: {stats.get('block_height', 0):,}")
+            if stats.get('total_supply_sol'):
+                lines.append(f"• Total Supply: {stats['total_supply_sol']:,.2f} SOL")
+            if stats.get('circulating_supply_sol'):
+                lines.append(f"• Circulating Supply: {stats['circulating_supply_sol']:,.2f} SOL")
+        else:
+            if stats.get('blocks'):
+                lines.append(f"• Blocks: {stats['blocks']:,}")
+            if stats.get('transactions'):
+                lines.append(f"• Total Transactions: {stats['transactions']:,}")
+            if stats.get('difficulty'):
+                lines.append(f"• Difficulty: {stats['difficulty']:,.0f}")
+            if stats.get('hashrate'):
+                lines.append(f"• Hashrate (24h): {stats['hashrate']:,.0f}")
+            if stats.get('mempool_transactions'):
+                lines.append(f"• Mempool: {stats['mempool_transactions']:,} txs")
+            if stats.get('market_price_usd'):
+                lines.append(f"• Price: ${stats['market_price_usd']:,.2f} USD")
+            if stats.get('market_cap_usd'):
+                lines.append(f"• Market Cap: ${stats['market_cap_usd']:,.0f} USD")
+        
+        return "\n".join(lines)
     
     def _format_portfolio(self, data: dict[str, Any]) -> str:
         """Format portfolio data for display."""

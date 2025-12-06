@@ -141,6 +141,43 @@ class TestSupervisorAgentRouting:
         assert result["agent_used"] == "researcher", \
             f"Expected 'researcher' but got '{result['agent_used']}'. General questions should go to researcher agent."
 
+    @pytest.mark.asyncio
+    async def test_supervisor_routes_blockchain_data_query_to_researcher_agent(self):
+        """Supervisor should route blockchain data queries to ResearcherAgent, not Coinbase.
+        
+        Blockchain data queries like 'get the last 10 transactions on the bitcoin blockchain'
+        require external information/web search, so should go to researcher, not coinbase.
+        Coinbase agent is for trading operations on the user's account, not blockchain exploration.
+        """
+        mock_llm = MagicMock()
+        mock_router = MagicMock()
+        mock_router.ainvoke = AsyncMock(return_value=RoutingDecision(
+            agent="researcher",
+            reasoning="User is asking for blockchain transaction data which requires external lookup",
+            query_for_agent="get the list of the last ten transactions on the bitcoin blockchain"
+        ))
+        mock_llm.with_structured_output = MagicMock(return_value=mock_router)
+        
+        mock_researcher_agent = MagicMock()
+        mock_researcher_agent.run = AsyncMock(return_value={
+            "response": "Here are the latest Bitcoin transactions from blockchain explorers...",
+            "status": "success"
+        })
+        
+        supervisor = SupervisorAgent(
+            llm=mock_llm,
+            researcher_agent=mock_researcher_agent
+        )
+        
+        result = await supervisor.execute(
+            user_message="get the list of the last ten transactions on the bitcoin blockchain",
+            conversation_history=[],
+            config={"configurable": {"thread_id": "test-123"}}
+        )
+        
+        assert result["agent_used"] == "researcher", \
+            f"Expected 'researcher' but got '{result['agent_used']}'. Blockchain data queries should go to researcher agent, not coinbase."
+
 
 class TestSchwabAgentProcessQuery:
     """Tests for SchwabAgent.process_query method."""

@@ -117,11 +117,12 @@ class SupervisorAgent:
         if self.coinbase_agent:
             agent_descriptions.append("""
 **Coinbase Agent** (agent="coinbase"):
-- Check cryptocurrency balances and portfolio
+- Check cryptocurrency balances and portfolio on YOUR Coinbase account
 - Get current crypto prices (Bitcoin, Ethereum, etc.)
 - Place buy/sell orders for cryptocurrencies
-- View open orders and transaction history
-- Use for ANY crypto-related queries""")
+- View open orders and transaction history on YOUR account
+- Blockchain data queries: recent transactions, blocks, on-chain data for BTC, ETH, XRP, SOL, ZEC
+- Use for crypto trading, account balances, price checks, AND blockchain data queries""")
         
         if self.schwab_agent:
             agent_descriptions.append("""
@@ -153,14 +154,15 @@ Your job is to analyze user requests and route them to the appropriate specializ
 {agents_section}
 
 ## Routing Guidelines:
-1. **Coinbase**: Route here for crypto balances, crypto prices, crypto orders, Bitcoin, Ethereum, etc.
+1. **Coinbase**: Route here for YOUR crypto balances, crypto prices, crypto buy/sell orders, AND blockchain data queries (transactions, blocks, on-chain data for BTC/ETH/XRP/SOL/ZEC)
 2. **Schwab**: Route here for stock quotes, stock orders, options, equity positions, market hours, etc.
 3. **Researcher**: Route here for analysis, opinions, news, comparisons, "what do you think", recommendations, web search, weather, general questions, or ANY query that needs external information
 4. **Direct**: ONLY use for simple greetings like "hi" or "hello", or questions about YOUR capabilities
 
 ## Important Rules:
 - If user mentions "Schwab account", "stock balance", or stock symbols like AAPL/TSLA → use Schwab
-- If user mentions "Coinbase", "crypto", "Bitcoin", "ETH" → use Coinbase
+- If user wants to check THEIR crypto balance, crypto prices, or place crypto orders → use Coinbase
+- If user asks about blockchain transactions, blocks, on-chain data, ledger, or network info → use Coinbase
 - If user asks "what do you think", "analyze", "research", "search", "look up", or wants opinions → use Researcher
 - If user asks about weather, news, or general information → use Researcher
 - For ANY question that requires looking something up or external knowledge → use Researcher
