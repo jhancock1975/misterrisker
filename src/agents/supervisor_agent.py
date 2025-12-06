@@ -122,7 +122,8 @@ class SupervisorAgent:
 - Place buy/sell orders for cryptocurrencies
 - View open orders and transaction history on YOUR account
 - Blockchain data queries: recent transactions, blocks, on-chain data for BTC, ETH, XRP, SOL, ZEC
-- Use for crypto trading, account balances, price checks, AND blockchain data queries""")
+- **REAL-TIME crypto analysis**: patterns, trends, technical analysis for BTC, ETH, XRP, SOL, ZEC
+- Use for crypto trading, account balances, price checks, blockchain data, AND crypto pattern/trend analysis""")
         
         if self.schwab_agent:
             agent_descriptions.append("""
@@ -154,24 +155,49 @@ Your job is to analyze user requests and route them to the appropriate specializ
 {agents_section}
 
 ## Routing Guidelines:
-1. **Coinbase**: Route here for YOUR crypto balances, crypto prices, crypto buy/sell orders, AND blockchain data queries (transactions, blocks, on-chain data for BTC/ETH/XRP/SOL/ZEC)
+1. **Coinbase**: Route here for YOUR crypto balances, crypto prices, crypto buy/sell orders, blockchain data queries, AND any analysis/patterns/trends for cryptocurrencies (BTC, ETH, XRP, SOL, ZEC, Bitcoin, Ethereum, etc.)
 2. **Schwab**: Route here for stock quotes, stock orders, options, equity positions, market hours, etc.
-3. **Researcher**: Route here for analysis, opinions, news, comparisons, "what do you think", recommendations, web search, weather, general questions, or ANY query that needs external information
+3. **Researcher**: Route here for STOCK analysis, opinions, news about STOCKS, comparisons, "what do you think" about STOCKS, recommendations, web search, weather, general questions, or ANY query that needs external information (but NOT for crypto analysis - use Coinbase for that)
 4. **Direct**: ONLY use for simple greetings like "hi" or "hello", or questions about YOUR capabilities
 
 ## Important Rules:
 - If user mentions "Schwab account", "stock balance", or stock symbols like AAPL/TSLA → use Schwab
 - If user wants to check THEIR crypto balance, crypto prices, or place crypto orders → use Coinbase
 - If user asks about blockchain transactions, blocks, on-chain data, ledger, or network info → use Coinbase
-- If user asks "what do you think", "analyze", "research", "search", "look up", or wants opinions → use Researcher
+- **CRITICAL: If user asks about BTC, Bitcoin, ETH, Ethereum, crypto patterns, trends, analysis, "what are you seeing", or any cryptocurrency analysis → ALWAYS use Coinbase (it has real-time WebSocket data with ACCURATE prices)**
+- The Researcher agent does NOT have accurate crypto price data - it will hallucinate wrong prices like $39 for Bitcoin
+- If user asks "what do you think" about STOCKS, or wants stock opinions/research → use Researcher
 - If user asks about weather, news, or general information → use Researcher
-- For ANY question that requires looking something up or external knowledge → use Researcher
+- For stock-related research or external knowledge → use Researcher
 - NEVER ask the user to "switch brokers" - YOU decide which agent to use
-- AVOID using "direct" unless it's a simple greeting - when in doubt, use Researcher
+- AVOID using "direct" unless it's a simple greeting
 - Pass the full context needed to the sub-agent in query_for_agent
 
 Analyze the user's message and decide which agent should handle it."""
     
+    def _is_crypto_analysis_query(self, message: str) -> bool:
+        """Check if the query is about crypto analysis/patterns (should use Coinbase with real-time data).
+        
+        Returns True if the message contains crypto-related analysis keywords.
+        This bypasses the LLM routing to ensure real-time WebSocket data is used.
+        """
+        message_lower = message.lower()
+        
+        # Crypto symbols and names
+        crypto_terms = ['btc', 'bitcoin', 'eth', 'ethereum', 'xrp', 'ripple', 
+                        'sol', 'solana', 'zec', 'zcash', 'crypto', 'cryptocurrency']
+        
+        # Analysis keywords
+        analysis_terms = ['pattern', 'analyze', 'analysis', 'trend', 'seeing', 
+                         'prediction', 'trajectory', 'movement', 'price action',
+                         'technical', 'looking at', 'what do you see', 'how is',
+                         'watch', 'monitoring', 'real-time', 'realtime', 'live']
+        
+        has_crypto = any(term in message_lower for term in crypto_terms)
+        has_analysis = any(term in message_lower for term in analysis_terms)
+        
+        return has_crypto and has_analysis
+
     async def route_query(
         self, 
         user_message: str, 
@@ -187,6 +213,15 @@ Analyze the user's message and decide which agent should handle it."""
             RoutingDecision with agent choice and reasoning
         """
         logger.info(f"[SUPERVISOR] Routing query: '{user_message[:80]}...'")
+        
+        # FAST PATH: Force crypto analysis queries to Coinbase (has real-time WebSocket data)
+        if self._is_crypto_analysis_query(user_message) and self.coinbase_agent:
+            logger.info("[SUPERVISOR] Crypto analysis detected - forcing route to Coinbase (real-time data)")
+            return RoutingDecision(
+                agent="coinbase",
+                reasoning="Crypto analysis query detected - using Coinbase agent with real-time WebSocket data for accurate prices",
+                query_for_agent=user_message
+            )
         
         # Build routing messages
         messages = [
