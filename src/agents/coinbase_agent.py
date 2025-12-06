@@ -474,6 +474,9 @@ class CoinbaseAgent:
             # Check for cancel requests FIRST
             if "cancel" in query_lower:
                 response = await self._handle_cancel_request(query)
+            # Check for analysis/pattern queries - use real-time data
+            elif any(word in query_lower for word in ["pattern", "patterns", "analyze", "analysis", "trend", "trends", "seeing"]):
+                response = await self._handle_analysis_query(query)
             # Check for blockchain data queries (transactions, blocks, on-chain data)
             elif any(word in query_lower for word in ["blockchain", "transaction", "transactions", "block ", "blocks", "on-chain", "onchain", "ledger"]):
                 response = await self._handle_blockchain_query(query)
@@ -731,6 +734,131 @@ class CoinbaseAgent:
                     return f"❌ Failed to cancel order(s): {result}"
         except Exception as e:
             return f"❌ Error cancelling order: {str(e)}"
+
+    async def _handle_analysis_query(self, query: str) -> str:
+        """Handle analysis/pattern queries using real-time WebSocket data.
+        
+        Uses the WebSocket candle data for current prices and combines with
+        API data for a comprehensive analysis.
+        
+        Args:
+            query: User query about patterns or analysis
+            
+        Returns:
+            Formatted analysis response with real data
+        """
+        query_lower = query.lower()
+        
+        # Determine which crypto to analyze
+        crypto = self._extract_crypto(query) or "BTC"
+        product_id = f"{crypto}-USD"
+        
+        # Get real-time data from WebSocket if available
+        realtime_data = None
+        if self.websocket_service:
+            realtime_data = self.websocket_service.get_latest_candle(product_id)
+        
+        # Also get data from Coinbase API for comparison
+        try:
+            api_data = await self.get_market_data(product_id)
+        except Exception as e:
+            logger.warning(f"Failed to get API data: {e}")
+            api_data = None
+        
+        # Build the analysis response
+        lines = [f"📊 **{crypto} Real-Time Analysis**\n"]
+        
+        # Use WebSocket data if available (most current)
+        if realtime_data:
+            close = realtime_data.get("close", "N/A")
+            high = realtime_data.get("high", "N/A")
+            low = realtime_data.get("low", "N/A")
+            open_price = realtime_data.get("open", "N/A")
+            volume = realtime_data.get("volume", "N/A")
+            
+            lines.append("**Current Data** (Real-Time WebSocket):")
+            lines.append(f"• Price: ${close}")
+            lines.append(f"• High: ${high}")
+            lines.append(f"• Low: ${low}")
+            lines.append(f"• Open: ${open_price}")
+            lines.append(f"• Volume: {volume}")
+            
+            # Calculate simple pattern indicators
+            try:
+                close_f = float(close)
+                open_f = float(open_price)
+                high_f = float(high)
+                low_f = float(low)
+                
+                # Price change
+                change = close_f - open_f
+                change_pct = (change / open_f * 100) if open_f > 0 else 0
+                
+                lines.append(f"\n**Pattern Analysis**:")
+                
+                # Trend direction
+                if change > 0:
+                    lines.append(f"• Trend: 📈 Bullish (+${change:.2f}, {change_pct:+.2f}%)")
+                elif change < 0:
+                    lines.append(f"• Trend: 📉 Bearish (${change:.2f}, {change_pct:.2f}%)")
+                else:
+                    lines.append(f"• Trend: ➡️ Sideways (0.00%)")
+                
+                # Volatility (high-low range as % of price)
+                range_size = high_f - low_f
+                volatility = (range_size / close_f * 100) if close_f > 0 else 0
+                if volatility > 3:
+                    lines.append(f"• Volatility: 🔴 High ({volatility:.2f}% range)")
+                elif volatility > 1:
+                    lines.append(f"• Volatility: 🟡 Moderate ({volatility:.2f}% range)")
+                else:
+                    lines.append(f"• Volatility: 🟢 Low ({volatility:.2f}% range)")
+                
+                # Candle pattern
+                body = abs(close_f - open_f)
+                upper_wick = high_f - max(close_f, open_f)
+                lower_wick = min(close_f, open_f) - low_f
+                
+                if body < range_size * 0.1:
+                    lines.append("• Candle Pattern: Doji (indecision)")
+                elif upper_wick > body * 2 and close_f < open_f:
+                    lines.append("• Candle Pattern: Shooting Star (bearish)")
+                elif lower_wick > body * 2 and close_f > open_f:
+                    lines.append("• Candle Pattern: Hammer (bullish)")
+                elif close_f > open_f:
+                    lines.append("• Candle Pattern: Bullish candle")
+                else:
+                    lines.append("• Candle Pattern: Bearish candle")
+                    
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Error calculating patterns: {e}")
+        
+        elif api_data:
+            # Fallback to API data
+            product = api_data.get("product", {})
+            price = product.get("price", "N/A")
+            lines.append("**Current Data** (API):")
+            lines.append(f"• Price: ${price}")
+            
+            bid_ask = api_data.get("bid_ask", {})
+            if bid_ask and "pricebooks" in bid_ask:
+                pricebooks = bid_ask.get("pricebooks", [])
+                if pricebooks:
+                    bids = pricebooks[0].get("bids", [])
+                    asks = pricebooks[0].get("asks", [])
+                    if bids and asks:
+                        bid = bids[0].get("price")
+                        ask = asks[0].get("price")
+                        spread = float(ask) - float(bid) if bid and ask else 0
+                        lines.append(f"• Bid: ${bid}")
+                        lines.append(f"• Ask: ${ask}")
+                        lines.append(f"• Spread: ${spread:.2f}")
+        else:
+            lines.append("⚠️ Unable to fetch real-time data. Please try again.")
+        
+        lines.append("\n*Data source: Coinbase Advanced Trade*")
+        
+        return "\n".join(lines)
 
     async def _handle_blockchain_query(self, query: str) -> str:
         """Handle blockchain data queries (transactions, blocks, stats).

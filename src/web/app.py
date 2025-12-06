@@ -917,7 +917,20 @@ chatbot = TradingChatBot(use_agents=True, enable_chain_of_thought=True)
 async def lifespan(app: FastAPI):
     """Initialize resources on startup."""
     await chatbot.initialize()
+    
+    # Start WebSocket monitoring if Coinbase agent is available
+    if chatbot.coinbase_agent and hasattr(chatbot.coinbase_agent, 'ensure_websocket_started'):
+        await chatbot.coinbase_agent.ensure_websocket_started()
+        logger.info("  ✓ Coinbase WebSocket candle monitoring started")
+    
     yield
+    
+    # Cleanup: Stop WebSocket monitoring
+    if chatbot.coinbase_agent and hasattr(chatbot.coinbase_agent, 'websocket_service'):
+        ws_service = chatbot.coinbase_agent.websocket_service
+        if ws_service and ws_service.is_running:
+            await ws_service.stop()
+            logger.info("  ✓ Coinbase WebSocket monitoring stopped")
 
 
 # Create FastAPI app

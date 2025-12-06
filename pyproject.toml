@@ -36,6 +36,9 @@ dependencies = [
     "finnhub-python>=2.4.25",
     "pytest-playwright>=0.7.2",
     "playwright>=1.56.0",
+    "websockets>=12.0",
+    "PyJWT>=2.8.0",
+    "cryptography>=41.0.0",
 ]
 
 [project.optional-dependencies]

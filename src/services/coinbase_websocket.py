@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from typing import Any, Callable
 import secrets
 
@@ -60,10 +61,16 @@ class CoinbaseWebSocketService:
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._running = False
         self._task: asyncio.Task | None = None
+        self._summary_task: asyncio.Task | None = None
         self._reconnect_delay = 5  # seconds
+        self._summary_interval = 300  # 5 minutes in seconds
         
         # Store latest candle data for each product
         self._latest_candles: dict[str, dict[str, Any]] = {}
+        
+        # Track candle update counts for summary
+        self._candle_counts: dict[str, int] = {}
+        self._last_summary_time: float = time.time()
     
     def _generate_jwt(self) -> str:
         """Generate a JWT for WebSocket authentication.
@@ -170,13 +177,8 @@ class CoinbaseWebSocketService:
                 # Store latest candle
                 self._latest_candles[product_id] = candle_data
                 
-                # Log the candle update
-                logger.info(
-                    f"🕯️ CANDLE [{product_id}] "
-                    f"O:{candle_data['open']} H:{candle_data['high']} "
-                    f"L:{candle_data['low']} C:{candle_data['close']} "
-                    f"V:{candle_data['volume']} ({event_type})"
-                )
+                # Increment candle count for this product
+                self._candle_counts[product_id] = self._candle_counts.get(product_id, 0) + 1
                 
                 # Call callback if provided
                 if self.on_candle:
@@ -184,6 +186,37 @@ class CoinbaseWebSocketService:
                         self.on_candle(candle_data)
                     except Exception as e:
                         logger.error(f"Error in candle callback: {e}")
+    
+    async def _log_summary(self) -> None:
+        """Log a summary of candle data every 5 minutes."""
+        while self._running:
+            await asyncio.sleep(self._summary_interval)
+            
+            if not self._latest_candles:
+                logger.info("📊 No candle data received yet")
+                continue
+            
+            # Build summary
+            now = datetime.now().strftime("%H:%M:%S")
+            total_updates = sum(self._candle_counts.values())
+            
+            summary_lines = [f"📊 CANDLE SUMMARY ({now}) - {total_updates} updates in last 5 min:"]
+            
+            for product_id in sorted(self._latest_candles.keys()):
+                candle = self._latest_candles[product_id]
+                count = self._candle_counts.get(product_id, 0)
+                price = candle.get('close', 'N/A')
+                high = candle.get('high', 'N/A')
+                low = candle.get('low', 'N/A')
+                summary_lines.append(
+                    f"  {product_id}: ${price} (H:${high} L:${low}) [{count} updates]"
+                )
+            
+            logger.info("\n".join(summary_lines))
+            
+            # Reset counts for next interval
+            self._candle_counts = {}
+            self._last_summary_time = time.time()
     
     async def _connect_and_listen(self) -> None:
         """Main connection loop with reconnection logic."""
@@ -226,7 +259,8 @@ class CoinbaseWebSocketService:
         
         self._running = True
         self._task = asyncio.create_task(self._connect_and_listen())
-        logger.info("🚀 Coinbase WebSocket monitoring started")
+        self._summary_task = asyncio.create_task(self._log_summary())
+        logger.info("🚀 Coinbase WebSocket monitoring started (summary every 5 min)")
     
     async def stop(self) -> None:
         """Stop the WebSocket connection and monitoring."""
@@ -239,6 +273,13 @@ class CoinbaseWebSocketService:
             self._task.cancel()
             try:
                 await self._task
+            except asyncio.CancelledError:
+                pass
+        
+        if self._summary_task:
+            self._summary_task.cancel()
+            try:
+                await self._summary_task
             except asyncio.CancelledError:
                 pass
         
