@@ -250,11 +250,11 @@ class FinRLService:
             if candle:
                 # For now, generate synthetic training data around the current price
                 # In production, you'd fetch historical data from an API
-                current_price = candle.get('close', 50000)
+                current_price = float(candle.get('close', 50000))
                 return self._generate_training_data(current_price, periods)
         
         # Fallback: generate synthetic training data
-        return self._generate_training_data(50000, periods)
+        return self._generate_training_data(50000.0, periods)
     
     def _generate_training_data(self, base_price: float, periods: int = 500) -> pd.DataFrame:
         """Generate synthetic OHLCV data for training.
@@ -428,7 +428,7 @@ class FinRLService:
                 model_name="none"
             )
         
-        current_price = current_candle.get('close', 0)
+        current_price = float(current_candle.get('close', 0))
         
         # Check if we have a trained model
         if symbol not in self.models:
@@ -484,15 +484,19 @@ class FinRLService:
     
     def _candle_to_observation(self, candle: dict) -> np.ndarray:
         """Convert a candle dict to model observation."""
-        close = candle.get('close', 1)
+        close = float(candle.get('close', 1))
+        open_price = float(candle.get('open', close))
+        high = float(candle.get('high', close))
+        low = float(candle.get('low', close))
+        volume = float(candle.get('volume', 1))
         
         # Create normalized observation matching CryptoTradingEnv
         obs = np.array([
-            candle.get('open', close) / close,
-            candle.get('high', close) / close,
-            candle.get('low', close) / close,
+            open_price / close,
+            high / close,
+            low / close,
             1.0,  # close normalized
-            candle.get('volume', 1) / 5.0,  # Rough normalization
+            volume / 5.0,  # Rough normalization
             0.5,  # RSI placeholder (would need history)
             0.0,  # MACD placeholder
             0.5,  # Assume 50% position

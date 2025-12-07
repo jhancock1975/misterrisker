@@ -33,7 +33,7 @@ class SupervisorAgentError(Exception):
 
 class RoutingDecision(BaseModel):
     """Schema for the supervisor's routing decision."""
-    agent: Literal["coinbase", "schwab", "researcher", "direct"] = Field(
+    agent: Literal["coinbase", "schwab", "researcher", "finrl", "direct"] = Field(
         description="Which agent should handle this request. 'direct' means respond without delegation."
     )
     reasoning: str = Field(
@@ -63,6 +63,7 @@ class SupervisorAgent:
         coinbase_agent: Sub-agent for crypto trading
         schwab_agent: Sub-agent for stock/options trading
         researcher_agent: Sub-agent for investment research
+        finrl_agent: Sub-agent for AI/RL trading decisions
     """
     
     def __init__(
@@ -71,6 +72,7 @@ class SupervisorAgent:
         coinbase_agent: Any = None,
         schwab_agent: Any = None,
         researcher_agent: Any = None,
+        finrl_agent: Any = None,
         checkpointer: Optional[InMemorySaver] = None,
         enable_chain_of_thought: bool = True
     ):
@@ -81,6 +83,7 @@ class SupervisorAgent:
             coinbase_agent: CoinbaseAgent instance (optional)
             schwab_agent: SchwabAgent instance (optional)
             researcher_agent: ResearcherAgent instance (optional)
+            finrl_agent: FinRLAgent instance for AI trading (optional)
             checkpointer: State persistence (optional)
             enable_chain_of_thought: Whether to log reasoning steps
         """
@@ -88,6 +91,7 @@ class SupervisorAgent:
         self.coinbase_agent = coinbase_agent
         self.schwab_agent = schwab_agent
         self.researcher_agent = researcher_agent
+        self.finrl_agent = finrl_agent
         self.checkpointer = checkpointer or InMemorySaver()
         self.enable_chain_of_thought = enable_chain_of_thought
         
@@ -108,7 +112,22 @@ class SupervisorAgent:
             agents["schwab"] = self.schwab_agent
         if self.researcher_agent:
             agents["researcher"] = self.researcher_agent
+        if self.finrl_agent:
+            agents["finrl"] = self.finrl_agent
         return agents
+    
+    def _is_finrl_query(self, message: str) -> bool:
+        """Check if the query is asking for AI/RL trading decisions."""
+        message_lower = message.lower()
+        
+        # FinRL-specific keywords
+        finrl_terms = ['finrl', 'reinforcement learning', 'rl model', 'ai trading',
+                       'drl', 'deep rl', 'train model', 'trading signal', 
+                       'ai recommendation', 'machine learning trade', 'ppo', 'a2c',
+                       'should i buy', 'should i sell', 'what would the ai',
+                       'ai decision', 'model predict', 'ai suggest']
+        
+        return any(term in message_lower for term in finrl_terms)
     
     def _build_routing_prompt(self) -> str:
         """Build the system prompt for routing decisions."""
@@ -146,6 +165,17 @@ class SupervisorAgent:
 - ANY question requiring external information or web search
 - Use for questions asking for opinions, analysis, research, or general knowledge""")
         
+        if self.finrl_agent:
+            agent_descriptions.append("""
+**FinRL Agent** (agent="finrl"):
+- AI-powered trading decisions using Deep Reinforcement Learning
+- Get buy/sell/hold signals based on trained RL models (PPO, A2C, SAC, TD3)
+- Train new trading models on crypto data
+- Portfolio recommendations from AI
+- "Should I buy/sell?" questions for crypto
+- Machine learning based trading signals
+- Use for AI/ML trading advice, model training, or automated trading decisions""")
+        
         agents_section = "\n".join(agent_descriptions)
         
         return f"""You are Mister Risker, a multi-broker trading assistant supervisor.
@@ -158,13 +188,15 @@ Your job is to analyze user requests and route them to the appropriate specializ
 1. **Coinbase**: Route here for YOUR crypto balances, crypto prices, crypto buy/sell orders, blockchain data queries, AND any analysis/patterns/trends for cryptocurrencies (BTC, ETH, XRP, SOL, ZEC, Bitcoin, Ethereum, etc.)
 2. **Schwab**: Route here for stock quotes, stock orders, options, equity positions, market hours, etc.
 3. **Researcher**: Route here for STOCK analysis, opinions, news about STOCKS, comparisons, "what do you think" about STOCKS, recommendations, web search, weather, general questions, or ANY query that needs external information (but NOT for crypto analysis - use Coinbase for that)
-4. **Direct**: ONLY use for simple greetings like "hi" or "hello", or questions about YOUR capabilities
+4. **FinRL**: Route here for AI/ML trading decisions, "should I buy/sell" questions, training models, or getting AI trading signals
+5. **Direct**: ONLY use for simple greetings like "hi" or "hello", or questions about YOUR capabilities
 
 ## Important Rules:
 - If user mentions "Schwab account", "stock balance", or stock symbols like AAPL/TSLA → use Schwab
 - If user wants to check THEIR crypto balance, crypto prices, or place crypto orders → use Coinbase
 - If user asks about blockchain transactions, blocks, on-chain data, ledger, or network info → use Coinbase
 - **CRITICAL: If user asks about BTC, Bitcoin, ETH, Ethereum, crypto patterns, trends, analysis, "what are you seeing", or any cryptocurrency analysis → ALWAYS use Coinbase (it has real-time WebSocket data with ACCURATE prices)**
+- **If user asks "should I buy/sell", wants AI trading signals, or mentions FinRL/reinforcement learning → use FinRL**
 - The Researcher agent does NOT have accurate crypto price data - it will hallucinate wrong prices like $39 for Bitcoin
 - If user asks "what do you think" about STOCKS, or wants stock opinions/research → use Researcher
 - If user asks about weather, news, or general information → use Researcher
@@ -213,6 +245,15 @@ Analyze the user's message and decide which agent should handle it."""
             RoutingDecision with agent choice and reasoning
         """
         logger.info(f"[SUPERVISOR] Routing query: '{user_message[:80]}...'")
+        
+        # FAST PATH: Force FinRL queries to FinRL agent
+        if self._is_finrl_query(user_message) and self.finrl_agent:
+            logger.info("[SUPERVISOR] FinRL/AI trading query detected - forcing route to FinRL")
+            return RoutingDecision(
+                agent="finrl",
+                reasoning="AI trading decision query detected - using FinRL agent with Deep Reinforcement Learning",
+                query_for_agent=user_message
+            )
         
         # FAST PATH: Force crypto analysis queries to Coinbase (has real-time WebSocket data)
         if self._is_crypto_analysis_query(user_message) and self.coinbase_agent:
@@ -323,6 +364,19 @@ Analyze the user's message and decide which agent should handle it."""
                 except Exception as e:
                     logs.append(f"[RESEARCHER AGENT] Error: {e}")
                     response = f"I encountered an error with the Researcher agent: {e}"
+        
+        elif decision.agent == "finrl":
+            if not self.finrl_agent:
+                logs.append(f"[SUPERVISOR] ERROR: FinRL agent not available")
+                response = "I'd like to help with AI trading decisions, but the FinRL agent is not configured."
+            else:
+                logs.append(f"[SUPERVISOR] Delegating to FinRL Agent")
+                try:
+                    response = await self.finrl_agent.process(decision.query_for_agent)
+                    logs.append(f"[FINRL AGENT] Completed: {len(response)} chars")
+                except Exception as e:
+                    logs.append(f"[FINRL AGENT] Error: {e}")
+                    response = f"I encountered an error with the FinRL agent: {e}"
         
         else:
             logs.append(f"[SUPERVISOR] Unknown agent: {decision.agent}")

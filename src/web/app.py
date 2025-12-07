@@ -42,6 +42,8 @@ from src.agents.coinbase_agent import CoinbaseAgent, CoinbaseAgentError
 from src.agents.schwab_agent import SchwabAgent, SchwabAgentError
 from src.agents.researcher_agent import ResearcherAgent, ResearcherAgentError
 from src.agents.supervisor_agent import SupervisorAgent, SupervisorAgentError
+from src.agents.finrl_agent import FinRLAgent
+from src.services.finrl_service import FinRLService
 
 # Load environment variables
 load_dotenv()
@@ -78,6 +80,8 @@ class TradingChatBot:
         self.coinbase_agent: CoinbaseAgent | None = None
         self.schwab_agent: SchwabAgent | None = None
         self.researcher_agent: ResearcherAgent | None = None
+        self.finrl_agent: FinRLAgent | None = None
+        self.finrl_service: FinRLService | None = None
         self.supervisor_agent: SupervisorAgent | None = None
         
         # Configuration
@@ -248,6 +252,27 @@ If you don't need to call a tool, just respond normally with text."""
         elif not finnhub_api_key:
             logger.info("  - FINNHUB_API_KEY not set (Researcher Agent disabled)")
         
+        # Initialize FinRL Agent (AI Trading with Deep Reinforcement Learning)
+        if self.use_agents and self.llm:
+            try:
+                # Get WebSocket service from Coinbase agent if available
+                websocket_service = None
+                if self.coinbase_agent and hasattr(self.coinbase_agent, 'websocket_service'):
+                    websocket_service = self.coinbase_agent.websocket_service
+                
+                self.finrl_service = FinRLService(
+                    websocket_service=websocket_service,
+                    default_algorithm="PPO"
+                )
+                self.finrl_agent = FinRLAgent(
+                    llm=self.llm,
+                    finrl_service=self.finrl_service,
+                    websocket_service=websocket_service
+                )
+                logger.info("  ✓ FinRL Agent initialized (Deep RL trading)")
+            except Exception as e:
+                logger.warning(f"  ✗ Could not initialize FinRL Agent: {e}")
+        
         # Initialize Supervisor Agent (Mister Risker as orchestrator)
         if self.use_agents and self.llm:
             try:
@@ -256,6 +281,7 @@ If you don't need to call a tool, just respond normally with text."""
                     coinbase_agent=self.coinbase_agent,
                     schwab_agent=self.schwab_agent,
                     researcher_agent=self.researcher_agent,
+                    finrl_agent=self.finrl_agent,
                     checkpointer=self.checkpointer,
                     enable_chain_of_thought=self.enable_chain_of_thought
                 )
