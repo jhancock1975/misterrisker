@@ -580,9 +580,13 @@ You have access to tools for:
 - Web search for current information
 - Coinbase for crypto trading
 - Schwab for stocks/options trading
+- Solana blockchain data via Solana RPC API
 
 The user has asked a question that may not require looking up specific data.
 Use the conversation history to provide a helpful, intelligent response.
+
+IMPORTANT: Do NOT suggest external blockchain explorers like blockchair.com, etherscan.io, or similar services. 
+Our data comes directly from the Solana RPC API - you can only reference solana.com or the data we provide.
 
 {history_context}
 
@@ -652,7 +656,10 @@ Include relevant data points and be specific with numbers when available.
 If the user is asking for investment advice, provide analysis but remind them
 that this is not financial advice and they should consult a professional.
 If the user is asking about something from earlier in the conversation, refer to
-the conversation context above."""
+the conversation context above.
+
+IMPORTANT: Do NOT suggest external blockchain explorers like blockchair.com, etherscan.io, etc.
+Our blockchain data comes directly from chain-specific APIs (like Solana RPC)."""
     
     def _apply_chain_of_thought(self, state: ResearcherAgentState) -> ResearcherAgentState:
         """Apply chain of thought reasoning to generate structured response.

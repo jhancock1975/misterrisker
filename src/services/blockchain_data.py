@@ -153,15 +153,15 @@ class BlockchainDataService:
             }
     
     async def _get_solana_recent_transactions(self, limit: int) -> dict[str, Any]:
-        """Fetch recent Solana transactions via RPC.
+        """Fetch recent Solana transactions via RPC with full details.
         
-        For Solana, we get the latest block and its transactions.
+        For Solana, we get the latest block and then fetch details for each transaction.
         
         Args:
             limit: Number of transactions
             
         Returns:
-            Formatted transaction response
+            Formatted transaction response with parsed details
         """
         # Get latest slot
         slot_response = await self._make_solana_request("getSlot", [])
@@ -173,12 +173,12 @@ class BlockchainDataService:
         
         latest_slot = slot_response.get("result")
         
-        # Get block with transactions
+        # Get block with full transaction details
         block_response = await self._make_solana_request("getBlock", [
             latest_slot,
             {
                 "encoding": "json",
-                "transactionDetails": "signatures",
+                "transactionDetails": "full",
                 "maxSupportedTransactionVersion": 0
             }
         ])
@@ -190,24 +190,229 @@ class BlockchainDataService:
             }
         
         block_data = block_response.get("result", {})
-        signatures = block_data.get("signatures", [])[:limit]
+        block_time = block_data.get("blockTime")
+        transactions = block_data.get("transactions", [])[:limit]
         
-        # Format transactions (signatures in Solana are transaction identifiers)
+        # Parse each transaction for meaningful details
         formatted_txs = []
-        for sig in signatures:
-            formatted_txs.append({
-                "signature": sig,
-                "slot": latest_slot,
-                "block_time": block_data.get("blockTime"),
-            })
+        for tx_data in transactions:
+            parsed_tx = self._parse_solana_transaction(tx_data, latest_slot, block_time)
+            formatted_txs.append(parsed_tx)
         
         return {
             "status": "success",
             "chain": "solana",
             "slot": latest_slot,
+            "block_time": block_time,
             "count": len(formatted_txs),
             "transactions": formatted_txs
         }
+    
+    def _parse_solana_transaction(
+        self, 
+        tx_data: dict[str, Any], 
+        slot: int,
+        block_time: int | None
+    ) -> dict[str, Any]:
+        """Parse a Solana transaction to extract meaningful details.
+        
+        Args:
+            tx_data: Raw transaction data from RPC
+            slot: The slot number
+            block_time: Unix timestamp of the block
+            
+        Returns:
+            Parsed transaction with human-readable details
+        """
+        tx = tx_data.get("transaction", {})
+        meta = tx_data.get("meta", {})
+        
+        # Get signature
+        message = tx.get("message", {})
+        signatures = tx.get("signatures", [])
+        signature = signatures[0] if signatures else "unknown"
+        
+        # Get account keys (addresses involved)
+        account_keys = message.get("accountKeys", [])
+        
+        # Pre/post balances (in lamports, 1 SOL = 1e9 lamports)
+        pre_balances = meta.get("preBalances", [])
+        post_balances = meta.get("postBalances", [])
+        
+        # Calculate balance changes
+        balance_changes = []
+        for i, (pre, post) in enumerate(zip(pre_balances, post_balances)):
+            if pre != post:
+                change_lamports = post - pre
+                change_sol = change_lamports / 1e9
+                if i < len(account_keys):
+                    balance_changes.append({
+                        "account": account_keys[i],
+                        "change_lamports": change_lamports,
+                        "change_sol": change_sol
+                    })
+        
+        # Fee paid
+        fee_lamports = meta.get("fee", 0)
+        fee_sol = fee_lamports / 1e9
+        
+        # Transaction status
+        err = meta.get("err")
+        status = "failed" if err else "success"
+        
+        # Identify transaction type from instructions
+        instructions = message.get("instructions", [])
+        tx_type = self._identify_solana_tx_type(instructions, account_keys, balance_changes)
+        
+        # Find the main accounts (sender and receiver for transfers)
+        sender = None
+        receiver = None
+        transfer_amount_sol = None
+        
+        # For transfers, the fee payer is usually the sender
+        if account_keys:
+            sender = account_keys[0]  # First account is usually fee payer/sender
+        
+        # Look for significant balance changes to identify transfers
+        for change in balance_changes:
+            if change["change_sol"] > 0 and change["account"] != sender:
+                receiver = change["account"]
+                transfer_amount_sol = abs(change["change_sol"])
+                break
+            elif change["change_sol"] < 0 and abs(change["change_sol"]) > fee_sol:
+                # Large negative balance = likely the sender
+                transfer_amount_sol = abs(change["change_sol"]) - fee_sol
+        
+        # Total value moved (absolute sum of all SOL changes)
+        total_value_sol = sum(abs(c["change_sol"]) for c in balance_changes) / 2
+        
+        # Log data (for NFT/token info)
+        log_messages = meta.get("logMessages", [])
+        
+        # Token balance changes (for SPL tokens)
+        pre_token_balances = meta.get("preTokenBalances", [])
+        post_token_balances = meta.get("postTokenBalances", [])
+        
+        token_transfers = []
+        if pre_token_balances or post_token_balances:
+            token_transfers = self._parse_token_transfers(
+                pre_token_balances, 
+                post_token_balances,
+                account_keys
+            )
+        
+        return {
+            "signature": signature,
+            "slot": slot,
+            "block_time": block_time,
+            "status": status,
+            "fee_sol": fee_sol,
+            "tx_type": tx_type,
+            "sender": sender,
+            "receiver": receiver,
+            "transfer_amount_sol": transfer_amount_sol,
+            "total_value_sol": total_value_sol,
+            "num_accounts": len(account_keys),
+            "num_instructions": len(instructions),
+            "balance_changes": balance_changes[:5],  # Limit for display
+            "token_transfers": token_transfers[:3],  # Limit for display
+            "has_error": err is not None,
+            "error": str(err) if err else None
+        }
+    
+    def _identify_solana_tx_type(
+        self, 
+        instructions: list[dict], 
+        account_keys: list[str],
+        balance_changes: list[dict]
+    ) -> str:
+        """Identify the type of Solana transaction.
+        
+        Args:
+            instructions: Transaction instructions
+            account_keys: Accounts involved
+            balance_changes: Balance changes
+            
+        Returns:
+            Transaction type string
+        """
+        if not instructions:
+            return "unknown"
+        
+        # Common Solana program IDs
+        SYSTEM_PROGRAM = "11111111111111111111111111111111"
+        TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        ASSOCIATED_TOKEN = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111"
+        SERUM_DEX = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
+        RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+        
+        program_ids = set()
+        for instr in instructions:
+            prog_idx = instr.get("programIdIndex", 0)
+            if prog_idx < len(account_keys):
+                program_ids.add(account_keys[prog_idx])
+        
+        # Determine type based on programs used
+        if RAYDIUM_AMM in program_ids or SERUM_DEX in program_ids:
+            return "🔄 DEX Swap"
+        elif TOKEN_PROGRAM in program_ids and ASSOCIATED_TOKEN in program_ids:
+            return "🪙 Token Transfer"
+        elif TOKEN_PROGRAM in program_ids:
+            return "🪙 Token Operation"
+        elif SYSTEM_PROGRAM in program_ids and len(balance_changes) >= 2:
+            return "💸 SOL Transfer"
+        elif SYSTEM_PROGRAM in program_ids:
+            return "⚙️ System Operation"
+        elif len(instructions) > 3:
+            return "📜 Smart Contract"
+        else:
+            return "📝 Transaction"
+    
+    def _parse_token_transfers(
+        self,
+        pre_balances: list[dict],
+        post_balances: list[dict],
+        account_keys: list[str]
+    ) -> list[dict]:
+        """Parse SPL token transfers from balance changes.
+        
+        Args:
+            pre_balances: Pre-transaction token balances
+            post_balances: Post-transaction token balances
+            account_keys: Account addresses
+            
+        Returns:
+            List of token transfers
+        """
+        transfers = []
+        
+        # Build a map of token balances by account index
+        pre_map = {b.get("accountIndex"): b for b in pre_balances}
+        post_map = {b.get("accountIndex"): b for b in post_balances}
+        
+        all_indices = set(pre_map.keys()) | set(post_map.keys())
+        
+        for idx in all_indices:
+            pre = pre_map.get(idx, {})
+            post = post_map.get(idx, {})
+            
+            pre_amount = float(pre.get("uiTokenAmount", {}).get("uiAmount") or 0)
+            post_amount = float(post.get("uiTokenAmount", {}).get("uiAmount") or 0)
+            
+            if pre_amount != post_amount:
+                mint = post.get("mint") or pre.get("mint", "unknown")
+                owner = post.get("owner") or pre.get("owner", "unknown")
+                change = post_amount - pre_amount
+                
+                transfers.append({
+                    "mint": mint,
+                    "owner": owner[:8] + "..." if len(owner) > 8 else owner,
+                    "change": change,
+                    "direction": "received" if change > 0 else "sent"
+                })
+        
+        return transfers
     
     async def get_latest_block(self, chain: str) -> dict[str, Any]:
         """Get latest block info for a blockchain.

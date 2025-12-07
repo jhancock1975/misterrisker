@@ -930,21 +930,78 @@ class CoinbaseAgent:
             return f"❌ Error fetching blockchain data: {str(e)}"
 
     def _format_blockchain_transactions(self, result: dict[str, Any]) -> str:
-        """Format blockchain transaction data for display."""
+        """Format blockchain transaction data for display with rich details."""
         chain = result.get("chain", "unknown").capitalize()
         transactions = result.get("transactions", [])
         count = result.get("count", len(transactions))
+        slot = result.get("slot")
+        block_time = result.get("block_time")
         
         if not transactions:
             return f"No recent transactions found for {chain}."
         
-        lines = [f"📋 **Recent {chain} Transactions** ({count} shown)\n"]
+        # Format block time if available
+        time_str = ""
+        if block_time:
+            from datetime import datetime
+            dt = datetime.fromtimestamp(block_time)
+            time_str = f" at {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        
+        lines = [f"📋 **Recent {chain} Transactions** ({count} shown from slot {slot:,}{time_str})\n"]
         
         for i, tx in enumerate(transactions[:10], 1):  # Limit display to 10
             if chain.lower() == "solana":
-                sig = tx.get("signature", "")[:20] + "..."
-                slot = tx.get("slot", "")
-                lines.append(f"{i}. Slot {slot}: `{sig}`")
+                sig = tx.get("signature", "")
+                sig_short = sig[:16] + "..." if len(sig) > 16 else sig
+                tx_type = tx.get("tx_type", "Transaction")
+                status = "✅" if tx.get("status") == "success" else "❌"
+                fee_sol = tx.get("fee_sol", 0)
+                
+                lines.append(f"### {i}. {tx_type} {status}")
+                lines.append(f"   **Signature:** `{sig_short}`")
+                
+                # Show transfer details if available
+                transfer_amount = tx.get("transfer_amount_sol")
+                total_value = tx.get("total_value_sol", 0)
+                sender = tx.get("sender")
+                receiver = tx.get("receiver")
+                
+                if transfer_amount and transfer_amount > 0.0001:
+                    lines.append(f"   **Amount:** {transfer_amount:.6f} SOL")
+                elif total_value > 0.0001:
+                    lines.append(f"   **Value Moved:** {total_value:.6f} SOL")
+                
+                if sender:
+                    sender_short = sender[:8] + "..." + sender[-4:] if len(sender) > 12 else sender
+                    lines.append(f"   **From:** `{sender_short}`")
+                
+                if receiver:
+                    receiver_short = receiver[:8] + "..." + receiver[-4:] if len(receiver) > 12 else receiver
+                    lines.append(f"   **To:** `{receiver_short}`")
+                
+                # Show token transfers if any
+                token_transfers = tx.get("token_transfers", [])
+                if token_transfers:
+                    for tt in token_transfers[:2]:
+                        direction = "📥" if tt.get("direction") == "received" else "📤"
+                        mint = tt.get("mint", "unknown")
+                        mint_short = mint[:8] + "..." if len(mint) > 8 else mint
+                        change = abs(tt.get("change", 0))
+                        lines.append(f"   {direction} **Token:** {change:,.2f} ({mint_short})")
+                
+                # Show balance changes summary
+                balance_changes = tx.get("balance_changes", [])
+                if balance_changes and not transfer_amount:
+                    significant_changes = [c for c in balance_changes if abs(c.get("change_sol", 0)) > 0.0001]
+                    if significant_changes:
+                        lines.append(f"   **Balance Changes:** {len(significant_changes)} accounts affected")
+                
+                lines.append(f"   **Fee:** {fee_sol:.9f} SOL | **Accounts:** {tx.get('num_accounts', 0)} | **Instructions:** {tx.get('num_instructions', 0)}")
+                
+                if tx.get("has_error"):
+                    lines.append(f"   ⚠️ **Error:** {tx.get('error', 'Unknown error')}")
+                
+                lines.append("")  # Blank line between transactions
             else:
                 tx_hash = tx.get("hash", "")
                 if len(tx_hash) > 20:
@@ -962,6 +1019,9 @@ class CoinbaseAgent:
                     value_str = f" ({tx['input_total_zec']:.6f} ZEC)"
                 
                 lines.append(f"{i}. Block {block}: `{tx_hash}`{value_str}")
+        
+        # Add explorer link note
+        lines.append("\n💡 *View full details on Solana Explorer: https://explorer.solana.com*")
         
         return "\n".join(lines)
 

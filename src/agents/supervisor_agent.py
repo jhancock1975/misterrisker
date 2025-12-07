@@ -264,16 +264,21 @@ class SupervisorAgent:
         if self.coinbase_agent:
             capabilities.append("""
 ## Coinbase Agent (agent="coinbase")
-**Purpose**: Cryptocurrency trading and real-time market data
+**Purpose**: Cryptocurrency trading, real-time market data, AND blockchain queries
 **Capabilities**:
 - Access to YOUR Coinbase account: balances, portfolio, transaction history
 - Real-time WebSocket price feeds for BTC, ETH, SOL, XRP, ZEC (ACCURATE live prices)
 - Place buy/sell orders for cryptocurrencies
-- Blockchain data: transactions, blocks, on-chain analytics
+- **BLOCKCHAIN DATA**: On-chain transactions, blocks, largest transactions, blockchain analytics
 - Technical analysis with live candle data (OHLCV)
 - Pattern detection: bullish/bearish trends, volatility analysis
-**Use when**: User asks about crypto prices, wants to trade crypto, check crypto balances, 
-or needs real-time cryptocurrency market data and analysis
+**Use when**: 
+- User asks about crypto prices, wants to trade crypto, check crypto balances
+- User asks about **blockchain transactions** (e.g., "largest transactions on Solana blockchain")
+- User asks about **on-chain data** for any cryptocurrency
+- User mentions "blockchain" + a crypto name (Bitcoin, Ethereum, Solana, etc.)
+**CRITICAL**: If user asks about "Solana blockchain" or "Bitcoin blockchain" transactions, 
+route to Coinbase - this is blockchain data, NOT stock ticker "SOL"!
 **Recognized crypto symbols**: BTC, ETH, SOL, XRP, ZEC, Bitcoin, Ethereum, Solana, Ripple, Zcash
 **DO NOT use for**: Stock trading, general web searches, or generating trading strategies with specific limit orders""")
         
@@ -308,7 +313,13 @@ trading advice or limit orders, route to Schwab for stock-specific handling
 - General knowledge queries (weather, news, etc.)
 - Access to external data sources via internet search
 **Use when**: User wants research, opinions, news, comparisons, or any external information
-**DO NOT use for**: Real-time crypto prices (will hallucinate), placing trades, account operations""")
+**DO NOT use for**: 
+- Real-time crypto prices (will hallucinate)
+- Placing trades
+- Account operations
+- **BLOCKCHAIN QUERIES**: If user asks about "Solana blockchain", "Bitcoin blockchain", 
+  or any blockchain transactions, route to Coinbase agent NOT here!
+  "SOL blockchain" means Solana cryptocurrency, NOT the stock ticker SOL.""")
         
         if self.finrl_agent:
             capabilities.append("""
@@ -379,6 +390,15 @@ When routing, you MUST also extract:
 4. **"Buy/sell X" (execute trade)** → Coinbase (crypto) or Schwab (stocks)
 5. **"Check my balance"** → Coinbase (crypto) or Schwab (stocks)
 6. **AI/ML trading signals** → FinRL
+7. **BLOCKCHAIN queries** (transactions, blocks, on-chain data) → Coinbase
+   - "Solana blockchain transactions" → Coinbase (NOT researcher!)
+   - "Bitcoin blockchain" anything → Coinbase
+   - "largest transactions on [crypto] blockchain" → Coinbase
+
+## CRITICAL Disambiguation:
+- "Solana blockchain" or "SOL blockchain" = cryptocurrency Solana → route to Coinbase
+- "SOL stock" = Emeren Group Ltd stock ticker → route to Schwab
+- When "blockchain" is mentioned with a crypto name, ALWAYS route to Coinbase
 
 ## Asset Type Detection:
 - **CRYPTO**: BTC, ETH, SOL, XRP, ZEC, Bitcoin, Ethereum, Solana, etc.
@@ -681,6 +701,7 @@ if they say "Bitcoin" that's BTC-USD crypto. Extract ALL symbols mentioned."""
         messages = [
             SystemMessage(content="""You are Mister Risker, a helpful AI trading assistant.
 You have access to Coinbase for crypto trading, Schwab for stocks/options, and research tools.
+For blockchain data, we use the Solana RPC API directly.
 
 When responding to the user:
 - Be helpful, friendly, and conversational
@@ -688,7 +709,8 @@ When responding to the user:
 - If they ask a question you can answer from context, answer it directly
 - If they need trading/research capabilities, let them know what you can do
 - Never just echo their question back - always provide a thoughtful response
-- Keep responses concise but complete""")
+- Keep responses concise but complete
+- Do NOT suggest external blockchain explorers (blockchair.com, etherscan.io, etc.) - our data comes directly from chain APIs""")
         ]
         
         # Add conversation history for context
