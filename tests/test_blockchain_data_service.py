@@ -1,8 +1,10 @@
 """Tests for the Blockchain Data Service.
 
 This service provides global blockchain data (transactions, blocks).
-Currently only Solana is supported via free public RPC API.
-Other chains (BTC, ETH, XRP, ZEC) return not_supported status.
+Bitcoin and Solana are supported:
+- Bitcoin via mempool.space API (free, no API key)
+- Solana via public RPC API (free, no API key)
+Other chains (ETH, XRP, ZEC) return not_supported status.
 """
 
 import pytest
@@ -20,12 +22,43 @@ class TestBlockchainDataService:
         # Mock the slot response
         mock_slot_response = {"result": 300000000}
         
-        # Mock the block response - Solana returns signatures list directly
+        # Mock the block response with full transaction data
         mock_block_response = {
             "result": {
                 "blockHeight": 250000000,
                 "blockTime": 1701864000,
-                "signatures": ["sig1abc123", "sig2def456"]
+                "transactions": [
+                    {
+                        "transaction": {
+                            "signatures": ["sig1abc123"],
+                            "message": {
+                                "accountKeys": ["addr1", "addr2"],
+                                "instructions": [{"programIdIndex": 0}]
+                            }
+                        },
+                        "meta": {
+                            "err": None,
+                            "fee": 5000,
+                            "preBalances": [1000000000, 500000000],
+                            "postBalances": [999995000, 500000000]
+                        }
+                    },
+                    {
+                        "transaction": {
+                            "signatures": ["sig2def456"],
+                            "message": {
+                                "accountKeys": ["addr3", "addr4"],
+                                "instructions": [{"programIdIndex": 0}]
+                            }
+                        },
+                        "meta": {
+                            "err": None,
+                            "fee": 5000,
+                            "preBalances": [2000000000, 100000000],
+                            "postBalances": [1999995000, 100000000]
+                        }
+                    }
+                ]
             }
         }
         
@@ -43,17 +76,44 @@ class TestBlockchainDataService:
             assert result["transactions"][0]["signature"] == "sig1abc123"
 
     @pytest.mark.asyncio
-    async def test_get_recent_transactions_bitcoin_not_supported(self):
-        """Should return not_supported for Bitcoin (no free API)."""
+    async def test_get_recent_transactions_bitcoin_supported(self):
+        """Should fetch recent Bitcoin transactions via mempool.space."""
         from src.services.blockchain_data import BlockchainDataService
         
-        service = BlockchainDataService()
-        result = await service.get_recent_transactions("bitcoin", limit=10)
+        # Mock blocks response
+        mock_blocks_response = [
+            {
+                "id": "0000000000000000000abc123",
+                "height": 926000,
+                "timestamp": 1701864000,
+                "tx_count": 3000
+            }
+        ]
         
-        assert result["status"] == "not_supported"
-        assert "chain" in result
-        assert "message" in result
-        assert "free API" in result["message"]
+        # Mock transactions response
+        mock_txs_response = [
+            {
+                "txid": "txid123abc",
+                "vin": [{"prevout": {"scriptpubkey_address": "bc1sender", "value": 100000}}],
+                "vout": [{"scriptpubkey_address": "bc1receiver", "value": 90000}],
+                "fee": 1000,
+                "size": 250,
+                "weight": 600,
+                "status": {"confirmed": True, "block_height": 926000}
+            }
+        ]
+        
+        with patch.object(BlockchainDataService, '_make_mempool_request', new_callable=AsyncMock) as mock_request:
+            mock_request.side_effect = [mock_blocks_response, mock_txs_response]
+            
+            service = BlockchainDataService()
+            result = await service.get_recent_transactions("bitcoin", limit=5)
+            
+            assert result["status"] == "success"
+            assert result["chain"] == "bitcoin"
+            assert "transactions" in result
+            assert len(result["transactions"]) == 1
+            assert result["transactions"][0]["txid"] == "txid123abc"
 
     @pytest.mark.asyncio
     async def test_get_recent_transactions_ethereum_not_supported(self):
@@ -91,15 +151,34 @@ class TestBlockchainDataService:
             assert result["block"]["slot"] == 300000000
 
     @pytest.mark.asyncio
-    async def test_get_latest_block_bitcoin_not_supported(self):
-        """Should return not_supported for Bitcoin block info."""
+    async def test_get_latest_block_bitcoin_supported(self):
+        """Should fetch Bitcoin block info via mempool.space."""
         from src.services.blockchain_data import BlockchainDataService
         
-        service = BlockchainDataService()
-        result = await service.get_latest_block("bitcoin")
+        mock_blocks_response = [
+            {
+                "id": "0000000000000000000abc123",
+                "height": 926000,
+                "timestamp": 1701864000,
+                "tx_count": 3000,
+                "size": 1500000,
+                "weight": 4000000,
+                "difficulty": 149000000000000,
+                "nonce": 12345678,
+                "merkle_root": "abc123merkle"
+            }
+        ]
         
-        assert result["status"] == "not_supported"
-        assert "free API" in result["message"]
+        with patch.object(BlockchainDataService, '_make_mempool_request', new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = mock_blocks_response
+            
+            service = BlockchainDataService()
+            result = await service.get_latest_block("bitcoin")
+            
+            assert result["status"] == "success"
+            assert result["chain"] == "bitcoin"
+            assert "block" in result
+            assert result["block"]["height"] == 926000
 
     @pytest.mark.asyncio
     async def test_get_chain_stats_solana(self):
@@ -161,9 +240,9 @@ class TestBlockchainDataService:
         # get_supported_chains returns only fully supported chains
         supported = service.get_supported_chains()
         assert "solana" in supported
+        assert "bitcoin" in supported  # Bitcoin is now supported via mempool.space
         
-        # Bitcoin/Ethereum/etc are not fully supported
-        assert "bitcoin" not in supported
+        # Ethereum etc are not fully supported
         assert "ethereum" not in supported
         
         # get_all_known_chains includes both supported and unsupported

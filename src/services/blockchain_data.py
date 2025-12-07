@@ -4,9 +4,9 @@ Provides global blockchain data (transactions, blocks) for supported chains.
 
 Currently supported:
 - Solana (SOL) via Solana RPC API (free, no API key required)
+- Bitcoin (BTC) via mempool.space API (free, no API key required)
 
 Future support (requires finding free APIs):
-- Bitcoin (BTC)
 - Ethereum (ETH)
 - Ripple (XRP)
 - Zcash (ZEC)
@@ -22,12 +22,16 @@ from typing import Any
 class BlockchainDataService:
     """Service for fetching blockchain data from multiple chains.
     
-    Currently uses Solana public RPC. Other chains require finding
-    alternative free APIs (Blockchair was removed due to rate limits).
+    Uses free public APIs:
+    - Solana: Solana public RPC
+    - Bitcoin: mempool.space (community-run, open-source)
     """
     
     # Solana RPC endpoints
     SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+    
+    # Bitcoin mempool.space API (free, no key required)
+    MEMPOOL_API_URL = "https://mempool.space/api"
     
     # Chain name mappings (aliases to canonical names)
     CHAIN_ALIASES = {
@@ -44,10 +48,10 @@ class BlockchainDataService:
     }
     
     # Chains with working free APIs
-    SUPPORTED_CHAINS = {"solana"}
+    SUPPORTED_CHAINS = {"solana", "bitcoin"}
     
     # Chains that need alternative APIs (placeholder for future)
-    UNSUPPORTED_CHAINS = {"bitcoin", "ethereum", "ripple", "zcash"}
+    UNSUPPORTED_CHAINS = {"ethereum", "ripple", "zcash"}
     
     def __init__(self):
         """Initialize the blockchain data service."""
@@ -127,7 +131,7 @@ class BlockchainDataService:
                 "chain": chain,
                 "message": (
                     f"Blockchain data for {chain.upper()} is not currently available. "
-                    f"Only Solana (SOL) is supported via free API at this time. "
+                    f"Supported chains: Solana (SOL), Bitcoin (BTC). "
                     f"Alternative free APIs for {chain.upper()} are being researched."
                 )
             }
@@ -141,6 +145,8 @@ class BlockchainDataService:
         try:
             if normalized_chain == "solana":
                 return await self._get_solana_recent_transactions(limit)
+            elif normalized_chain == "bitcoin":
+                return await self._get_bitcoin_recent_transactions(limit)
             else:
                 return {
                     "status": "error",
@@ -413,7 +419,239 @@ class BlockchainDataService:
                 })
         
         return transfers
+
+    # ==================== BITCOIN (mempool.space) ====================
     
+    async def _make_mempool_request(self, endpoint: str) -> dict[str, Any] | list | str | int:
+        """Make GET request to mempool.space API.
+        
+        Args:
+            endpoint: API endpoint path (e.g., "/blocks/tip/height")
+            
+        Returns:
+            JSON response (can be dict, list, or primitive)
+        """
+        url = f"{self.MEMPOOL_API_URL}{endpoint}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers={"Accept": "application/json"}
+            ) as response:
+                if response.status != 200:
+                    return {"error": f"HTTP {response.status}"}
+                
+                content_type = response.headers.get("Content-Type", "")
+                if "application/json" in content_type:
+                    return await response.json()
+                else:
+                    # Some endpoints return plain text (like block height)
+                    text = await response.text()
+                    try:
+                        return int(text)
+                    except ValueError:
+                        return text
+
+    async def _get_bitcoin_recent_transactions(self, limit: int) -> dict[str, Any]:
+        """Fetch recent Bitcoin transactions via mempool.space API.
+        
+        Gets transactions from the most recent blocks.
+        
+        Args:
+            limit: Number of transactions
+            
+        Returns:
+            Formatted transaction response with parsed details
+        """
+        # Get recent blocks (returns 10 blocks)
+        blocks = await self._make_mempool_request("/blocks")
+        
+        if isinstance(blocks, dict) and "error" in blocks:
+            return {
+                "status": "error",
+                "message": f"mempool.space API error: {blocks.get('error')}"
+            }
+        
+        if not blocks or not isinstance(blocks, list):
+            return {
+                "status": "error",
+                "message": "Failed to fetch recent blocks from mempool.space"
+            }
+        
+        # Get the most recent block
+        latest_block = blocks[0]
+        block_hash = latest_block.get("id")
+        block_height = latest_block.get("height")
+        block_time = latest_block.get("timestamp")
+        
+        # Get transactions from the latest block (page 0, 25 txs per page)
+        txs_response = await self._make_mempool_request(f"/block/{block_hash}/txs/0")
+        
+        if isinstance(txs_response, dict) and "error" in txs_response:
+            return {
+                "status": "error",
+                "message": f"mempool.space API error: {txs_response.get('error')}"
+            }
+        
+        transactions = txs_response[:limit] if isinstance(txs_response, list) else []
+        
+        # Parse each transaction for meaningful details
+        formatted_txs = []
+        for tx_data in transactions:
+            parsed_tx = self._parse_bitcoin_transaction(tx_data, block_height, block_time)
+            formatted_txs.append(parsed_tx)
+        
+        return {
+            "status": "success",
+            "chain": "bitcoin",
+            "block_height": block_height,
+            "block_hash": block_hash,
+            "block_time": block_time,
+            "count": len(formatted_txs),
+            "transactions": formatted_txs
+        }
+    
+    def _parse_bitcoin_transaction(
+        self, 
+        tx_data: dict[str, Any], 
+        block_height: int,
+        block_time: int | None
+    ) -> dict[str, Any]:
+        """Parse a Bitcoin transaction to extract meaningful details.
+        
+        Args:
+            tx_data: Raw transaction data from mempool.space
+            block_height: The block height
+            block_time: Unix timestamp of the block
+            
+        Returns:
+            Parsed transaction with human-readable details
+        """
+        txid = tx_data.get("txid", "unknown")
+        
+        # Get inputs and outputs
+        vin = tx_data.get("vin", [])
+        vout = tx_data.get("vout", [])
+        
+        # Transaction size and fee
+        size = tx_data.get("size", 0)
+        weight = tx_data.get("weight", 0)
+        fee = tx_data.get("fee", 0)
+        fee_btc = fee / 1e8  # Convert satoshis to BTC
+        
+        # Calculate fee rate (sat/vB)
+        vsize = weight / 4 if weight else size
+        fee_rate = fee / vsize if vsize else 0
+        
+        # Get input addresses and values
+        input_total = 0
+        input_addresses = []
+        for inp in vin:
+            prevout = inp.get("prevout") or {}  # Handle None explicitly
+            value = prevout.get("value", 0)
+            input_total += value
+            
+            # Get the spending address
+            scriptpubkey_address = prevout.get("scriptpubkey_address")
+            if scriptpubkey_address and scriptpubkey_address not in input_addresses:
+                input_addresses.append(scriptpubkey_address)
+        
+        input_total_btc = input_total / 1e8
+        
+        # Get output addresses and values
+        output_total = 0
+        output_addresses = []
+        for out in vout:
+            value = out.get("value", 0)
+            output_total += value
+            
+            scriptpubkey_address = out.get("scriptpubkey_address")
+            if scriptpubkey_address and scriptpubkey_address not in output_addresses:
+                output_addresses.append(scriptpubkey_address)
+        
+        output_total_btc = output_total / 1e8
+        
+        # Determine transaction type
+        tx_type = self._identify_bitcoin_tx_type(vin, vout, fee)
+        
+        # Get sender (first input) and receiver (first non-change output)
+        sender = input_addresses[0] if input_addresses else None
+        
+        # Find receiver (output that's not likely change)
+        receiver = None
+        transfer_amount_btc = None
+        for out in vout:
+            addr = out.get("scriptpubkey_address")
+            if addr and addr not in input_addresses:
+                receiver = addr
+                transfer_amount_btc = out.get("value", 0) / 1e8
+                break
+        
+        # If no external receiver found, use first output
+        if not receiver and output_addresses:
+            receiver = output_addresses[0]
+            transfer_amount_btc = vout[0].get("value", 0) / 1e8 if vout else None
+        
+        # Transaction status
+        status_data = tx_data.get("status", {})
+        confirmed = status_data.get("confirmed", False)
+        status = "confirmed" if confirmed else "unconfirmed"
+        
+        return {
+            "txid": txid,
+            "block_height": block_height,
+            "block_time": block_time,
+            "status": status,
+            "fee_btc": fee_btc,
+            "fee_rate_sat_vb": round(fee_rate, 2),
+            "tx_type": tx_type,
+            "sender": sender,
+            "receiver": receiver,
+            "transfer_amount_btc": transfer_amount_btc,
+            "input_total_btc": input_total_btc,
+            "output_total_btc": output_total_btc,
+            "num_inputs": len(vin),
+            "num_outputs": len(vout),
+            "size_bytes": size,
+            "weight": weight,
+            "is_coinbase": len(vin) == 1 and vin[0].get("is_coinbase", False)
+        }
+    
+    def _identify_bitcoin_tx_type(
+        self, 
+        vin: list[dict], 
+        vout: list[dict],
+        fee: int
+    ) -> str:
+        """Identify the type of Bitcoin transaction.
+        
+        Args:
+            vin: Transaction inputs
+            vout: Transaction outputs
+            fee: Transaction fee in satoshis
+            
+        Returns:
+            Transaction type string
+        """
+        # Check for coinbase (mining reward)
+        if len(vin) == 1 and vin[0].get("is_coinbase"):
+            return "⛏️ Coinbase (Mining Reward)"
+        
+        # Check for consolidation (many inputs, one output)
+        if len(vin) > 5 and len(vout) <= 2:
+            return "🔄 Consolidation"
+        
+        # Check for batch payment (one input, many outputs)
+        if len(vin) <= 2 and len(vout) > 5:
+            return "📤 Batch Payment"
+        
+        # Check for simple transfer
+        if len(vin) <= 2 and len(vout) <= 2:
+            return "💸 Transfer"
+        
+        # Default
+        return "📝 Transaction"
+
     async def get_latest_block(self, chain: str) -> dict[str, Any]:
         """Get latest block info for a blockchain.
         
@@ -431,7 +669,7 @@ class BlockchainDataService:
                 "chain": chain,
                 "message": (
                     f"Block data for {chain.upper()} is not currently available. "
-                    f"Only Solana (SOL) is supported via free API at this time."
+                    f"Only Bitcoin (BTC) and Solana (SOL) are supported at this time."
                 )
             }
         
@@ -444,6 +682,8 @@ class BlockchainDataService:
         try:
             if normalized_chain == "solana":
                 return await self._get_solana_latest_block()
+            elif normalized_chain == "bitcoin":
+                return await self._get_bitcoin_latest_block()
             else:
                 return {
                     "status": "error",
@@ -454,6 +694,35 @@ class BlockchainDataService:
                 "status": "error",
                 "message": f"Error fetching block: {str(e)}"
             }
+    
+    async def _get_bitcoin_latest_block(self) -> dict[str, Any]:
+        """Get latest Bitcoin block info using mempool.space API."""
+        # Get the latest block hash and height
+        blocks = await self._make_mempool_request("/blocks")
+        
+        if not blocks or len(blocks) == 0:
+            return {
+                "status": "error",
+                "message": "No blocks returned from mempool.space"
+            }
+        
+        latest_block = blocks[0]
+        
+        return {
+            "status": "success",
+            "chain": "bitcoin",
+            "block": {
+                "height": latest_block.get("height"),
+                "hash": latest_block.get("id"),
+                "timestamp": latest_block.get("timestamp"),
+                "tx_count": latest_block.get("tx_count"),
+                "size_bytes": latest_block.get("size"),
+                "weight": latest_block.get("weight"),
+                "difficulty": latest_block.get("difficulty"),
+                "nonce": latest_block.get("nonce"),
+                "merkle_root": latest_block.get("merkle_root"),
+            }
+        }
     
     async def _get_solana_latest_block(self) -> dict[str, Any]:
         """Get latest Solana slot/block info."""
@@ -499,7 +768,7 @@ class BlockchainDataService:
                 "chain": chain,
                 "message": (
                     f"Stats for {chain.upper()} are not currently available. "
-                    f"Only Solana (SOL) is supported via free API at this time."
+                    f"Only Bitcoin (BTC) and Solana (SOL) are supported at this time."
                 )
             }
         
@@ -512,6 +781,8 @@ class BlockchainDataService:
         try:
             if normalized_chain == "solana":
                 return await self._get_solana_stats()
+            elif normalized_chain == "bitcoin":
+                return await self._get_bitcoin_stats()
             else:
                 return {
                     "status": "error",
@@ -522,6 +793,52 @@ class BlockchainDataService:
                 "status": "error",
                 "message": f"Error fetching stats: {str(e)}"
             }
+    
+    async def _get_bitcoin_stats(self) -> dict[str, Any]:
+        """Get Bitcoin network stats using mempool.space API."""
+        # Get latest blocks for difficulty and height
+        blocks = await self._make_mempool_request("/blocks")
+        
+        if not blocks or len(blocks) == 0:
+            return {
+                "status": "error",
+                "message": "No blocks returned from mempool.space"
+            }
+        
+        latest_block = blocks[0]
+        
+        # Get mempool stats
+        mempool = await self._make_mempool_request("/mempool")
+        
+        # Get fee estimates
+        fees = await self._make_mempool_request("/v1/fees/recommended")
+        
+        # Get hashrate stats (optional endpoint)
+        try:
+            hashrate_data = await self._make_mempool_request("/v1/mining/hashrate/3d")
+            current_hashrate = hashrate_data.get("currentHashrate", 0) if hashrate_data else 0
+        except Exception:
+            current_hashrate = 0
+        
+        return {
+            "status": "success",
+            "chain": "bitcoin",
+            "stats": {
+                "block_height": latest_block.get("height"),
+                "difficulty": latest_block.get("difficulty"),
+                "mempool_size": mempool.get("count", 0) if mempool else 0,
+                "mempool_vsize_mb": (mempool.get("vsize", 0) / 1_000_000) if mempool else 0,
+                "mempool_total_fee_btc": (mempool.get("total_fee", 0) / 100_000_000) if mempool else 0,
+                "recommended_fee_sat_vb": {
+                    "fastest": fees.get("fastestFee", 0) if fees else 0,
+                    "half_hour": fees.get("halfHourFee", 0) if fees else 0,
+                    "hour": fees.get("hourFee", 0) if fees else 0,
+                    "economy": fees.get("economyFee", 0) if fees else 0,
+                    "minimum": fees.get("minimumFee", 0) if fees else 0,
+                },
+                "hashrate_eh_s": current_hashrate / 1e18 if current_hashrate else None,
+            }
+        }
     
     async def _get_solana_stats(self) -> dict[str, Any]:
         """Get Solana network stats."""

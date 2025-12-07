@@ -474,12 +474,15 @@ class CoinbaseAgent:
             # Check for cancel requests FIRST
             if "cancel" in query_lower:
                 response = await self._handle_cancel_request(query)
-            # Check for analysis/pattern queries - use real-time data
+            # Check for blockchain data queries (transactions, blocks, on-chain data)
+            # This must come BEFORE analysis check because "analyze blockchain" should use blockchain data
+            elif any(word in query_lower for word in ["blockchain", "block chain", "on-chain", "onchain", "ledger"]) or \
+                 (any(word in query_lower for word in ["transaction", "transactions"]) and 
+                  any(word in query_lower for word in ["bitcoin", "btc", "solana", "sol", "ethereum", "eth"])):
+                response = await self._handle_blockchain_query(query)
+            # Check for analysis/pattern queries - use real-time price data
             elif any(word in query_lower for word in ["pattern", "patterns", "analyze", "analysis", "trend", "trends", "seeing"]):
                 response = await self._handle_analysis_query(query)
-            # Check for blockchain data queries (transactions, blocks, on-chain data)
-            elif any(word in query_lower for word in ["blockchain", "transaction", "transactions", "block ", "blocks", "on-chain", "onchain", "ledger"]):
-                response = await self._handle_blockchain_query(query)
             # Check for order/trade requests (before price checks)
             elif any(word in query_lower for word in ["limit order", "place.*order", "order"]):
                 response = await self._handle_order_request(query)
@@ -935,6 +938,7 @@ class CoinbaseAgent:
         transactions = result.get("transactions", [])
         count = result.get("count", len(transactions))
         slot = result.get("slot")
+        block_height = result.get("block_height")
         block_time = result.get("block_time")
         
         if not transactions:
@@ -947,7 +951,14 @@ class CoinbaseAgent:
             dt = datetime.fromtimestamp(block_time)
             time_str = f" at {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
         
-        lines = [f"📋 **Recent {chain} Transactions** ({count} shown from slot {slot:,}{time_str})\n"]
+        # Build header based on chain
+        if chain.lower() == "solana":
+            lines = [f"📋 **Recent {chain} Transactions** ({count} shown from slot {slot:,}{time_str})\n"]
+        elif chain.lower() == "bitcoin":
+            block_ref = f"block {block_height:,}" if block_height else "mempool"
+            lines = [f"₿ **Recent {chain} Transactions** ({count} shown from {block_ref}{time_str})\n"]
+        else:
+            lines = [f"📋 **Recent {chain} Transactions** ({count} shown{time_str})\n"]
         
         for i, tx in enumerate(transactions[:10], 1):  # Limit display to 10
             if chain.lower() == "solana":
@@ -1002,6 +1013,60 @@ class CoinbaseAgent:
                     lines.append(f"   ⚠️ **Error:** {tx.get('error', 'Unknown error')}")
                 
                 lines.append("")  # Blank line between transactions
+            
+            elif chain.lower() == "bitcoin":
+                txid = tx.get("txid", "")
+                txid_short = txid[:16] + "..." if len(txid) > 16 else txid
+                tx_type = tx.get("tx_type", "📝 Transaction")
+                status_str = tx.get("status", "unknown")
+                confirmed = status_str == "confirmed"
+                status = "✅" if confirmed else "⏳"
+                
+                lines.append(f"### {i}. {tx_type} {status}")
+                lines.append(f"   **TxID:** `{txid_short}`")
+                
+                # Show value (use transfer_amount_btc or fall back to output_total_btc)
+                value_btc = tx.get("transfer_amount_btc") or tx.get("output_total_btc", 0)
+                if value_btc and value_btc > 0:
+                    lines.append(f"   **Value:** {value_btc:.8f} BTC")
+                
+                # Show sender and receiver
+                sender = tx.get("sender")
+                receiver = tx.get("receiver")
+                
+                if sender:
+                    sender_short = sender[:12] + "..." + sender[-4:] if len(sender) > 16 else sender
+                    lines.append(f"   **From:** `{sender_short}`")
+                
+                if receiver:
+                    receiver_short = receiver[:12] + "..." + receiver[-4:] if len(receiver) > 16 else receiver
+                    lines.append(f"   **To:** `{receiver_short}`")
+                
+                # Show fee
+                fee_btc = tx.get("fee_btc", 0)
+                fee_rate = tx.get("fee_rate_sat_vb")
+                fee_str = f"**Fee:** {fee_btc:.8f} BTC"
+                if fee_rate:
+                    fee_str += f" ({fee_rate:.1f} sat/vB)"
+                lines.append(f"   {fee_str}")
+                
+                # Show input/output counts and size
+                input_count = tx.get("num_inputs", 0)
+                output_count = tx.get("num_outputs", 0)
+                size = tx.get("size_bytes")
+                weight = tx.get("weight")
+                vsize = weight // 4 if weight else size
+                
+                size_str = f"{vsize:,} vB" if vsize else f"{size:,} B" if size else ""
+                lines.append(f"   **Inputs:** {input_count} | **Outputs:** {output_count} | **Size:** {size_str}")
+                
+                # Show confirmations if confirmed
+                confirmations = tx.get("confirmations", 0)
+                if confirmed and confirmations:
+                    lines.append(f"   **Confirmations:** {confirmations:,}")
+                
+                lines.append("")  # Blank line between transactions
+            
             else:
                 tx_hash = tx.get("hash", "")
                 if len(tx_hash) > 20:
@@ -1020,8 +1085,11 @@ class CoinbaseAgent:
                 
                 lines.append(f"{i}. Block {block}: `{tx_hash}`{value_str}")
         
-        # Add explorer link note
-        lines.append("\n💡 *View full details on Solana Explorer: https://explorer.solana.com*")
+        # Add explorer link note based on chain
+        if chain.lower() == "solana":
+            lines.append("\n💡 *View full details on Solana Explorer: https://explorer.solana.com*")
+        elif chain.lower() == "bitcoin":
+            lines.append("\n💡 *View full details on Mempool.space: https://mempool.space*")
         
         return "\n".join(lines)
 
@@ -1035,6 +1103,25 @@ class CoinbaseAgent:
             lines.append(f"• Slot: {block.get('slot', 'N/A'):,}")
             lines.append(f"• Epoch: {block.get('epoch', 'N/A')}")
             lines.append(f"• Slot Index: {block.get('slot_index', 'N/A'):,} / {block.get('slots_in_epoch', 'N/A'):,}")
+        elif chain.lower() == "bitcoin":
+            lines = [f"₿ **Latest {chain} Block**\n"]
+            lines.append(f"• Height: {block.get('height', 'N/A'):,}")
+            if block.get('hash'):
+                hash_display = block['hash'][:20] + "..." if len(block.get('hash', '')) > 20 else block.get('hash')
+                lines.append(f"• Hash: `{hash_display}`")
+            if block.get('timestamp'):
+                from datetime import datetime
+                dt = datetime.fromtimestamp(block['timestamp'])
+                lines.append(f"• Time: {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            if block.get('tx_count'):
+                lines.append(f"• Transactions: {block['tx_count']:,}")
+            if block.get('size_bytes'):
+                size_mb = block['size_bytes'] / 1_000_000
+                lines.append(f"• Size: {size_mb:.2f} MB")
+            if block.get('difficulty'):
+                lines.append(f"• Difficulty: {block['difficulty']:,.0f}")
+            if block.get('nonce'):
+                lines.append(f"• Nonce: {block['nonce']:,}")
         else:
             lines = [f"🔲 **Latest {chain} Block**\n"]
             lines.append(f"• Height: {block.get('height', 'N/A'):,}")
@@ -1063,6 +1150,24 @@ class CoinbaseAgent:
                 lines.append(f"• Total Supply: {stats['total_supply_sol']:,.2f} SOL")
             if stats.get('circulating_supply_sol'):
                 lines.append(f"• Circulating Supply: {stats['circulating_supply_sol']:,.2f} SOL")
+        elif chain.lower() == "bitcoin":
+            lines.append(f"• Block Height: {stats.get('block_height', 0):,}")
+            if stats.get('difficulty'):
+                lines.append(f"• Difficulty: {stats['difficulty']:,.0f}")
+            if stats.get('hashrate_eh_s'):
+                lines.append(f"• Hashrate: {stats['hashrate_eh_s']:.2f} EH/s")
+            lines.append("")
+            lines.append("**Mempool:**")
+            lines.append(f"• Pending Transactions: {stats.get('mempool_size', 0):,}")
+            lines.append(f"• Mempool Size: {stats.get('mempool_vsize_mb', 0):.2f} MB")
+            lines.append(f"• Total Fees: {stats.get('mempool_total_fee_btc', 0):.4f} BTC")
+            lines.append("")
+            lines.append("**Recommended Fees (sat/vB):**")
+            fees = stats.get('recommended_fee_sat_vb', {})
+            lines.append(f"• Fastest (~10 min): {fees.get('fastest', 0)} sat/vB")
+            lines.append(f"• Half Hour: {fees.get('half_hour', 0)} sat/vB")
+            lines.append(f"• Hour: {fees.get('hour', 0)} sat/vB")
+            lines.append(f"• Economy: {fees.get('economy', 0)} sat/vB")
         else:
             if stats.get('blocks'):
                 lines.append(f"• Blocks: {stats['blocks']:,}")
