@@ -564,8 +564,12 @@ if they say "Bitcoin" that's BTC-USD crypto. Extract ALL symbols mentioned."""
                 response = "I'd like to help with trading strategy, but the strategy service is not configured."
             else:
                 logs.append(f"[SUPERVISOR] Generating trading strategy with TradingStrategyService")
+                logs.append(f"[SUPERVISOR] Symbols: {decision.symbols}, Asset type: {decision.asset_type}")
                 try:
-                    response = await self._generate_trading_strategy_response(decision.query_for_agent)
+                    response = await self._generate_trading_strategy_response(
+                        decision.query_for_agent,
+                        routing_decision=decision
+                    )
                     logs.append(f"[STRATEGY SERVICE] Completed: {len(response)} chars")
                 except Exception as e:
                     logs.append(f"[STRATEGY SERVICE] Error: {e}")

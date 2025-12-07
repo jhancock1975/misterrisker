@@ -99,14 +99,15 @@ class PortfolioStrategy:
 
 
 class TradingStrategyService:
-    """Service for generating intelligent trading strategies.
+    """Service for generating intelligent trading strategies for ANY tradeable asset.
     
     This service combines multiple data sources and analysis methods to generate
     actionable trading recommendations based on sound investment principles.
     
-    Supports both:
+    Supports:
     - Cryptocurrency (via Coinbase WebSocket real-time data)
-    - Stocks (via Schwab MCP Server quotes)
+    - Stocks/ETFs (via Schwab MCP Server quotes)
+    - Any other tradeable asset with available price data
     
     Key Principles (from The Intelligent Investor):
     1. Margin of Safety - Buy below intrinsic value, set entries below current price
@@ -122,25 +123,6 @@ class TradingStrategyService:
     DEFAULT_TAKE_PROFIT_MULTIPLIER = 2.0  # 2:1 risk/reward minimum
     MAX_POSITION_SIZE = 0.10  # Max 10% of portfolio per position
     MAX_TOTAL_RISK = 0.25  # Max 25% of portfolio at risk
-    
-    # Known stock symbols (not crypto) for detection
-    COMMON_STOCKS = {
-        'AAPL', 'TSLA', 'NVDA', 'AMD', 'GOOG', 'GOOGL', 'MSFT', 'AMZN', 'META',
-        'MU', 'INTC', 'NFLX', 'BABA', 'DIS', 'V', 'MA', 'JPM', 'BAC', 'WFC',
-        'XOM', 'CVX', 'PFE', 'JNJ', 'UNH', 'HD', 'WMT', 'TGT', 'COST', 'KO',
-        'PEP', 'MCD', 'SBUX', 'NKE', 'ABNB', 'UBER', 'LYFT', 'SQ', 'PYPL',
-        'CRM', 'ORCL', 'ADBE', 'NOW', 'SHOP', 'SNOW', 'PLTR', 'NET', 'DDOG',
-        'ZM', 'DOCU', 'TWLO', 'OKTA', 'CRWD', 'ZS', 'PANW', 'FTNT', 'SPLK',
-        'COIN', 'HOOD', 'RBLX', 'U', 'SNAP', 'PINS', 'TWTR', 'SPOT', 'ROKU',
-        'GME', 'AMC', 'BB', 'NOK', 'SOFI', 'LCID', 'RIVN', 'F', 'GM', 'TM',
-        'SPY', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO', 'ARKK', 'XLF', 'XLK', 'XLE'
-    }
-    
-    # Known crypto symbols for detection
-    CRYPTO_SYMBOLS = {
-        'BTC', 'ETH', 'SOL', 'XRP', 'ZEC', 'DOGE', 'ADA', 'DOT', 'LINK', 'LTC',
-        'BCH', 'AVAX', 'SHIB', 'MATIC', 'UNI', 'ATOM', 'XLM', 'FIL', 'AAVE', 'ALGO'
-    }
     
     def __init__(
         self,
@@ -168,36 +150,109 @@ class TradingStrategyService:
         
         logger.info("TradingStrategyService initialized")
     
-    def _is_stock(self, symbol: str) -> bool:
-        """Determine if symbol is a stock (vs crypto).
+    def _is_crypto_symbol(self, symbol: str) -> bool:
+        """Determine if symbol looks like a crypto symbol.
         
-        Args:
-            symbol: The trading symbol
-            
-        Returns:
-            True if symbol appears to be a stock, False for crypto
+        Crypto symbols typically have -USD suffix (BTC-USD, ETH-USD) or
+        are well-known crypto tickers.
         """
-        # Clean up symbol (remove -USD suffix if present)
-        clean_symbol = symbol.replace('-USD', '').upper()
+        symbol_upper = symbol.upper()
         
-        # Check if it's in known stocks
-        if clean_symbol in self.COMMON_STOCKS:
+        # Crypto pairs have -USD, -USDT, -BTC suffix
+        if any(suffix in symbol_upper for suffix in ['-USD', '-USDT', '-BTC', '-ETH']):
             return True
         
-        # Check if it's in known crypto
-        if clean_symbol in self.CRYPTO_SYMBOLS:
-            return False
-        
-        # Heuristic: crypto pairs usually have -USD suffix
-        if '-USD' in symbol.upper():
-            return False
-        
-        # Heuristic: single ticker without -USD is likely a stock
-        if len(clean_symbol) <= 5 and clean_symbol.isalpha():
+        # Common crypto base symbols (without suffix)
+        common_crypto = {'BTC', 'ETH', 'SOL', 'XRP', 'ZEC', 'DOGE', 'ADA', 'DOT', 
+                        'LINK', 'LTC', 'BCH', 'AVAX', 'SHIB', 'MATIC', 'UNI'}
+        if symbol_upper in common_crypto:
             return True
         
         return False
     
+    def _normalize_symbol(self, symbol: str, asset_type: str = "unknown") -> str:
+        """Normalize symbol format based on asset type.
+        
+        Crypto: Ensure -USD suffix (BTC -> BTC-USD)
+        Stocks: Keep as-is (AAPL stays AAPL)
+        """
+        symbol_upper = symbol.upper().strip()
+        
+        if asset_type == "crypto" or self._is_crypto_symbol(symbol_upper):
+            # Add -USD suffix if not present
+            if not any(suffix in symbol_upper for suffix in ['-USD', '-USDT', '-BTC']):
+                return f"{symbol_upper}-USD"
+            return symbol_upper
+        
+        # Stock: just uppercase
+        return symbol_upper
+    
+    async def _get_market_data(self, symbol: str, asset_type: str = "unknown") -> Optional[dict]:
+        """Get market data for any symbol, auto-detecting source.
+        
+        Returns unified market data dict with keys:
+        - current_price: float
+        - high: float (day or period high)
+        - low: float (day or period low)
+        - open: float (optional)
+        - volume: float (optional)
+        - source: str ("websocket", "schwab", "none")
+        """
+        normalized = self._normalize_symbol(symbol, asset_type)
+        
+        # Try crypto WebSocket first if it looks like crypto
+        if asset_type == "crypto" or self._is_crypto_symbol(normalized):
+            candle = self._get_current_candle(normalized)
+            if candle:
+                return {
+                    "current_price": float(candle.get('close', 0)),
+                    "high": float(candle.get('high', 0)),
+                    "low": float(candle.get('low', 0)),
+                    "open": float(candle.get('open', 0)),
+                    "volume": float(candle.get('volume', 0)),
+                    "source": "websocket",
+                    "symbol": normalized
+                }
+        
+        # Try Schwab for stocks
+        if asset_type in ("stock", "unknown") and self.schwab_mcp_server:
+            quote = await self._get_stock_quote(symbol.replace('-USD', ''))
+            if quote:
+                # Parse Schwab quote format
+                return self._parse_schwab_quote(quote, symbol)
+        
+        # No data available
+        return None
+    
+    def _parse_schwab_quote(self, quote: dict, symbol: str) -> Optional[dict]:
+        """Parse Schwab quote response into unified format."""
+        try:
+            # Schwab returns nested quote data
+            if isinstance(quote, dict):
+                # Handle different response formats
+                quote_data = quote.get(symbol, quote)
+                if 'quote' in quote_data:
+                    quote_data = quote_data['quote']
+                
+                current = float(quote_data.get('lastPrice', quote_data.get('mark', 0)))
+                high = float(quote_data.get('highPrice', quote_data.get('52WeekHigh', current * 1.1)))
+                low = float(quote_data.get('lowPrice', quote_data.get('52WeekLow', current * 0.9)))
+                
+                return {
+                    "current_price": current,
+                    "high": high,
+                    "low": low,
+                    "open": float(quote_data.get('openPrice', current)),
+                    "volume": float(quote_data.get('totalVolume', 0)),
+                    "source": "schwab",
+                    "symbol": symbol,
+                    "52_week_high": float(quote_data.get('52WeekHigh', high)),
+                    "52_week_low": float(quote_data.get('52WeekLow', low)),
+                }
+        except Exception as e:
+            logger.error(f"Error parsing Schwab quote: {e}")
+        return None
+
     async def _get_stock_quote(self, symbol: str) -> Optional[dict]:
         """Get stock quote data from Schwab MCP Server.
         
@@ -225,6 +280,205 @@ class TradingStrategyService:
         if self.websocket_service:
             return self.websocket_service.get_latest_candle(symbol)
         return None
+    
+    async def generate_recommendations(
+        self,
+        symbols: list[str],
+        asset_type: str = "unknown",
+        risk_tolerance: Literal["conservative", "moderate", "aggressive"] = "conservative"
+    ) -> list[LimitOrderRecommendation]:
+        """Generate trading recommendations for any list of symbols.
+        
+        This is the main unified entry point that handles both crypto and stocks.
+        
+        Args:
+            symbols: List of trading symbols (any format)
+            asset_type: "crypto", "stock", "mixed", or "unknown"
+            risk_tolerance: Risk level for recommendations
+            
+        Returns:
+            List of LimitOrderRecommendation objects
+        """
+        recommendations = []
+        
+        for symbol in symbols[:10]:  # Limit to 10 symbols
+            try:
+                # Get market data from appropriate source
+                market_data = await self._get_market_data(symbol, asset_type)
+                
+                if not market_data or market_data.get("current_price", 0) <= 0:
+                    logger.warning(f"No market data for {symbol}")
+                    continue
+                
+                # Generate recommendation using unified logic
+                rec = self._generate_recommendation_from_data(
+                    symbol=market_data.get("symbol", symbol),
+                    market_data=market_data,
+                    risk_tolerance=risk_tolerance
+                )
+                recommendations.append(rec)
+                
+            except Exception as e:
+                logger.error(f"Error generating recommendation for {symbol}: {e}")
+                continue
+        
+        return recommendations
+    
+    def _generate_recommendation_from_data(
+        self,
+        symbol: str,
+        market_data: dict,
+        risk_tolerance: Literal["conservative", "moderate", "aggressive"] = "conservative"
+    ) -> LimitOrderRecommendation:
+        """Generate a recommendation from unified market data."""
+        current_price = market_data["current_price"]
+        high = market_data.get("high", current_price * 1.02)
+        low = market_data.get("low", current_price * 0.98)
+        source = market_data.get("source", "unknown")
+        
+        # Calculate support/resistance from day range
+        support = low * 0.995
+        resistance = high * 1.005
+        
+        # Calculate volatility
+        volatility = (high - low) / current_price if current_price > 0 else 0.02
+        
+        # Determine trend from price position
+        mid = (high + low) / 2
+        if current_price > mid * 1.01:
+            trend = "bullish"
+        elif current_price < mid * 0.99:
+            trend = "bearish"
+        else:
+            trend = "neutral"
+        
+        # Get FinRL signal if available (crypto only)
+        finrl_signal = None
+        if source == "websocket" and self.finrl_service:
+            finrl_signal = self._get_finrl_signal(symbol)
+        
+        # Determine action
+        action = self._determine_action(trend, finrl_signal, volatility)
+        
+        # Set risk parameters
+        if risk_tolerance == "conservative":
+            mos = 0.03
+            stop_loss_pct = 0.05
+            rr_target = 2.5
+            max_position = 5.0
+        elif risk_tolerance == "moderate":
+            mos = 0.02
+            stop_loss_pct = 0.07
+            rr_target = 2.0
+            max_position = 10.0
+        else:
+            mos = 0.01
+            stop_loss_pct = 0.10
+            rr_target = 1.5
+            max_position = 15.0
+        
+        # Calculate price levels
+        if action == "buy":
+            entry_price = current_price * (1 - mos)
+            stop_loss_price = entry_price * (1 - stop_loss_pct)
+            risk = entry_price - stop_loss_price
+            take_profit_price = entry_price + (risk * rr_target)
+        elif action == "sell":
+            entry_price = current_price * (1 + mos)
+            take_profit_price = current_price * (1 - mos * 2)
+            stop_loss_price = current_price * (1 + stop_loss_pct)
+            risk = stop_loss_price - entry_price
+        else:  # hold
+            extra_mos = mos * 1.5
+            entry_price = current_price * (1 - extra_mos)
+            stop_loss_price = entry_price * (1 - stop_loss_pct)
+            risk = entry_price - stop_loss_price
+            take_profit_price = entry_price + (risk * rr_target)
+        
+        # Calculate R:R
+        if action in ("buy", "hold") and risk > 0:
+            risk_reward = (take_profit_price - entry_price) / risk
+        else:
+            risk_reward = rr_target
+        
+        # Build factors
+        technical_factors = [
+            f"Trend: {trend.upper()}",
+            f"Volatility: {volatility:.2%}",
+            f"Support: ${support:,.2f}",
+            f"Resistance: ${resistance:,.2f}",
+            f"Data source: {source}"
+        ]
+        
+        if finrl_signal:
+            technical_factors.append(
+                f"FinRL AI: {finrl_signal['action'].upper()} ({finrl_signal['confidence']:.0%})"
+            )
+        
+        risk_factors = []
+        if volatility > 0.05:
+            risk_factors.append("High volatility")
+        if action == "buy" and trend == "bearish":
+            risk_factors.append("Buying against trend")
+        
+        # Confidence
+        confidence = self._calculate_confidence(trend, finrl_signal, volatility)
+        
+        reasoning = self._generate_reasoning(
+            action, trend, finrl_signal, current_price, entry_price,
+            take_profit_price, stop_loss_price, mos
+        )
+        
+        return LimitOrderRecommendation(
+            symbol=symbol,
+            action=action,
+            current_price=current_price,
+            entry_price=entry_price,
+            take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
+            risk_reward_ratio=risk_reward,
+            position_size_percent=max_position,
+            confidence=confidence,
+            signal_source=source,
+            reasoning=reasoning,
+            technical_factors=technical_factors,
+            risk_factors=risk_factors if risk_factors else ["Standard market risk"],
+            margin_of_safety_percent=mos * 100
+        )
+    
+    def create_portfolio_from_recommendations(
+        self,
+        recommendations: list[LimitOrderRecommendation]
+    ) -> PortfolioStrategy:
+        """Create a portfolio strategy from a list of recommendations."""
+        buy_count = sum(1 for r in recommendations if r.action == "buy")
+        sell_count = sum(1 for r in recommendations if r.action == "sell")
+        
+        if buy_count > sell_count + 1:
+            outlook = "bullish"
+            conditions = "Market showing bullish signals."
+        elif sell_count > buy_count + 1:
+            outlook = "bearish"
+            conditions = "Market showing bearish signals."
+        else:
+            outlook = "neutral"
+            conditions = "Mixed signals across assets."
+        
+        total_risk = sum(
+            r.position_size_percent * (1 - r.stop_loss_price / r.entry_price)
+            for r in recommendations if r.action == "buy" and r.entry_price > 0
+        )
+        
+        summary = self._generate_portfolio_summary(recommendations, outlook)
+        
+        return PortfolioStrategy(
+            recommendations=recommendations,
+            overall_outlook=outlook,
+            market_conditions=conditions,
+            total_risk_percent=min(total_risk, self.MAX_TOTAL_RISK * 100),
+            diversification_score=len(set(r.action for r in recommendations)) / 3.0,
+            summary=summary
+        )
     
     def _calculate_support_resistance(self, symbol: str, current_price: float) -> tuple[float, float]:
         """Calculate support and resistance levels based on recent price action.
