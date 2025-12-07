@@ -22,6 +22,9 @@ from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
+# Import TradingStrategyService for generating actionable recommendations
+from src.services.trading_strategy import TradingStrategyService
+
 # Configure logging
 logger = logging.getLogger("mister_risker.supervisor")
 
@@ -33,7 +36,7 @@ class SupervisorAgentError(Exception):
 
 class RoutingDecision(BaseModel):
     """Schema for the supervisor's routing decision."""
-    agent: Literal["coinbase", "schwab", "researcher", "finrl", "direct"] = Field(
+    agent: Literal["coinbase", "schwab", "researcher", "finrl", "strategy", "direct"] = Field(
         description="Which agent should handle this request. 'direct' means respond without delegation."
     )
     reasoning: str = Field(
@@ -41,6 +44,14 @@ class RoutingDecision(BaseModel):
     )
     query_for_agent: str = Field(
         description="The query or instruction to pass to the sub-agent, or direct response if agent='direct'."
+    )
+    symbols: list[str] = Field(
+        default=[],
+        description="Trading symbols mentioned or implied. For crypto use format like 'BTC-USD'. For stocks use ticker like 'AAPL'. Extract ALL symbols the user is asking about."
+    )
+    asset_type: Literal["crypto", "stock", "mixed", "unknown"] = Field(
+        default="unknown",
+        description="Type of assets: 'crypto' for cryptocurrency, 'stock' for equities, 'mixed' if both, 'unknown' if unclear."
     )
 
 
@@ -73,6 +84,7 @@ class SupervisorAgent:
         schwab_agent: Any = None,
         researcher_agent: Any = None,
         finrl_agent: Any = None,
+        trading_strategy_service: Optional[TradingStrategyService] = None,
         checkpointer: Optional[InMemorySaver] = None,
         enable_chain_of_thought: bool = True
     ):
@@ -84,6 +96,7 @@ class SupervisorAgent:
             schwab_agent: SchwabAgent instance (optional)
             researcher_agent: ResearcherAgent instance (optional)
             finrl_agent: FinRLAgent instance for AI trading (optional)
+            trading_strategy_service: Service for generating trading strategies (optional)
             checkpointer: State persistence (optional)
             enable_chain_of_thought: Whether to log reasoning steps
         """
@@ -92,6 +105,7 @@ class SupervisorAgent:
         self.schwab_agent = schwab_agent
         self.researcher_agent = researcher_agent
         self.finrl_agent = finrl_agent
+        self.trading_strategy_service = trading_strategy_service
         self.checkpointer = checkpointer or InMemorySaver()
         self.enable_chain_of_thought = enable_chain_of_thought
         
@@ -116,126 +130,280 @@ class SupervisorAgent:
             agents["finrl"] = self.finrl_agent
         return agents
     
-    def _is_finrl_query(self, message: str) -> bool:
-        """Check if the query is asking for AI/RL trading decisions."""
+    def _extract_symbols_from_query(self, message: str) -> tuple[list[str], str]:
+        """Extract trading symbols from the query and determine asset type.
+        
+        Returns:
+            Tuple of (symbols list, asset_type: "crypto" | "stock" | "mixed")
+        """
+        message_upper = message.upper()
         message_lower = message.lower()
+        symbols = []
+        asset_type = None
         
-        # FinRL-specific keywords
-        finrl_terms = ['finrl', 'reinforcement learning', 'rl model', 'ai trading',
-                       'drl', 'deep rl', 'train model', 'trading signal', 
-                       'ai recommendation', 'machine learning trade', 'ppo', 'a2c',
-                       'should i buy', 'should i sell', 'what would the ai',
-                       'ai decision', 'model predict', 'ai suggest']
+        # Check for crypto symbols first
+        crypto_map = {
+            'btc': 'BTC-USD', 'bitcoin': 'BTC-USD',
+            'eth': 'ETH-USD', 'ethereum': 'ETH-USD',
+            'sol': 'SOL-USD', 'solana': 'SOL-USD',
+            'xrp': 'XRP-USD', 'ripple': 'XRP-USD',
+            'zec': 'ZEC-USD', 'zcash': 'ZEC-USD',
+        }
         
-        return any(term in message_lower for term in finrl_terms)
+        for keyword, symbol in crypto_map.items():
+            if keyword in message_lower and symbol not in symbols:
+                symbols.append(symbol)
+                asset_type = "crypto"
+        
+        # Check for stock symbols (from TradingStrategyService.COMMON_STOCKS)
+        common_stocks = {
+            'AAPL', 'TSLA', 'NVDA', 'AMD', 'GOOG', 'GOOGL', 'MSFT', 'AMZN', 'META',
+            'MU', 'INTC', 'NFLX', 'BABA', 'DIS', 'V', 'MA', 'JPM', 'BAC', 'WFC',
+            'XOM', 'CVX', 'PFE', 'JNJ', 'UNH', 'HD', 'WMT', 'TGT', 'COST', 'KO',
+            'PEP', 'MCD', 'SBUX', 'NKE', 'ABNB', 'UBER', 'LYFT', 'SQ', 'PYPL',
+            'CRM', 'ORCL', 'ADBE', 'NOW', 'SHOP', 'SNOW', 'PLTR', 'NET', 'DDOG',
+            'ZM', 'DOCU', 'TWLO', 'OKTA', 'CRWD', 'ZS', 'PANW', 'FTNT', 'SPLK',
+            'COIN', 'HOOD', 'RBLX', 'U', 'SNAP', 'PINS', 'TWTR', 'SPOT', 'ROKU',
+            'GME', 'AMC', 'BB', 'NOK', 'SOFI', 'LCID', 'RIVN', 'F', 'GM', 'TM',
+            'SPY', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO', 'ARKK', 'XLF', 'XLK', 'XLE'
+        }
+        
+        # Look for stock symbols in the message (as whole words)
+        import re
+        words = re.findall(r'\b[A-Z]{1,5}\b', message_upper)
+        for word in words:
+            if word in common_stocks and word not in symbols:
+                symbols.append(word)
+                if asset_type == "crypto":
+                    asset_type = "mixed"
+                else:
+                    asset_type = "stock"
+        
+        # If no symbols found, check context words
+        if not symbols:
+            if any(term in message_lower for term in ['crypto', 'bitcoin', 'cryptocurrency', 'coin']):
+                symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ZEC-USD']
+                asset_type = "crypto"
+            elif any(term in message_lower for term in ['stock', 'equity', 'equities', 'share']):
+                # No specific stocks mentioned, can't default to a list
+                asset_type = "stock"
+            else:
+                # Default to crypto for backward compatibility
+                symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ZEC-USD']
+                asset_type = "crypto"
+        
+        return symbols, asset_type or "crypto"
     
-    def _build_routing_prompt(self) -> str:
-        """Build the system prompt for routing decisions."""
-        agent_descriptions = []
+    async def _generate_trading_strategy_response(
+        self, 
+        message: str,
+        routing_decision: RoutingDecision = None
+    ) -> str:
+        """Generate a trading strategy response using TradingStrategyService.
+        
+        This method synthesizes data from multiple sources to create actionable
+        trading recommendations with entry, take profit, and stop loss levels.
+        Supports ANY tradeable asset - crypto, stocks, ETFs, etc.
+        
+        Args:
+            message: The user's query
+            routing_decision: Optional pre-computed routing decision with extracted symbols
+        """
+        if not self.trading_strategy_service:
+            return "Trading strategy service is not available. Please try again later."
+        
+        try:
+            # Use LLM-extracted symbols if available, otherwise fall back to pattern matching
+            if routing_decision and routing_decision.symbols:
+                symbols = routing_decision.symbols
+                asset_type = routing_decision.asset_type
+            else:
+                symbols, asset_type = self._extract_symbols_from_query(message)
+            
+            logger.info(f"[SUPERVISOR] Generating strategy for {symbols} (type: {asset_type})")
+            
+            if not symbols:
+                return ("I couldn't identify specific trading symbols. "
+                        "Please specify what you want to trade (e.g., 'BTC', 'AAPL', 'MU').")
+            
+            # Generate recommendations for all symbols using unified method
+            recommendations = await self.trading_strategy_service.generate_recommendations(
+                symbols=symbols,
+                asset_type=asset_type,
+                risk_tolerance="conservative"
+            )
+            
+            if not recommendations:
+                return "Unable to generate recommendations. No market data available for the requested symbols."
+            
+            if len(recommendations) == 1:
+                return self.trading_strategy_service.format_recommendation_text(recommendations[0])
+            else:
+                # Multiple recommendations - format as portfolio
+                strategy = self.trading_strategy_service.create_portfolio_from_recommendations(
+                    recommendations=recommendations
+                )
+                return self.trading_strategy_service.format_portfolio_strategy_text(strategy)
+                
+        except Exception as e:
+            logger.error(f"[SUPERVISOR] Trading strategy error: {e}")
+            import traceback
+            traceback.print_exc()
+            return f"Error generating trading strategy: {e}"
+
+    def _build_intelligent_routing_prompt(self) -> str:
+        """Build a comprehensive prompt for intelligent LLM-based routing.
+        
+        This prompt gives the LLM full context about all available agents and services,
+        allowing it to make nuanced routing decisions rather than relying on keyword matching.
+        """
+        
+        # Build dynamic capability descriptions based on what's available
+        capabilities = []
         
         if self.coinbase_agent:
-            agent_descriptions.append("""
-**Coinbase Agent** (agent="coinbase"):
-- Check cryptocurrency balances and portfolio on YOUR Coinbase account
-- Get current crypto prices (Bitcoin, Ethereum, etc.)
+            capabilities.append("""
+## Coinbase Agent (agent="coinbase")
+**Purpose**: Cryptocurrency trading and real-time market data
+**Capabilities**:
+- Access to YOUR Coinbase account: balances, portfolio, transaction history
+- Real-time WebSocket price feeds for BTC, ETH, SOL, XRP, ZEC (ACCURATE live prices)
 - Place buy/sell orders for cryptocurrencies
-- View open orders and transaction history on YOUR account
-- Blockchain data queries: recent transactions, blocks, on-chain data for BTC, ETH, XRP, SOL, ZEC
-- **REAL-TIME crypto analysis**: patterns, trends, technical analysis for BTC, ETH, XRP, SOL, ZEC
-- Use for crypto trading, account balances, price checks, blockchain data, AND crypto pattern/trend analysis""")
+- Blockchain data: transactions, blocks, on-chain analytics
+- Technical analysis with live candle data (OHLCV)
+- Pattern detection: bullish/bearish trends, volatility analysis
+**Use when**: User asks about crypto prices, wants to trade crypto, check crypto balances, 
+or needs real-time cryptocurrency market data and analysis
+**Recognized crypto symbols**: BTC, ETH, SOL, XRP, ZEC, Bitcoin, Ethereum, Solana, Ripple, Zcash
+**DO NOT use for**: Stock trading, general web searches, or generating trading strategies with specific limit orders""")
         
         if self.schwab_agent:
-            agent_descriptions.append("""
-**Schwab Agent** (agent="schwab"):
-- Check stock account balances and positions
-- Get stock quotes and option chains
+            capabilities.append("""
+## Schwab Agent (agent="schwab")
+**Purpose**: Stock and options trading via Schwab brokerage
+**Capabilities**:
+- Access to YOUR Schwab brokerage account
+- Stock quotes and real-time equity prices  
+- Option chains and options pricing
 - Place equity and options orders
-- View market movers and market hours
-- Use for ANY stock/options/equity-related queries""")
+- View positions, market movers, market hours
+- Account balances and transaction history
+**Use when**: User asks about stocks, equities, options, or anything stock-related
+**Common stock symbols this handles**: AAPL, TSLA, NVDA, AMD, GOOG, GOOGL, MSFT, AMZN, META, 
+MU (Micron), INTC (Intel), NFLX, and ALL OTHER stock ticker symbols
+**KEY DISTINCTION**: If user mentions a stock symbol (like MU, AAPL, NVDA, etc.) and wants 
+trading advice or limit orders, route to Schwab for stock-specific handling
+**DO NOT use for**: Cryptocurrency trading (use Coinbase instead)""")
         
         if self.researcher_agent:
-            agent_descriptions.append("""
-**Researcher Agent** (agent="researcher"):
-- Web search and internet queries (weather, news, general information)
-- Investment research and analysis
-- Stock/company analysis with news and sentiment
-- Compare investments
-- Risk assessment and recommendations
-- Analyst ratings and financial metrics
-- ANY question requiring external information or web search
-- Use for questions asking for opinions, analysis, research, or general knowledge""")
+            capabilities.append("""
+## Researcher Agent (agent="researcher")
+**Purpose**: Investment research, web search, and external information
+**Capabilities**:
+- Web search for news, analyst reports, company information
+- Fundamental analysis: earnings, financials, analyst ratings
+- Sentiment analysis from news and social media
+- Compare investments and companies
+- Risk assessment and investment recommendations
+- General knowledge queries (weather, news, etc.)
+- Access to external data sources via internet search
+**Use when**: User wants research, opinions, news, comparisons, or any external information
+**DO NOT use for**: Real-time crypto prices (will hallucinate), placing trades, account operations""")
         
         if self.finrl_agent:
-            agent_descriptions.append("""
-**FinRL Agent** (agent="finrl"):
-- AI-powered trading decisions using Deep Reinforcement Learning
-- Get buy/sell/hold signals based on trained RL models (PPO, A2C, SAC, TD3)
-- Train new trading models on crypto data
-- Portfolio recommendations from AI
-- "Should I buy/sell?" questions for crypto
-- Machine learning based trading signals
-- Use for AI/ML trading advice, model training, or automated trading decisions""")
+            capabilities.append("""
+## FinRL Agent (agent="finrl")
+**Purpose**: AI-powered trading decisions using Deep Reinforcement Learning
+**Capabilities**:
+- Trained RL models (PPO, A2C, SAC, TD3) for crypto trading signals
+- Buy/sell/hold recommendations based on machine learning
+- Train new models on historical data
+- AI confidence scores for trading decisions
+- Portfolio optimization using reinforcement learning
+**Use when**: User specifically asks for AI/ML trading decisions, mentions reinforcement learning,
+asks "should I buy/sell" from an AI perspective, or wants machine learning-based signals
+**DO NOT use for**: Specific limit order prices, detailed trading strategies with entry/exit levels""")
         
-        agents_section = "\n".join(agent_descriptions)
+        if self.trading_strategy_service:
+            capabilities.append("""
+## Trading Strategy Service (agent="strategy")
+**Purpose**: Generate actionable trading recommendations with specific prices for ANY asset
+**Capabilities**:
+- **Limit order recommendations** with specific entry prices
+- **Take profit targets** based on technical analysis and risk/reward ratios
+- **Stop loss levels** to protect against downside
+- Position sizing recommendations (% of portfolio)
+- Risk/reward ratio calculations
+- Multi-asset portfolio strategies
+- Applies "Intelligent Investor" principles: margin of safety, risk management
+- For CRYPTO: Uses real-time WebSocket data + FinRL AI signals
+- For STOCKS: Uses Schwab quote data + fundamental analysis
+**Supported assets**: ANY tradeable asset - stocks, crypto, ETFs, etc.
+**Use when**: User asks for:
+  - Trading strategies with specific prices (any asset type)
+  - Limit orders, entry points, exit points
+  - Take profit and stop loss recommendations
+  - "What orders should I place?"
+  - "Give me a trading plan for [symbol]"
+  - Actionable trade recommendations (not just analysis)
+**This is the RIGHT choice when user wants SPECIFIC PRICES to trade at**""")
         
-        return f"""You are Mister Risker, a multi-broker trading assistant supervisor.
-Your job is to analyze user requests and route them to the appropriate specialized sub-agent.
+        capabilities.append("""
+## Direct Response (agent="direct")
+**Purpose**: Simple interactions that don't need delegation
+**Use when**: Simple greetings ("hi", "hello"), questions about Mister Risker's capabilities,
+or when no other agent is appropriate
+**DO NOT use for**: Any actual trading, research, or analysis tasks""")
+        
+        capabilities_text = "\n".join(capabilities)
+        
+        return f"""You are Mister Risker, an intelligent trading assistant supervisor.
+Your job is to analyze user requests and route them to the BEST agent or service.
 
-## Available Sub-Agents:
-{agents_section}
+# Available Agents and Services
+{capabilities_text}
 
-## Routing Guidelines:
-1. **Coinbase**: Route here for YOUR crypto balances, crypto prices, crypto buy/sell orders, blockchain data queries, AND any analysis/patterns/trends for cryptocurrencies (BTC, ETH, XRP, SOL, ZEC, Bitcoin, Ethereum, etc.)
-2. **Schwab**: Route here for stock quotes, stock orders, options, equity positions, market hours, etc.
-3. **Researcher**: Route here for STOCK analysis, opinions, news about STOCKS, comparisons, "what do you think" about STOCKS, recommendations, web search, weather, general questions, or ANY query that needs external information (but NOT for crypto analysis - use Coinbase for that)
-4. **FinRL**: Route here for AI/ML trading decisions, "should I buy/sell" questions, training models, or getting AI trading signals
-5. **Direct**: ONLY use for simple greetings like "hi" or "hello", or questions about YOUR capabilities
+# Symbol Extraction
+When routing, you MUST also extract:
+1. **symbols**: List of trading symbols mentioned (e.g., ["BTC-USD", "AAPL", "ETH-USD"])
+   - For crypto: use format "XXX-USD" (e.g., "BTC-USD", "ETH-USD")
+   - For stocks: use ticker symbol (e.g., "AAPL", "MU", "TSLA")
+2. **asset_type**: "crypto", "stock", "mixed", or "unknown"
 
-## Important Rules:
-- If user mentions "Schwab account", "stock balance", or stock symbols like AAPL/TSLA → use Schwab
-- If user wants to check THEIR crypto balance, crypto prices, or place crypto orders → use Coinbase
-- If user asks about blockchain transactions, blocks, on-chain data, ledger, or network info → use Coinbase
-- **CRITICAL: If user asks about BTC, Bitcoin, ETH, Ethereum, crypto patterns, trends, analysis, "what are you seeing", or any cryptocurrency analysis → ALWAYS use Coinbase (it has real-time WebSocket data with ACCURATE prices)**
-- **If user asks "should I buy/sell", wants AI trading signals, or mentions FinRL/reinforcement learning → use FinRL**
-- The Researcher agent does NOT have accurate crypto price data - it will hallucinate wrong prices like $39 for Bitcoin
-- If user asks "what do you think" about STOCKS, or wants stock opinions/research → use Researcher
-- If user asks about weather, news, or general information → use Researcher
-- For stock-related research or external knowledge → use Researcher
-- NEVER ask the user to "switch brokers" - YOU decide which agent to use
-- AVOID using "direct" unless it's a simple greeting
-- Pass the full context needed to the sub-agent in query_for_agent
+# Routing Decision Guidelines
 
-Analyze the user's message and decide which agent should handle it."""
+## Key Routing Rules:
+1. **"Give me a limit order/strategy for X"** → Strategy (generates specific prices)
+2. **"What is the current price of X?"** → Coinbase (crypto) or Schwab (stocks)
+3. **"Research X" or "What do analysts think?"** → Researcher
+4. **"Buy/sell X" (execute trade)** → Coinbase (crypto) or Schwab (stocks)
+5. **"Check my balance"** → Coinbase (crypto) or Schwab (stocks)
+6. **AI/ML trading signals** → FinRL
+
+## Asset Type Detection:
+- **CRYPTO**: BTC, ETH, SOL, XRP, ZEC, Bitcoin, Ethereum, Solana, etc.
+- **STOCKS**: Any ticker trading on NYSE/NASDAQ (AAPL, TSLA, MU, NVDA, etc.)
+- Use conversation context if asset type is ambiguous
+
+## Response Requirements:
+- **agent**: The agent code to route to
+- **reasoning**: Brief explanation (1-2 sentences)
+- **query_for_agent**: The full query to pass
+- **symbols**: List of trading symbols extracted from the query
+- **asset_type**: "crypto", "stock", "mixed", or "unknown"
+
+Be intelligent about symbol detection - if user says "MU" that's Micron stock, 
+if they say "Bitcoin" that's BTC-USD crypto. Extract ALL symbols mentioned."""
     
-    def _is_crypto_analysis_query(self, message: str) -> bool:
-        """Check if the query is about crypto analysis/patterns (should use Coinbase with real-time data).
-        
-        Returns True if the message contains crypto-related analysis keywords.
-        This bypasses the LLM routing to ensure real-time WebSocket data is used.
-        """
-        message_lower = message.lower()
-        
-        # Crypto symbols and names
-        crypto_terms = ['btc', 'bitcoin', 'eth', 'ethereum', 'xrp', 'ripple', 
-                        'sol', 'solana', 'zec', 'zcash', 'crypto', 'cryptocurrency']
-        
-        # Analysis keywords
-        analysis_terms = ['pattern', 'analyze', 'analysis', 'trend', 'seeing', 
-                         'prediction', 'trajectory', 'movement', 'price action',
-                         'technical', 'looking at', 'what do you see', 'how is',
-                         'watch', 'monitoring', 'real-time', 'realtime', 'live']
-        
-        has_crypto = any(term in message_lower for term in crypto_terms)
-        has_analysis = any(term in message_lower for term in analysis_terms)
-        
-        return has_crypto and has_analysis
-
     async def route_query(
         self, 
         user_message: str, 
         conversation_history: list[dict] = None
     ) -> RoutingDecision:
-        """Route a user query to the appropriate sub-agent.
+        """Route a user query using intelligent LLM-based decision making.
+        
+        This method uses the LLM to analyze the user's query and determine
+        the best agent/service to handle it, rather than using keyword matching.
         
         Args:
             user_message: The user's query
@@ -244,48 +412,60 @@ Analyze the user's message and decide which agent should handle it."""
         Returns:
             RoutingDecision with agent choice and reasoning
         """
-        logger.info(f"[SUPERVISOR] Routing query: '{user_message[:80]}...'")
+        logger.info(f"[SUPERVISOR] Intelligent routing for: '{user_message[:80]}...'")
         
-        # FAST PATH: Force FinRL queries to FinRL agent
-        if self._is_finrl_query(user_message) and self.finrl_agent:
-            logger.info("[SUPERVISOR] FinRL/AI trading query detected - forcing route to FinRL")
-            return RoutingDecision(
-                agent="finrl",
-                reasoning="AI trading decision query detected - using FinRL agent with Deep Reinforcement Learning",
-                query_for_agent=user_message
-            )
-        
-        # FAST PATH: Force crypto analysis queries to Coinbase (has real-time WebSocket data)
-        if self._is_crypto_analysis_query(user_message) and self.coinbase_agent:
-            logger.info("[SUPERVISOR] Crypto analysis detected - forcing route to Coinbase (real-time data)")
-            return RoutingDecision(
-                agent="coinbase",
-                reasoning="Crypto analysis query detected - using Coinbase agent with real-time WebSocket data for accurate prices",
-                query_for_agent=user_message
-            )
-        
-        # Build routing messages
+        # Build routing messages with comprehensive context
         messages = [
-            SystemMessage(content=self._build_routing_prompt())
+            SystemMessage(content=self._build_intelligent_routing_prompt())
         ]
         
-        # Add relevant conversation context
+        # Add relevant conversation context for better routing decisions
         if conversation_history:
+            context_summary = []
             for msg in conversation_history[-5:]:  # Last 5 messages for context
-                if msg.get("role") == "user":
-                    messages.append(HumanMessage(content=msg["content"]))
-                elif msg.get("role") == "assistant":
-                    messages.append(AIMessage(content=msg["content"]))
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")[:200]  # Truncate for context
+                context_summary.append(f"{role}: {content}")
+            
+            if context_summary:
+                context_text = "\n".join(context_summary)
+                messages.append(SystemMessage(
+                    content=f"Recent conversation context:\n{context_text}\n\nNow routing the following new message:"
+                ))
         
         # Add current query
         messages.append(HumanMessage(content=user_message))
         
         try:
+            # Use LLM with structured output for routing decision
             decision = await self.router.ainvoke(messages)
-            logger.info(f"[SUPERVISOR] Routing decision: agent={decision.agent}, reason={decision.reasoning}")
+            
+            # Validate the agent choice is available
+            valid_agents = ["direct"]
+            if self.coinbase_agent:
+                valid_agents.append("coinbase")
+            if self.schwab_agent:
+                valid_agents.append("schwab")
+            if self.researcher_agent:
+                valid_agents.append("researcher")
+            if self.finrl_agent:
+                valid_agents.append("finrl")
+            if self.trading_strategy_service:
+                valid_agents.append("strategy")
+            
+            if decision.agent not in valid_agents:
+                logger.warning(f"[SUPERVISOR] LLM chose unavailable agent '{decision.agent}', falling back to direct")
+                decision = RoutingDecision(
+                    agent="direct",
+                    reasoning=f"Requested agent '{decision.agent}' not available, responding directly",
+                    query_for_agent=user_message
+                )
+            
+            logger.info(f"[SUPERVISOR] LLM routing decision: agent={decision.agent}, reason={decision.reasoning[:80]}...")
             return decision
+            
         except Exception as e:
-            logger.error(f"[SUPERVISOR] Routing error: {e}")
+            logger.error(f"[SUPERVISOR] LLM routing error: {e}")
             # Default to direct response on error
             return RoutingDecision(
                 agent="direct",
@@ -377,6 +557,19 @@ Analyze the user's message and decide which agent should handle it."""
                 except Exception as e:
                     logs.append(f"[FINRL AGENT] Error: {e}")
                     response = f"I encountered an error with the FinRL agent: {e}"
+        
+        elif decision.agent == "strategy":
+            if not self.trading_strategy_service:
+                logs.append(f"[SUPERVISOR] ERROR: Trading Strategy service not available")
+                response = "I'd like to help with trading strategy, but the strategy service is not configured."
+            else:
+                logs.append(f"[SUPERVISOR] Generating trading strategy with TradingStrategyService")
+                try:
+                    response = await self._generate_trading_strategy_response(decision.query_for_agent)
+                    logs.append(f"[STRATEGY SERVICE] Completed: {len(response)} chars")
+                except Exception as e:
+                    logs.append(f"[STRATEGY SERVICE] Error: {e}")
+                    response = f"I encountered an error generating trading strategy: {e}"
         
         else:
             logs.append(f"[SUPERVISOR] Unknown agent: {decision.agent}")

@@ -44,6 +44,7 @@ from src.agents.researcher_agent import ResearcherAgent, ResearcherAgentError
 from src.agents.supervisor_agent import SupervisorAgent, SupervisorAgentError
 from src.agents.finrl_agent import FinRLAgent
 from src.services.finrl_service import FinRLService
+from src.services.trading_strategy import TradingStrategyService
 
 # Load environment variables
 load_dotenv()
@@ -82,6 +83,7 @@ class TradingChatBot:
         self.researcher_agent: ResearcherAgent | None = None
         self.finrl_agent: FinRLAgent | None = None
         self.finrl_service: FinRLService | None = None
+        self.trading_strategy_service: TradingStrategyService | None = None
         self.supervisor_agent: SupervisorAgent | None = None
         
         # Configuration
@@ -273,6 +275,31 @@ If you don't need to call a tool, just respond normally with text."""
             except Exception as e:
                 logger.warning(f"  ✗ Could not initialize FinRL Agent: {e}")
         
+        # Initialize Trading Strategy Service (multi-source analysis for actionable recommendations)
+        if self.use_agents:
+            try:
+                # Get WebSocket service from Coinbase agent if available
+                websocket_service = None
+                if self.coinbase_agent and hasattr(self.coinbase_agent, 'websocket_service'):
+                    websocket_service = self.coinbase_agent.websocket_service
+                
+                # Get Schwab MCP server for stock quotes
+                schwab_mcp_server = None
+                if self.schwab_agent and hasattr(self.schwab_agent, 'mcp_server'):
+                    schwab_mcp_server = self.schwab_agent.mcp_server
+                
+                self.trading_strategy_service = TradingStrategyService(
+                    websocket_service=websocket_service,
+                    finrl_service=self.finrl_service,
+                    researcher_agent=self.researcher_agent,
+                    schwab_mcp_server=schwab_mcp_server
+                )
+                logger.info("  ✓ Trading Strategy Service initialized (Intelligent Investor principles)")
+                if schwab_mcp_server:
+                    logger.info("    - Stock support enabled via Schwab MCP")
+            except Exception as e:
+                logger.warning(f"  ✗ Could not initialize Trading Strategy Service: {e}")
+        
         # Initialize Supervisor Agent (Mister Risker as orchestrator)
         if self.use_agents and self.llm:
             try:
@@ -282,6 +309,7 @@ If you don't need to call a tool, just respond normally with text."""
                     schwab_agent=self.schwab_agent,
                     researcher_agent=self.researcher_agent,
                     finrl_agent=self.finrl_agent,
+                    trading_strategy_service=self.trading_strategy_service,
                     checkpointer=self.checkpointer,
                     enable_chain_of_thought=self.enable_chain_of_thought
                 )
