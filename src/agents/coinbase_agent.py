@@ -963,7 +963,6 @@ class CoinbaseAgent:
                 
                 lines.append(f"{i}. Block {block}: `{tx_hash}`{value_str}")
         
-        lines.append(f"\n🔗 View more at blockchair.com/{chain.lower()}")
         return "\n".join(lines)
 
     def _format_blockchain_block(self, result: dict[str, Any]) -> str:

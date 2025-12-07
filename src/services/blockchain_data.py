@@ -1,11 +1,17 @@
 """Blockchain Data Service.
 
-Provides global blockchain data (transactions, blocks) for multiple chains:
-- Bitcoin (BTC) via Blockchair API
-- Ethereum (ETH) via Blockchair API
-- Ripple (XRP) via Blockchair API
-- Zcash (ZEC) via Blockchair API
-- Solana (SOL) via Solana RPC API
+Provides global blockchain data (transactions, blocks) for supported chains.
+
+Currently supported:
+- Solana (SOL) via Solana RPC API (free, no API key required)
+
+Future support (requires finding free APIs):
+- Bitcoin (BTC)
+- Ethereum (ETH)
+- Ripple (XRP)
+- Zcash (ZEC)
+
+Note: Blockchair was removed due to aggressive rate limiting on free tier.
 """
 
 import os
@@ -16,11 +22,9 @@ from typing import Any
 class BlockchainDataService:
     """Service for fetching blockchain data from multiple chains.
     
-    Uses Blockchair API for BTC, ETH, XRP, ZEC and Solana RPC for SOL.
+    Currently uses Solana public RPC. Other chains require finding
+    alternative free APIs (Blockchair was removed due to rate limits).
     """
-    
-    # Blockchair base URL
-    BLOCKCHAIR_BASE_URL = "https://api.blockchair.com"
     
     # Solana RPC endpoints
     SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
@@ -39,19 +43,15 @@ class BlockchainDataService:
         "solana": "solana",
     }
     
-    # Chains supported by Blockchair
-    BLOCKCHAIR_CHAINS = {"bitcoin", "ethereum", "ripple", "zcash"}
+    # Chains with working free APIs
+    SUPPORTED_CHAINS = {"solana"}
     
-    # Chains with native RPC
-    SOLANA_CHAIN = "solana"
+    # Chains that need alternative APIs (placeholder for future)
+    UNSUPPORTED_CHAINS = {"bitcoin", "ethereum", "ripple", "zcash"}
     
-    def __init__(self, blockchair_api_key: str | None = None):
-        """Initialize the blockchain data service.
-        
-        Args:
-            blockchair_api_key: Optional Blockchair API key for higher rate limits
-        """
-        self.blockchair_api_key = blockchair_api_key or os.getenv("BLOCKCHAIR_API_KEY")
+    def __init__(self):
+        """Initialize the blockchain data service."""
+        pass
     
     def get_supported_chains(self) -> list[str]:
         """Get list of supported blockchain chains.
@@ -59,7 +59,15 @@ class BlockchainDataService:
         Returns:
             List of supported chain names
         """
-        return ["bitcoin", "ethereum", "ripple", "zcash", "solana"]
+        return list(self.SUPPORTED_CHAINS)
+    
+    def get_all_known_chains(self) -> list[str]:
+        """Get all known chains (including unsupported ones).
+        
+        Returns:
+            List of all chain names
+        """
+        return list(self.SUPPORTED_CHAINS | self.UNSUPPORTED_CHAINS)
     
     def _normalize_chain(self, chain: str) -> str:
         """Normalize chain name to canonical form.
@@ -71,24 +79,6 @@ class BlockchainDataService:
             Canonical chain name (e.g., "bitcoin")
         """
         return self.CHAIN_ALIASES.get(chain.lower(), chain.lower())
-    
-    async def _make_request(self, url: str) -> dict[str, Any]:
-        """Make HTTP request to Blockchair API.
-        
-        Args:
-            url: Full URL to request
-            
-        Returns:
-            JSON response as dict
-        """
-        # Add API key if available
-        if self.blockchair_api_key:
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}key={self.blockchair_api_key}"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                return await response.json()
     
     async def _make_solana_request(self, method: str, params: list[Any]) -> dict[str, Any]:
         """Make JSON-RPC request to Solana RPC.
@@ -123,90 +113,44 @@ class BlockchainDataService:
         """Get recent transactions for a blockchain.
         
         Args:
-            chain: Blockchain name or alias (btc, eth, xrp, sol, zec)
-            limit: Number of transactions to return (max 100)
+            chain: Blockchain name or alias (currently only sol/solana supported)
+            limit: Number of transactions to return
             
         Returns:
             Dict with status, transactions list, and chain info
         """
         normalized_chain = self._normalize_chain(chain)
         
-        if normalized_chain not in self.get_supported_chains():
+        if normalized_chain in self.UNSUPPORTED_CHAINS:
+            return {
+                "status": "not_supported",
+                "chain": chain,
+                "message": (
+                    f"Blockchain data for {chain.upper()} is not currently available. "
+                    f"Only Solana (SOL) is supported via free API at this time. "
+                    f"Alternative free APIs for {chain.upper()} are being researched."
+                )
+            }
+        
+        if normalized_chain not in self.SUPPORTED_CHAINS:
             return {
                 "status": "error",
-                "message": f"Unsupported chain: {chain}. Supported chains: {', '.join(self.get_supported_chains())}"
+                "message": f"Unknown chain: {chain}. Supported: {', '.join(self.get_supported_chains())}"
             }
         
         try:
-            if normalized_chain == self.SOLANA_CHAIN:
+            if normalized_chain == "solana":
                 return await self._get_solana_recent_transactions(limit)
             else:
-                return await self._get_blockchair_recent_transactions(normalized_chain, limit)
+                return {
+                    "status": "error",
+                    "message": f"No API configured for {chain}"
+                }
         except Exception as e:
             return {
                 "status": "error",
                 "message": f"Error fetching transactions: {str(e)}"
             }
-    
-    async def _get_blockchair_recent_transactions(
-        self, 
-        chain: str, 
-        limit: int
-    ) -> dict[str, Any]:
-        """Fetch recent transactions from Blockchair API.
-        
-        Args:
-            chain: Normalized chain name
-            limit: Number of transactions
-            
-        Returns:
-            Formatted transaction response
-        """
-        # Limit to max 100 per Blockchair API
-        limit = min(limit, 100)
-        
-        url = f"{self.BLOCKCHAIR_BASE_URL}/{chain}/transactions?limit={limit}&s=time(desc)"
-        response = await self._make_request(url)
-        
-        if response.get("context", {}).get("code") != 200:
-            return {
-                "status": "error",
-                "message": f"Blockchair API error: {response.get('context', {}).get('error', 'Unknown error')}"
-            }
-        
-        transactions = response.get("data", [])
-        
-        # Format transactions for display
-        formatted_txs = []
-        for tx in transactions:
-            formatted_tx = {
-                "hash": tx.get("hash"),
-                "block": tx.get("block_id"),
-                "time": tx.get("time"),
-            }
-            
-            # Add chain-specific fields
-            if chain == "bitcoin":
-                formatted_tx["input_total_btc"] = tx.get("input_total", 0) / 100000000
-                formatted_tx["output_total_btc"] = tx.get("output_total", 0) / 100000000
-                formatted_tx["fee_btc"] = tx.get("fee", 0) / 100000000
-            elif chain == "ethereum":
-                formatted_tx["value_eth"] = tx.get("value", 0) / 1e18
-                formatted_tx["gas_used"] = tx.get("gas_used")
-            elif chain == "ripple":
-                formatted_tx["ledger_index"] = tx.get("ledger_index")
-            elif chain == "zcash":
-                formatted_tx["input_total_zec"] = tx.get("input_total", 0) / 100000000
-                formatted_tx["output_total_zec"] = tx.get("output_total", 0) / 100000000
-            
-            formatted_txs.append(formatted_tx)
-        
-        return {
-            "status": "success",
-            "chain": chain,
-            "count": len(formatted_txs),
-            "transactions": formatted_txs
-        }
     
     async def _get_solana_recent_transactions(self, limit: int) -> dict[str, Any]:
         """Fetch recent Solana transactions via RPC.
@@ -276,46 +220,35 @@ class BlockchainDataService:
         """
         normalized_chain = self._normalize_chain(chain)
         
-        if normalized_chain not in self.get_supported_chains():
+        if normalized_chain in self.UNSUPPORTED_CHAINS:
+            return {
+                "status": "not_supported",
+                "chain": chain,
+                "message": (
+                    f"Block data for {chain.upper()} is not currently available. "
+                    f"Only Solana (SOL) is supported via free API at this time."
+                )
+            }
+        
+        if normalized_chain not in self.SUPPORTED_CHAINS:
             return {
                 "status": "error",
-                "message": f"Unsupported chain: {chain}"
+                "message": f"Unknown chain: {chain}"
             }
         
         try:
-            if normalized_chain == self.SOLANA_CHAIN:
+            if normalized_chain == "solana":
                 return await self._get_solana_latest_block()
             else:
-                return await self._get_blockchair_latest_block(normalized_chain)
+                return {
+                    "status": "error",
+                    "message": f"No API configured for {chain}"
+                }
         except Exception as e:
             return {
                 "status": "error",
                 "message": f"Error fetching block: {str(e)}"
             }
-    
-    async def _get_blockchair_latest_block(self, chain: str) -> dict[str, Any]:
-        """Get latest block info from Blockchair stats endpoint."""
-        url = f"{self.BLOCKCHAIR_BASE_URL}/{chain}/stats"
-        response = await self._make_request(url)
-        
-        if response.get("context", {}).get("code") != 200:
-            return {
-                "status": "error",
-                "message": f"Blockchair API error"
-            }
-        
-        data = response.get("data", {})
-        
-        return {
-            "status": "success",
-            "chain": chain,
-            "block": {
-                "height": data.get("best_block_height") or data.get("blocks"),
-                "hash": data.get("best_block_hash"),
-                "time": data.get("best_block_time"),
-                "total_transactions": data.get("transactions"),
-            }
-        }
     
     async def _get_solana_latest_block(self) -> dict[str, Any]:
         """Get latest Solana slot/block info."""
@@ -355,50 +288,35 @@ class BlockchainDataService:
         """
         normalized_chain = self._normalize_chain(chain)
         
-        if normalized_chain not in self.get_supported_chains():
+        if normalized_chain in self.UNSUPPORTED_CHAINS:
+            return {
+                "status": "not_supported",
+                "chain": chain,
+                "message": (
+                    f"Stats for {chain.upper()} are not currently available. "
+                    f"Only Solana (SOL) is supported via free API at this time."
+                )
+            }
+        
+        if normalized_chain not in self.SUPPORTED_CHAINS:
             return {
                 "status": "error",
-                "message": f"Unsupported chain: {chain}"
+                "message": f"Unknown chain: {chain}"
             }
         
         try:
-            if normalized_chain == self.SOLANA_CHAIN:
+            if normalized_chain == "solana":
                 return await self._get_solana_stats()
             else:
-                return await self._get_blockchair_stats(normalized_chain)
+                return {
+                    "status": "error",
+                    "message": f"No API configured for {chain}"
+                }
         except Exception as e:
             return {
                 "status": "error",
                 "message": f"Error fetching stats: {str(e)}"
             }
-    
-    async def _get_blockchair_stats(self, chain: str) -> dict[str, Any]:
-        """Get blockchain stats from Blockchair."""
-        url = f"{self.BLOCKCHAIR_BASE_URL}/{chain}/stats"
-        response = await self._make_request(url)
-        
-        if response.get("context", {}).get("code") != 200:
-            return {
-                "status": "error",
-                "message": "Blockchair API error"
-            }
-        
-        data = response.get("data", {})
-        
-        return {
-            "status": "success",
-            "chain": chain,
-            "stats": {
-                "blocks": data.get("blocks"),
-                "transactions": data.get("transactions"),
-                "difficulty": data.get("difficulty"),
-                "hashrate": data.get("hashrate_24h"),
-                "mempool_transactions": data.get("mempool_transactions"),
-                "mempool_size": data.get("mempool_size"),
-                "market_price_usd": data.get("market_price_usd"),
-                "market_cap_usd": data.get("market_cap_usd"),
-            }
-        }
     
     async def _get_solana_stats(self) -> dict[str, Any]:
         """Get Solana network stats."""

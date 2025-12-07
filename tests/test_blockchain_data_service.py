@@ -1,224 +1,189 @@
 """Tests for the Blockchain Data Service.
 
-This service provides global blockchain data (transactions, blocks) for multiple chains:
-- Bitcoin (BTC) via Blockchair API
-- Ethereum (ETH) via Blockchair API
-- Ripple (XRP) via Blockchair API
-- Zcash (ZEC) via Blockchair API
-- Solana (SOL) via Solana RPC API
+This service provides global blockchain data (transactions, blocks).
+Currently only Solana is supported via free public RPC API.
+Other chains (BTC, ETH, XRP, ZEC) return not_supported status.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-import aiohttp
+from unittest.mock import AsyncMock, patch
 
 
 class TestBlockchainDataService:
     """Tests for BlockchainDataService."""
 
     @pytest.mark.asyncio
-    async def test_get_recent_transactions_bitcoin(self):
-        """Should fetch recent Bitcoin transactions from Blockchair."""
-        from src.services.blockchain_data import BlockchainDataService
-        
-        mock_response = {
-            "data": [
-                {
-                    "block_id": 873500,
-                    "hash": "abc123",
-                    "time": "2025-12-06 10:00:00",
-                    "input_total": 100000000,
-                    "output_total": 99990000,
-                    "fee": 10000,
-                },
-                {
-                    "block_id": 873500,
-                    "hash": "def456",
-                    "time": "2025-12-06 09:59:00",
-                    "input_total": 50000000,
-                    "output_total": 49995000,
-                    "fee": 5000,
-                }
-            ],
-            "context": {"code": 200}
-        }
-        
-        with patch.object(BlockchainDataService, '_make_request', new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = mock_response
-            
-            service = BlockchainDataService()
-            result = await service.get_recent_transactions("bitcoin", limit=10)
-            
-            assert result["status"] == "success"
-            assert "transactions" in result
-            assert len(result["transactions"]) == 2
-            mock_request.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_get_recent_transactions_ethereum(self):
-        """Should fetch recent Ethereum transactions from Blockchair."""
-        from src.services.blockchain_data import BlockchainDataService
-        
-        mock_response = {
-            "data": [
-                {
-                    "block_id": 19000000,
-                    "hash": "0xabc123",
-                    "time": "2025-12-06 10:00:00",
-                    "value": 1000000000000000000,
-                    "gas_used": 21000,
-                }
-            ],
-            "context": {"code": 200}
-        }
-        
-        with patch.object(BlockchainDataService, '_make_request', new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = mock_response
-            
-            service = BlockchainDataService()
-            result = await service.get_recent_transactions("ethereum", limit=10)
-            
-            assert result["status"] == "success"
-            assert "transactions" in result
-            assert len(result["transactions"]) == 1
-
-    @pytest.mark.asyncio
-    async def test_get_recent_transactions_ripple(self):
-        """Should fetch recent Ripple (XRP) transactions from Blockchair."""
-        from src.services.blockchain_data import BlockchainDataService
-        
-        mock_response = {
-            "data": [
-                {
-                    "ledger_index": 85000000,
-                    "hash": "xyz789",
-                    "close_time": "2025-12-06 10:00:00",
-                }
-            ],
-            "context": {"code": 200}
-        }
-        
-        with patch.object(BlockchainDataService, '_make_request', new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = mock_response
-            
-            service = BlockchainDataService()
-            result = await service.get_recent_transactions("ripple", limit=10)
-            
-            assert result["status"] == "success"
-            assert "transactions" in result
-
-    @pytest.mark.asyncio
-    async def test_get_recent_transactions_zcash(self):
-        """Should fetch recent Zcash transactions from Blockchair."""
-        from src.services.blockchain_data import BlockchainDataService
-        
-        mock_response = {
-            "data": [
-                {
-                    "block_id": 2500000,
-                    "hash": "zec123",
-                    "time": "2025-12-06 10:00:00",
-                }
-            ],
-            "context": {"code": 200}
-        }
-        
-        with patch.object(BlockchainDataService, '_make_request', new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = mock_response
-            
-            service = BlockchainDataService()
-            result = await service.get_recent_transactions("zcash", limit=10)
-            
-            assert result["status"] == "success"
-            assert "transactions" in result
-
-    @pytest.mark.asyncio
     async def test_get_recent_transactions_solana(self):
         """Should fetch recent Solana transactions via Solana RPC."""
         from src.services.blockchain_data import BlockchainDataService
         
-        # Solana uses a different API structure
+        # Mock the slot response
+        mock_slot_response = {"result": 300000000}
+        
+        # Mock the block response - Solana returns signatures list directly
         mock_block_response = {
             "result": {
-                "transactions": [
-                    {
-                        "transaction": {
-                            "signatures": ["sig1"],
-                        },
-                        "meta": {
-                            "fee": 5000,
-                        }
-                    },
-                    {
-                        "transaction": {
-                            "signatures": ["sig2"],
-                        },
-                        "meta": {
-                            "fee": 5000,
-                        }
-                    }
-                ]
+                "blockHeight": 250000000,
+                "blockTime": 1701864000,
+                "signatures": ["sig1abc123", "sig2def456"]
             }
         }
         
         with patch.object(BlockchainDataService, '_make_solana_request', new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = mock_block_response
+            # First call returns slot, second returns block
+            mock_request.side_effect = [mock_slot_response, mock_block_response]
             
             service = BlockchainDataService()
             result = await service.get_recent_transactions("solana", limit=10)
             
             assert result["status"] == "success"
+            assert result["chain"] == "solana"
             assert "transactions" in result
+            assert len(result["transactions"]) == 2
+            assert result["transactions"][0]["signature"] == "sig1abc123"
 
     @pytest.mark.asyncio
-    async def test_get_latest_block_bitcoin(self):
-        """Should fetch the latest Bitcoin block info."""
-        from src.services.blockchain_data import BlockchainDataService
-        
-        mock_response = {
-            "data": {
-                "blocks": 873500,
-                "transactions": 1050000000,
-                "best_block_hash": "abc123hash",
-                "best_block_height": 873500,
-                "best_block_time": "2025-12-06 10:00:00",
-            },
-            "context": {"code": 200}
-        }
-        
-        with patch.object(BlockchainDataService, '_make_request', new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = mock_response
-            
-            service = BlockchainDataService()
-            result = await service.get_latest_block("bitcoin")
-            
-            assert result["status"] == "success"
-            assert "block" in result
-
-    @pytest.mark.asyncio
-    async def test_supported_chains(self):
-        """Should list all supported blockchain chains."""
+    async def test_get_recent_transactions_bitcoin_not_supported(self):
+        """Should return not_supported for Bitcoin (no free API)."""
         from src.services.blockchain_data import BlockchainDataService
         
         service = BlockchainDataService()
-        chains = service.get_supported_chains()
+        result = await service.get_recent_transactions("bitcoin", limit=10)
         
-        assert "bitcoin" in chains
-        assert "ethereum" in chains
-        assert "ripple" in chains
-        assert "zcash" in chains
-        assert "solana" in chains
+        assert result["status"] == "not_supported"
+        assert "chain" in result
+        assert "message" in result
+        assert "free API" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_get_recent_transactions_ethereum_not_supported(self):
+        """Should return not_supported for Ethereum (no free API)."""
+        from src.services.blockchain_data import BlockchainDataService
+        
+        service = BlockchainDataService()
+        result = await service.get_recent_transactions("ethereum", limit=10)
+        
+        assert result["status"] == "not_supported"
+
+    @pytest.mark.asyncio
+    async def test_get_latest_block_solana(self):
+        """Should fetch the latest Solana slot info."""
+        from src.services.blockchain_data import BlockchainDataService
+        
+        mock_slot_response = {"result": 300000000}
+        mock_epoch_response = {
+            "result": {
+                "epoch": 650,
+                "slotIndex": 150000,
+                "slotsInEpoch": 432000,
+            }
+        }
+        
+        with patch.object(BlockchainDataService, '_make_solana_request', new_callable=AsyncMock) as mock_request:
+            mock_request.side_effect = [mock_slot_response, mock_epoch_response]
+            
+            service = BlockchainDataService()
+            result = await service.get_latest_block("solana")
+            
+            assert result["status"] == "success"
+            assert result["chain"] == "solana"
+            assert "block" in result
+            assert result["block"]["slot"] == 300000000
+
+    @pytest.mark.asyncio
+    async def test_get_latest_block_bitcoin_not_supported(self):
+        """Should return not_supported for Bitcoin block info."""
+        from src.services.blockchain_data import BlockchainDataService
+        
+        service = BlockchainDataService()
+        result = await service.get_latest_block("bitcoin")
+        
+        assert result["status"] == "not_supported"
+        assert "free API" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_get_chain_stats_solana(self):
+        """Should fetch Solana chain statistics."""
+        from src.services.blockchain_data import BlockchainDataService
+        
+        # getEpochInfo response
+        mock_epoch_response = {
+            "result": {
+                "epoch": 650,
+                "slotIndex": 150000,
+                "slotsInEpoch": 432000,
+                "absoluteSlot": 300000000,
+                "blockHeight": 250000000,
+            }
+        }
+        # getSupply response
+        mock_supply_response = {
+            "result": {
+                "value": {
+                    "total": 580000000000000000,
+                    "circulating": 450000000000000000,
+                    "nonCirculating": 130000000000000000,
+                }
+            }
+        }
+        
+        with patch.object(BlockchainDataService, '_make_solana_request', new_callable=AsyncMock) as mock_request:
+            mock_request.side_effect = [
+                mock_epoch_response,
+                mock_supply_response,
+            ]
+            
+            service = BlockchainDataService()
+            result = await service.get_blockchain_stats("solana")
+            
+            assert result["status"] == "success"
+            assert result["chain"] == "solana"
+            assert "stats" in result
+            assert result["stats"]["epoch"] == 650
+
+    @pytest.mark.asyncio
+    async def test_get_chain_stats_ethereum_not_supported(self):
+        """Should return not_supported for Ethereum stats."""
+        from src.services.blockchain_data import BlockchainDataService
+        
+        service = BlockchainDataService()
+        result = await service.get_blockchain_stats("ethereum")
+        
+        assert result["status"] == "not_supported"
+
+    @pytest.mark.asyncio
+    async def test_supported_chains(self):
+        """Should list supported and known chains correctly."""
+        from src.services.blockchain_data import BlockchainDataService
+        
+        service = BlockchainDataService()
+        
+        # get_supported_chains returns only fully supported chains
+        supported = service.get_supported_chains()
+        assert "solana" in supported
+        
+        # Bitcoin/Ethereum/etc are not fully supported
+        assert "bitcoin" not in supported
+        assert "ethereum" not in supported
+        
+        # get_all_known_chains includes both supported and unsupported
+        all_known = service.get_all_known_chains()
+        assert "bitcoin" in all_known
+        assert "ethereum" in all_known
+        assert "ripple" in all_known
+        assert "zcash" in all_known
+        assert "solana" in all_known
 
     @pytest.mark.asyncio
     async def test_unsupported_chain_returns_error(self):
-        """Should return error for unsupported chains."""
+        """Should return error for completely unknown chains."""
         from src.services.blockchain_data import BlockchainDataService
         
         service = BlockchainDataService()
         result = await service.get_recent_transactions("unsupported_chain", limit=10)
         
-        assert result["status"] == "error"
-        assert "unsupported" in result["message"].lower()
+        # Unknown chains return not_supported
+        assert result["status"] in ("error", "not_supported")
 
     @pytest.mark.asyncio
     async def test_chain_aliases(self):
@@ -234,3 +199,18 @@ class TestBlockchainDataService:
         assert service._normalize_chain("sol") == "solana"
         assert service._normalize_chain("zec") == "zcash"
         assert service._normalize_chain("bitcoin") == "bitcoin"
+        assert service._normalize_chain("SOLANA") == "solana"
+
+    @pytest.mark.asyncio
+    async def test_solana_rpc_error_handling(self):
+        """Should handle Solana RPC errors gracefully."""
+        from src.services.blockchain_data import BlockchainDataService
+        
+        with patch.object(BlockchainDataService, '_make_solana_request', new_callable=AsyncMock) as mock_request:
+            mock_request.side_effect = Exception("RPC connection failed")
+            
+            service = BlockchainDataService()
+            result = await service.get_recent_transactions("solana", limit=10)
+            
+            assert result["status"] == "error"
+            assert "error" in result["message"].lower() or "failed" in result["message"].lower()

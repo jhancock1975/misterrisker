@@ -6,7 +6,7 @@ cryptocurrency patterns and prices, rather than hallucinating incorrect values.
 
 The agent has access to:
 1. Real-time candle data via WebSocket (CoinbaseWebSocketService)
-2. Blockchain transaction data via Blockchair API
+2. Blockchain transaction data via Solana RPC and other free APIs
 3. Coinbase API for current prices and historical data
 
 Tests ensure the agent uses these real data sources for analysis.

@@ -1039,8 +1039,8 @@ HTML_TEMPLATE = r"""
         }
         
         .container {
-            width: 100%;
-            max-width: 900px;
+            width: 95%;
+            max-width: 1400px;
             background: #ffffff;
             border-radius: 16px;
             box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
