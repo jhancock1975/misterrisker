@@ -454,19 +454,22 @@ class SchwabAgent:
                 result = await self.get_account_summary()
                 response = f"Here's your Schwab account summary:\n{self._format_account_summary(result)}"
             elif any(word in query_lower for word in ["position", "holding", "portfolio", "stock", "own"]):
-                result = await self.get_positions()
+                result = await self.get_portfolio()
                 response = f"Here are your current positions:\n{self._format_positions(result)}"
             elif any(word in query_lower for word in ["quote", "price"]):
                 # Extract symbol from query (basic extraction)
                 symbols = self._extract_symbols(query)
                 if symbols:
-                    result = await self.get_quote(symbols[0])
+                    result = await self.get_stock_price(symbols[0])
                     response = f"Quote for {symbols[0]}:\n{self._format_quote(result)}"
                 else:
                     response = "Please specify a stock symbol to get a quote."
             elif any(word in query_lower for word in ["order", "trade"]):
-                result = await self.get_orders()
+                result = await self.get_open_orders()
                 response = f"Here are your recent orders:\n{self._format_orders(result)}"
+            elif any(word in query_lower for word in ["market", "today", "mover", "movers"]):
+                result = await self.get_market_movers()
+                response = f"Here's what's moving in the market today:\n{self._format_market_movers(result)}"
             else:
                 # Default to account summary
                 result = await self.get_account_summary()

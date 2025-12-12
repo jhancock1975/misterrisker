@@ -836,15 +836,33 @@ Current active broker: {self.active_broker.upper()}"""
     def _is_image_generation_request(self, message: str) -> bool:
         """Detect if a message is requesting image/visual content generation.
         
+        This method distinguishes between:
+        - Generic image/art generation ("draw a cat", "create logo") → Image generator
+        - Data visualization requests ("plot BTC prices", "chart correlation") → Agent
+        
         Args:
             message: User message
         
         Returns:
-            True if this is an image generation request
+            True if this is a generic image generation request (not data visualization)
         """
         lower_msg = message.lower()
         
-        # Image generation indicators
+        # Data visualization keywords - these should go to agents, not image generator
+        # The agent can use actual data to create meaningful visualizations
+        data_viz_indicators = [
+            "plot", "chart", "graph", "histogram", "scatter",
+            "correlation", "trend", "price", "prices", "data",
+            "statistics", "stats", "performance", "portfolio",
+            "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
+            "stock", "stocks", "market", "trading", "historical"
+        ]
+        
+        # If the message contains data visualization keywords, route to agent
+        if any(indicator in lower_msg for indicator in data_viz_indicators):
+            return False
+        
+        # Image generation indicators for generic images/art
         image_keywords = [
             "draw", "sketch", "create an image", "create a picture",
             "generate an svg", "generate svg", "make an svg", "make svg",

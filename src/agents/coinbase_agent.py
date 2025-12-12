@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
+from pydantic import BaseModel, Field
 
 from src.mcp_servers.coinbase import CoinbaseMCPServer, CoinbaseAPIError
 from src.agents.chain_of_thought import ChainOfThought, ReasoningType
@@ -20,6 +21,28 @@ from src.services.coinbase_websocket import CoinbaseWebSocketService
 
 # Configure logger for this module
 logger = logging.getLogger(__name__)
+
+
+class CoinbaseToolDecision(BaseModel):
+    """Structured output for LLM tool selection in Coinbase agent."""
+    capability: str = Field(
+        description="The capability to use. Must be one of: portfolio, price, historical, blockchain, analysis, buy, sell, order, cancel, general"
+    )
+    crypto: str | None = Field(
+        default=None,
+        description="The cryptocurrency symbol if relevant (e.g., BTC, ETH, SOL)"
+    )
+    time_period: str | None = Field(
+        default=None,
+        description="Time period if relevant (e.g., 'week', 'month', 'year')"
+    )
+    amount: str | None = Field(
+        default=None,
+        description="Dollar amount if relevant for trading"
+    )
+    reasoning: str = Field(
+        description="Brief explanation of why this capability was chosen"
+    )
 
 
 class CoinbaseAgentError(Exception):
@@ -116,6 +139,14 @@ class CoinbaseAgent:
         self.chain_of_thought = ChainOfThought() if enable_chain_of_thought else None
         self.checkpointer = checkpointer
         self.blockchain_data_service = BlockchainDataService()
+        
+        # Set up LLM-based tool router if LLM is provided
+        self.tool_router = None
+        if self.llm:
+            try:
+                self.tool_router = self.llm.with_structured_output(CoinbaseToolDecision)
+            except Exception as e:
+                logger.warning(f"Could not set up LLM tool router: {e}")
         
         # Initialize WebSocket service for candle monitoring
         self.enable_websocket = enable_websocket
@@ -452,11 +483,10 @@ class CoinbaseAgent:
         config: dict[str, Any] | None = None,
         conversation_history: list[dict[str, Any]] | None = None
     ) -> dict[str, Any]:
-        """Process a natural language query through the agent workflow.
+        """Process a natural language query using LLM-based tool selection.
         
-        This is the high-level interface used by the Supervisor Agent for delegation.
-        It accepts a query string and optional config, builds the appropriate state,
-        and returns a structured response.
+        This method uses an LLM to intelligently decide which capability to use
+        based on the user's query, rather than relying on keyword matching.
         
         Args:
             query: Natural language query from the user
@@ -467,52 +497,13 @@ class CoinbaseAgent:
             Dict with 'response' and 'status' keys
         """
         try:
-            # Determine what tool to call based on the query
-            query_lower = query.lower()
-            
-            # Route to appropriate tool based on query content
-            # Check for cancel requests FIRST
-            if "cancel" in query_lower:
-                response = await self._handle_cancel_request(query)
-            # Check for blockchain data queries (transactions, blocks, on-chain data)
-            # This must come BEFORE analysis check because "analyze blockchain" should use blockchain data
-            elif any(word in query_lower for word in ["blockchain", "block chain", "on-chain", "onchain", "ledger"]) or \
-                 (any(word in query_lower for word in ["transaction", "transactions"]) and 
-                  any(word in query_lower for word in ["bitcoin", "btc", "solana", "sol", "ethereum", "eth"])):
-                response = await self._handle_blockchain_query(query)
-            # Check for analysis/pattern queries - use real-time price data
-            elif any(word in query_lower for word in ["pattern", "patterns", "analyze", "analysis", "trend", "trends", "seeing"]):
-                response = await self._handle_analysis_query(query)
-            # Check for order/trade requests (before price checks)
-            elif any(word in query_lower for word in ["limit order", "place.*order", "order"]):
-                response = await self._handle_order_request(query)
-            elif any(word in query_lower for word in ["buy", "purchase"]) and any(word in query_lower for word in ["$", "usd", "dollar"]):
-                response = await self._handle_buy_request(query)
-            elif any(word in query_lower for word in ["sell"]) and any(word in query_lower for word in ["$", "usd", "dollar"]):
-                response = await self._handle_sell_request(query)
-            elif any(word in query_lower for word in ["balance", "account", "cash", "value", "worth", "portfolio"]):
-                result = await self.get_portfolio_summary()
-                response = f"Here's your Coinbase portfolio:\n{self._format_portfolio(result)}"
-            elif any(word in query_lower for word in ["price", "quote", "how much", "cost"]):
-                # Extract crypto from query
-                crypto = self._extract_crypto(query)
-                if crypto:
-                    result = await self.get_market_data(f"{crypto}-USD")
-                    response = f"{self._format_price(crypto, result)}"
-                else:
-                    # Default to Bitcoin
-                    result = await self.get_market_data("BTC-USD")
-                    response = f"{self._format_price('BTC', result)}"
-            elif any(word in query_lower for word in ["buy", "purchase"]):
-                crypto = self._extract_crypto(query) or "BTC"
-                response = f"To buy {crypto}, please specify an amount (e.g., 'buy $100 of BTC')."
-            elif any(word in query_lower for word in ["sell"]):
-                crypto = self._extract_crypto(query) or "BTC"
-                response = f"To sell {crypto}, please specify an amount."
+            # Use LLM-based routing if available
+            if self.tool_router:
+                decision = await self._llm_route_query(query, conversation_history)
+                response = await self._execute_capability(decision, query)
             else:
-                # Default to portfolio summary
-                result = await self.get_portfolio_summary()
-                response = f"Here's your Coinbase account:\n{self._format_portfolio(result)}"
+                # Fallback to keyword-based routing if no LLM
+                response = await self._fallback_route_query(query)
             
             return {
                 "response": response,
@@ -524,10 +515,237 @@ class CoinbaseAgent:
                 "status": "error"
             }
         except Exception as e:
+            logger.error(f"Error processing query: {e}")
             return {
                 "response": f"An error occurred: {str(e)}",
                 "status": "error"
             }
+    
+    async def _llm_route_query(
+        self, 
+        query: str, 
+        conversation_history: list[dict[str, Any]] | None = None
+    ) -> CoinbaseToolDecision:
+        """Use LLM to intelligently route the query to the right capability.
+        
+        Args:
+            query: User's natural language query
+            conversation_history: Previous messages for context
+            
+        Returns:
+            CoinbaseToolDecision with the selected capability
+        """
+        routing_prompt = self._build_capability_routing_prompt()
+        
+        messages = [
+            {"role": "system", "content": routing_prompt}
+        ]
+        
+        # Add conversation history for context if available
+        if conversation_history:
+            for msg in conversation_history[-5:]:  # Last 5 messages for context
+                messages.append(msg)
+        
+        messages.append({"role": "user", "content": query})
+        
+        try:
+            decision = await asyncio.to_thread(
+                self.tool_router.invoke, messages
+            )
+            logger.info(f"[COINBASE] LLM routing: capability={decision.capability}, crypto={decision.crypto}, reason={decision.reasoning[:80]}...")
+            return decision
+        except Exception as e:
+            logger.error(f"LLM routing failed: {e}, falling back to keyword routing")
+            # Create fallback decision
+            return self._create_fallback_decision(query)
+    
+    def _build_capability_routing_prompt(self) -> str:
+        """Build a comprehensive prompt for LLM-based capability routing."""
+        return """You are the Coinbase Agent's intelligent router. Your job is to analyze user queries 
+and decide which capability to use to best answer them.
+
+## Available Capabilities
+
+### portfolio
+Get user's Coinbase account balances, holdings, and portfolio summary.
+Use when: User asks about their balance, account, holdings, portfolio value, how much they have.
+
+### price  
+Get current real-time price for a cryptocurrency.
+Use when: User asks for current price, quote, how much something costs right now.
+
+### historical
+Get historical price data with statistics (mean, min, max, std dev, median).
+Use when: User asks about price history, past prices, historical data, statistics over time, 
+trends over weeks/months/years, wants to analyze past performance, mentions "last month", 
+"past week", "historical", or wants statistical analysis.
+
+### blockchain
+Get on-chain blockchain data: transactions, blocks, network stats, mempool info.
+Use when: User asks about blockchain transactions, block data, on-chain activity, 
+network statistics, mempool, or compares blockchain activity between chains.
+
+### chart
+Generate a data visualization chart or plot with actual data.
+Use when: User asks to "draw", "plot", "chart", "graph", or "visualize" price data,
+correlation, performance, or any quantitative crypto data. This generates an actual 
+SVG chart with real data, not a generic image.
+
+### analysis
+Real-time technical analysis with current price patterns, trends, volatility.
+Use when: User asks to "analyze" current market conditions, patterns, trends, 
+what's happening right now, technical indicators.
+
+### buy
+Execute a cryptocurrency purchase.
+Use when: User wants to buy crypto with a specific dollar amount.
+
+### sell
+Execute a cryptocurrency sale.  
+Use when: User wants to sell crypto for dollars.
+
+### order
+Place a limit order (buy or sell at a specific price).
+Use when: User wants to place an order at a specific limit price.
+
+### cancel
+Cancel an existing order.
+Use when: User wants to cancel an order.
+
+### general
+General crypto questions that can be answered with available data.
+Use when: Query doesn't fit other categories but is crypto-related.
+
+## Instructions
+1. Analyze the user's query carefully
+2. Consider what data or action would best satisfy their request
+3. Select the most appropriate capability
+4. Extract relevant parameters (crypto symbol, time period, amounts)
+
+## Examples
+- "What's my balance?" → portfolio
+- "BTC price" → price
+- "Historical bitcoin prices from last month with statistics" → historical (crypto=BTC, time_period=month)
+- "Show me Solana blockchain transactions" → blockchain (crypto=SOL)
+- "Draw a chart of BTC prices" → chart (crypto=BTC)
+- "Plot the price correlation" → chart
+- "Visualize ETH performance" → chart (crypto=ETH)
+- "Analyze BTC trends" with no time period mentioned → analysis (current real-time)
+- "How has ETH performed over the past year?" → historical (crypto=ETH, time_period=year)
+- "Buy $100 of ETH" → buy (crypto=ETH, amount=100)
+- "Compare Bitcoin and Solana blockchains" → blockchain (crypto=BTC,SOL)
+- "What are the largest Bitcoin transactions today?" → blockchain (crypto=BTC)
+- "Mean and standard deviation of BTC prices this month" → historical (crypto=BTC, time_period=month)
+
+Be precise in your selection. If the user mentions historical/past data with statistics, use 'historical'.
+If they want current real-time analysis, use 'analysis'. These are different capabilities.
+If they want a visual chart/plot/graph, use 'chart'."""
+    
+    def _create_fallback_decision(self, query: str) -> CoinbaseToolDecision:
+        """Create a fallback decision using keyword matching when LLM fails."""
+        query_lower = query.lower()
+        crypto = self._extract_crypto(query)
+        
+        # Simple keyword matching as fallback
+        if any(word in query_lower for word in ["chart", "plot", "graph", "draw", "visualize", "visualization"]):
+            return CoinbaseToolDecision(
+                capability="chart",
+                crypto=crypto,
+                reasoning="Fallback: detected chart/visualization keywords"
+            )
+        elif any(word in query_lower for word in ["historical", "history", "past month", "last month", "past week", "last week", "statistics", "mean", "median"]):
+            return CoinbaseToolDecision(
+                capability="historical",
+                crypto=crypto,
+                time_period="month" if "month" in query_lower else "week" if "week" in query_lower else "year" if "year" in query_lower else None,
+                reasoning="Fallback: detected historical/statistics keywords"
+            )
+        elif any(word in query_lower for word in ["blockchain", "block chain", "on-chain", "transaction"]):
+            return CoinbaseToolDecision(
+                capability="blockchain",
+                crypto=crypto,
+                reasoning="Fallback: detected blockchain keywords"
+            )
+        elif any(word in query_lower for word in ["balance", "portfolio", "account"]):
+            return CoinbaseToolDecision(
+                capability="portfolio",
+                reasoning="Fallback: detected portfolio keywords"
+            )
+        elif any(word in query_lower for word in ["price", "quote", "cost"]):
+            return CoinbaseToolDecision(
+                capability="price",
+                crypto=crypto,
+                reasoning="Fallback: detected price keywords"
+            )
+        else:
+            return CoinbaseToolDecision(
+                capability="general",
+                crypto=crypto,
+                reasoning="Fallback: no specific keywords matched"
+            )
+    
+    async def _execute_capability(self, decision: CoinbaseToolDecision, query: str) -> str:
+        """Execute the selected capability based on LLM decision.
+        
+        Args:
+            decision: The LLM's routing decision
+            query: Original user query
+            
+        Returns:
+            Formatted response string
+        """
+        capability = decision.capability
+        crypto = decision.crypto
+        
+        if capability == "portfolio":
+            result = await self.get_portfolio_summary()
+            return f"Here's your Coinbase portfolio:\n{self._format_portfolio(result)}"
+        
+        elif capability == "price":
+            crypto = crypto or "BTC"
+            result = await self.get_market_data(f"{crypto}-USD")
+            return self._format_price(crypto, result)
+        
+        elif capability == "historical":
+            return await self._handle_historical_query(query)
+        
+        elif capability == "blockchain":
+            return await self._handle_blockchain_query(query)
+        
+        elif capability == "chart":
+            return await self._handle_chart_request(query)
+        
+        elif capability == "analysis":
+            return await self._handle_analysis_query(query)
+        
+        elif capability == "buy":
+            return await self._handle_buy_request(query)
+        
+        elif capability == "sell":
+            return await self._handle_sell_request(query)
+        
+        elif capability == "order":
+            return await self._handle_order_request(query)
+        
+        elif capability == "cancel":
+            return await self._handle_cancel_request(query)
+        
+        else:  # general
+            # Try to provide helpful response based on available data
+            if crypto:
+                result = await self.get_market_data(f"{crypto}-USD")
+                return self._format_price(crypto, result)
+            else:
+                result = await self.get_portfolio_summary()
+                return f"Here's your Coinbase account:\n{self._format_portfolio(result)}"
+    
+    async def _fallback_route_query(self, query: str) -> str:
+        """Fallback routing when LLM is not available.
+        
+        Uses keyword matching as a backup routing mechanism.
+        """
+        decision = self._create_fallback_decision(query)
+        return await self._execute_capability(decision, query)
     
     def _extract_crypto(self, query: str) -> str | None:
         """Extract cryptocurrency name/symbol from a query string."""
@@ -738,6 +956,404 @@ class CoinbaseAgent:
         except Exception as e:
             return f"❌ Error cancelling order: {str(e)}"
 
+    async def _handle_historical_query(self, query: str) -> str:
+        """Handle historical price data queries with statistics.
+        
+        Fetches historical candle data from Coinbase API and calculates
+        statistics like mean, min, max, standard deviation, and median.
+        
+        Args:
+            query: User query about historical prices
+            
+        Returns:
+            Formatted historical analysis with statistics
+        """
+        import re
+        from datetime import datetime, timedelta
+        import statistics
+        
+        query_lower = query.lower()
+        
+        # Determine which crypto
+        crypto = self._extract_crypto(query) or "BTC"
+        product_id = f"{crypto}-USD"
+        
+        # Determine time period and granularity to stay under 350 candles limit
+        if "year" in query_lower:
+            days = 365
+            period_name = "1 Year"
+            granularity = "ONE_DAY"  # 365 candles
+        elif "month" in query_lower:
+            days = 30
+            period_name = "1 Month"
+            granularity = "SIX_HOUR"  # 120 candles (30*4)
+        elif "week" in query_lower:
+            days = 7
+            period_name = "1 Week"
+            granularity = "ONE_HOUR"  # 168 candles (7*24)
+        else:
+            days = 30
+            period_name = "1 Month"
+            granularity = "SIX_HOUR"  # 120 candles (30*4)
+        
+        # Calculate time range
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(days=days)
+        
+        # Format timestamps for Coinbase API (Unix timestamp as string)
+        start_ts = str(int(start_time.timestamp()))
+        end_ts = str(int(end_time.timestamp()))
+        
+        try:
+            # Fetch candles from Coinbase MCP Server
+            candles_result = await self.mcp_server.call_tool(
+                "get_candles",
+                {
+                    "product_id": product_id,
+                    "start": start_ts,
+                    "end": end_ts,
+                    "granularity": granularity
+                }
+            )
+            
+            # Extract candles data
+            if hasattr(candles_result, 'candles'):
+                candles = candles_result.candles
+            elif isinstance(candles_result, dict) and 'candles' in candles_result:
+                candles = candles_result['candles']
+            else:
+                candles = candles_result if isinstance(candles_result, list) else []
+            
+            if not candles:
+                return f"❌ No historical data available for {crypto} over the past {period_name}."
+            
+            # Extract closing prices
+            close_prices = []
+            high_prices = []
+            low_prices = []
+            volumes = []
+            timestamps = []
+            
+            for candle in candles:
+                if hasattr(candle, 'close'):
+                    close_prices.append(float(candle.close))
+                    high_prices.append(float(candle.high))
+                    low_prices.append(float(candle.low))
+                    volumes.append(float(candle.volume))
+                    timestamps.append(int(candle.start))
+                elif isinstance(candle, dict):
+                    close_prices.append(float(candle.get('close', 0)))
+                    high_prices.append(float(candle.get('high', 0)))
+                    low_prices.append(float(candle.get('low', 0)))
+                    volumes.append(float(candle.get('volume', 0)))
+                    timestamps.append(int(candle.get('start', 0)))
+                elif isinstance(candle, (list, tuple)) and len(candle) >= 5:
+                    # [timestamp, low, high, open, close, volume]
+                    close_prices.append(float(candle[4]))
+                    high_prices.append(float(candle[2]))
+                    low_prices.append(float(candle[1]))
+                    volumes.append(float(candle[5]) if len(candle) > 5 else 0)
+                    timestamps.append(int(candle[0]))
+            
+            if not close_prices:
+                return f"❌ Unable to parse historical data for {crypto}."
+            
+            # Calculate statistics
+            num_samples = len(close_prices)
+            price_mean = statistics.mean(close_prices)
+            price_min = min(close_prices)
+            price_max = max(close_prices)
+            price_median = statistics.median(close_prices)
+            price_std = statistics.stdev(close_prices) if len(close_prices) > 1 else 0
+            total_volume = sum(volumes)
+            
+            # Current vs start price
+            current_price = close_prices[0] if timestamps[0] > timestamps[-1] else close_prices[-1]
+            start_price = close_prices[-1] if timestamps[0] > timestamps[-1] else close_prices[0]
+            price_change = current_price - start_price
+            price_change_pct = (price_change / start_price) * 100 if start_price else 0
+            
+            # Overall high/low
+            overall_high = max(high_prices)
+            overall_low = min(low_prices)
+            
+            # Build response
+            lines = [f"📈 **{crypto} Historical Price Analysis** ({period_name})\n"]
+            
+            lines.append("**Summary:**")
+            lines.append(f"• Data Points: {num_samples:,} candles")
+            lines.append(f"• Period: {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}")
+            lines.append("")
+            
+            lines.append("**Price Statistics:**")
+            lines.append(f"• Current Price: ${current_price:,.2f}")
+            lines.append(f"• Mean (Average): ${price_mean:,.2f}")
+            lines.append(f"• Median: ${price_median:,.2f}")
+            lines.append(f"• Minimum: ${price_min:,.2f}")
+            lines.append(f"• Maximum: ${price_max:,.2f}")
+            lines.append(f"• Standard Deviation: ${price_std:,.2f}")
+            lines.append(f"• Period High: ${overall_high:,.2f}")
+            lines.append(f"• Period Low: ${overall_low:,.2f}")
+            lines.append("")
+            
+            lines.append("**Performance:**")
+            trend_emoji = "📈" if price_change >= 0 else "📉"
+            lines.append(f"• Change: {trend_emoji} ${price_change:+,.2f} ({price_change_pct:+.2f}%)")
+            lines.append(f"• Volatility (Std/Mean): {(price_std/price_mean)*100:.2f}%")
+            lines.append(f"• Price Range: ${overall_high - overall_low:,.2f}")
+            lines.append("")
+            
+            if total_volume > 0:
+                lines.append("**Volume:**")
+                lines.append(f"• Total Volume: {total_volume:,.2f} {crypto}")
+                lines.append(f"• Avg Volume/Candle: {total_volume/num_samples:,.2f} {crypto}")
+                lines.append("")
+            
+            # Check if user asked for chart
+            if any(word in query_lower for word in ["chart", "plot", "graph", "visualize"]):
+                lines.append("📊 *Note: Chart visualization is available in the web interface. Use the Charts button or ask for a specific chart type.*")
+            
+            lines.append(f"\n*Data source: Coinbase Advanced Trade API ({granularity} candles)*")
+            
+            return "\n".join(lines)
+            
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {e}")
+            return f"❌ Error fetching historical data for {crypto}: {str(e)}"
+
+    async def _handle_chart_request(self, query: str) -> str:
+        """Handle chart/visualization requests by generating SVG charts with real data.
+        
+        Args:
+            query: User query requesting a chart/plot/visualization
+            
+        Returns:
+            SVG chart wrapped in markdown or error message
+        """
+        from datetime import datetime, timedelta
+        
+        query_lower = query.lower()
+        
+        # Determine chart type based on query
+        is_correlation = "correlation" in query_lower
+        is_comparison = any(word in query_lower for word in ["compare", "comparison", "vs", "versus"])
+        
+        # Extract cryptos
+        cryptos = []
+        crypto_keywords = {
+            "bitcoin": "BTC", "btc": "BTC",
+            "ethereum": "ETH", "eth": "ETH",
+            "solana": "SOL", "sol": "SOL",
+            "ripple": "XRP", "xrp": "XRP",
+        }
+        for keyword, symbol in crypto_keywords.items():
+            if keyword in query_lower and symbol not in cryptos:
+                cryptos.append(symbol)
+        
+        if not cryptos:
+            cryptos = ["BTC", "ETH"]  # Default to BTC vs ETH for correlation
+        
+        try:
+            # Fetch historical data for the cryptos
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(days=7)  # 1 week of data
+            start_ts = str(int(start_time.timestamp()))
+            end_ts = str(int(end_time.timestamp()))
+            
+            all_data = {}
+            for crypto in cryptos[:2]:  # Max 2 for comparison
+                candles_result = await self.mcp_server.call_tool(
+                    "get_candles",
+                    {
+                        "product_id": f"{crypto}-USD",
+                        "start": start_ts,
+                        "end": end_ts,
+                        "granularity": "SIX_HOUR"
+                    }
+                )
+                
+                # Extract close prices
+                prices = []
+                if isinstance(candles_result, dict) and 'candles' in candles_result:
+                    for candle in candles_result['candles']:
+                        if isinstance(candle, dict):
+                            prices.append(float(candle.get('close', 0)))
+                        elif hasattr(candle, 'close'):
+                            prices.append(float(candle.close))
+                
+                if prices:
+                    all_data[crypto] = prices[:28]  # Last 28 data points (7 days * 4)
+            
+            if not all_data:
+                return "❌ Unable to fetch price data for chart generation."
+            
+            # Generate SVG chart
+            if is_correlation and len(all_data) >= 2:
+                svg = self._generate_correlation_chart(all_data)
+                title = f"Price Correlation: {' vs '.join(all_data.keys())}"
+            else:
+                svg = self._generate_price_chart(all_data)
+                title = f"Price Chart: {', '.join(all_data.keys())}"
+            
+            # Return SVG wrapped for frontend
+            return f"""📊 **{title}**
+
+<div class="generated-chart">
+{svg}
+</div>
+
+*Data: Last 7 days, 6-hour intervals from Coinbase*"""
+            
+        except Exception as e:
+            logger.error(f"Error generating chart: {e}")
+            return f"❌ Error generating chart: {str(e)}"
+    
+    def _generate_price_chart(self, data: dict[str, list[float]]) -> str:
+        """Generate an SVG line chart for price data.
+        
+        Args:
+            data: Dict of crypto symbol to list of prices
+            
+        Returns:
+            SVG string
+        """
+        width, height = 600, 300
+        margin = 50
+        chart_width = width - 2 * margin
+        chart_height = height - 2 * margin
+        
+        # Find global min/max for scaling
+        all_prices = [p for prices in data.values() for p in prices]
+        min_price = min(all_prices) * 0.99
+        max_price = max(all_prices) * 1.01
+        price_range = max_price - min_price
+        
+        colors = ["#2563eb", "#dc2626", "#16a34a", "#ca8a04"]
+        
+        svg_parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">',
+            f'<rect width="{width}" height="{height}" fill="#1a1a2e"/>',
+            # Grid lines
+            f'<g stroke="#333" stroke-width="1">'
+        ]
+        
+        for i in range(5):
+            y = margin + (i * chart_height / 4)
+            svg_parts.append(f'<line x1="{margin}" y1="{y}" x2="{width-margin}" y2="{y}"/>')
+        svg_parts.append('</g>')
+        
+        # Price lines
+        for idx, (crypto, prices) in enumerate(data.items()):
+            color = colors[idx % len(colors)]
+            points = []
+            num_points = len(prices)
+            
+            for i, price in enumerate(reversed(prices)):  # Reverse for chronological
+                x = margin + (i * chart_width / (num_points - 1)) if num_points > 1 else margin
+                y = margin + chart_height - ((price - min_price) / price_range * chart_height)
+                points.append(f"{x:.1f},{y:.1f}")
+            
+            svg_parts.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2"/>')
+            
+            # Legend
+            legend_y = margin + 20 + idx * 20
+            svg_parts.append(f'<rect x="{margin + 10}" y="{legend_y - 10}" width="15" height="15" fill="{color}"/>')
+            svg_parts.append(f'<text x="{margin + 30}" y="{legend_y}" fill="white" font-size="12">{crypto}</text>')
+        
+        # Axis labels
+        svg_parts.append(f'<text x="{width/2}" y="{height - 10}" fill="white" font-size="12" text-anchor="middle">Time (7 days)</text>')
+        svg_parts.append(f'<text x="15" y="{height/2}" fill="white" font-size="12" transform="rotate(-90, 15, {height/2})">Price (USD)</text>')
+        
+        # Price labels
+        for i in range(5):
+            y = margin + (i * chart_height / 4)
+            price_val = max_price - (i * price_range / 4)
+            svg_parts.append(f'<text x="{margin - 5}" y="{y + 4}" fill="white" font-size="10" text-anchor="end">${price_val:,.0f}</text>')
+        
+        svg_parts.append('</svg>')
+        return '\n'.join(svg_parts)
+    
+    def _generate_correlation_chart(self, data: dict[str, list[float]]) -> str:
+        """Generate an SVG scatter plot showing price correlation.
+        
+        Args:
+            data: Dict of crypto symbol to list of prices (needs exactly 2)
+            
+        Returns:
+            SVG string
+        """
+        if len(data) < 2:
+            return self._generate_price_chart(data)
+        
+        symbols = list(data.keys())[:2]
+        prices1 = data[symbols[0]]
+        prices2 = data[symbols[1]]
+        
+        # Normalize prices to percentage changes for correlation
+        def pct_changes(prices):
+            return [(prices[i] - prices[i-1]) / prices[i-1] * 100 for i in range(1, len(prices))]
+        
+        changes1 = pct_changes(prices1)
+        changes2 = pct_changes(prices2)
+        
+        # Calculate correlation
+        n = min(len(changes1), len(changes2))
+        if n < 2:
+            return self._generate_price_chart(data)
+        
+        mean1 = sum(changes1[:n]) / n
+        mean2 = sum(changes2[:n]) / n
+        
+        numerator = sum((changes1[i] - mean1) * (changes2[i] - mean2) for i in range(n))
+        denom1 = sum((changes1[i] - mean1) ** 2 for i in range(n)) ** 0.5
+        denom2 = sum((changes2[i] - mean2) ** 2 for i in range(n)) ** 0.5
+        
+        correlation = numerator / (denom1 * denom2) if denom1 * denom2 > 0 else 0
+        
+        width, height = 600, 350
+        margin = 60
+        chart_size = min(width, height) - 2 * margin
+        
+        # Scale changes for plotting
+        all_changes = changes1[:n] + changes2[:n]
+        max_change = max(abs(c) for c in all_changes) * 1.1
+        
+        svg_parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">',
+            f'<rect width="{width}" height="{height}" fill="#1a1a2e"/>',
+            # Grid
+            f'<line x1="{margin}" y1="{margin + chart_size/2}" x2="{margin + chart_size}" y2="{margin + chart_size/2}" stroke="#444" stroke-width="1"/>',
+            f'<line x1="{margin + chart_size/2}" y1="{margin}" x2="{margin + chart_size/2}" y2="{margin + chart_size}" stroke="#444" stroke-width="1"/>',
+        ]
+        
+        # Plot points
+        for i in range(n):
+            x = margin + chart_size/2 + (changes1[i] / max_change * chart_size/2)
+            y = margin + chart_size/2 - (changes2[i] / max_change * chart_size/2)
+            svg_parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#60a5fa" opacity="0.8"/>')
+        
+        # Correlation line (trend line)
+        if abs(correlation) > 0.1:
+            slope = correlation * (max_change / max_change)  # Simplified
+            x1, x2 = margin, margin + chart_size
+            y1 = margin + chart_size/2 + (slope * chart_size/2)
+            y2 = margin + chart_size/2 - (slope * chart_size/2)
+            svg_parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#f97316" stroke-width="2" stroke-dasharray="5,5"/>')
+        
+        # Labels
+        svg_parts.append(f'<text x="{width/2}" y="{height - 15}" fill="white" font-size="12" text-anchor="middle">{symbols[0]} Price Change (%)</text>')
+        svg_parts.append(f'<text x="20" y="{height/2}" fill="white" font-size="12" transform="rotate(-90, 20, {height/2})">{symbols[1]} Price Change (%)</text>')
+        
+        # Correlation value
+        corr_color = "#22c55e" if correlation > 0.5 else "#f97316" if correlation > 0 else "#ef4444"
+        svg_parts.append(f'<text x="{width - margin}" y="{margin + 20}" fill="{corr_color}" font-size="14" text-anchor="end">r = {correlation:.3f}</text>')
+        
+        corr_label = "Strong Positive" if correlation > 0.7 else "Moderate Positive" if correlation > 0.3 else "Weak" if correlation > -0.3 else "Negative"
+        svg_parts.append(f'<text x="{width - margin}" y="{margin + 40}" fill="white" font-size="11" text-anchor="end">{corr_label} Correlation</text>')
+        
+        svg_parts.append('</svg>')
+        return '\n'.join(svg_parts)
+
     async def _handle_analysis_query(self, query: str) -> str:
         """Handle analysis/pattern queries using real-time WebSocket data.
         
@@ -875,8 +1491,8 @@ class CoinbaseAgent:
         import re
         query_lower = query.lower()
         
-        # Detect which chain
-        chain = None
+        # Detect which chains are mentioned (support multiple)
+        chains = []
         chain_keywords = {
             "bitcoin": "bitcoin",
             "btc": "bitcoin",
@@ -891,18 +1507,25 @@ class CoinbaseAgent:
         }
         
         for keyword, chain_name in chain_keywords.items():
-            if keyword in query_lower:
-                chain = chain_name
-                break
+            # Use word boundary to avoid false matches (e.g., "sol" in "solana")
+            if re.search(rf'\b{keyword}\b', query_lower) and chain_name not in chains:
+                chains.append(chain_name)
         
-        if not chain:
+        if not chains:
             # Default to bitcoin if no chain specified
-            chain = "bitcoin"
+            chains = ["bitcoin"]
+        
+        # Detect if this is a comparison/correlation query
+        is_comparison = any(word in query_lower for word in [
+            "correlation", "correlate", "compare", "comparison", "vs", "versus",
+            " and ", "both", "together", "predictor", "predict"
+        ]) and len(chains) >= 2
         
         # Detect query type
         is_transaction_query = any(word in query_lower for word in ["transaction", "transactions", "tx", "txs"])
-        is_block_query = any(word in query_lower for word in ["block ", "blocks", "latest block"])
+        is_block_query = any(word in query_lower for word in ["block ", "blocks", "latest block"]) and not is_comparison
         is_stats_query = any(word in query_lower for word in ["stats", "statistics", "info", "network"])
+        is_analysis_query = any(word in query_lower for word in ["analyze", "analysis", "24 hours", "last day"])
         
         # Extract limit if specified
         limit_match = re.search(r'(\d+)\s*(?:recent|last|latest)?', query_lower)
@@ -910,6 +1533,13 @@ class CoinbaseAgent:
         limit = min(limit, 25)  # Cap at 25 for readability
         
         try:
+            # Handle multi-chain comparison/analysis
+            if is_comparison or (is_analysis_query and len(chains) >= 2):
+                return await self._handle_blockchain_comparison(chains, query_lower)
+            
+            # Single chain query
+            chain = chains[0]
+            
             if is_transaction_query:
                 result = await self.blockchain_data_service.get_recent_transactions(chain, limit=limit)
                 if result["status"] == "success":
@@ -931,6 +1561,125 @@ class CoinbaseAgent:
                     return f"❌ {result.get('message', 'Failed to fetch stats')}"
         except Exception as e:
             return f"❌ Error fetching blockchain data: {str(e)}"
+    
+    async def _handle_blockchain_comparison(self, chains: list[str], query_lower: str) -> str:
+        """Handle comparison/analysis queries across multiple blockchains.
+        
+        Args:
+            chains: List of blockchain names to compare
+            query_lower: Lowercase query for context
+            
+        Returns:
+            Formatted comparison analysis
+        """
+        lines = ["# 🔗 Blockchain Comparison Analysis\n"]
+        
+        # Fetch stats and transactions for each chain
+        chain_data = {}
+        for chain in chains:
+            stats = await self.blockchain_data_service.get_blockchain_stats(chain)
+            txs = await self.blockchain_data_service.get_recent_transactions(chain, limit=10)
+            block = await self.blockchain_data_service.get_latest_block(chain)
+            chain_data[chain] = {
+                "stats": stats,
+                "transactions": txs,
+                "block": block
+            }
+        
+        # Display stats for each chain
+        for chain in chains:
+            data = chain_data[chain]
+            stats = data["stats"]
+            block = data["block"]
+            
+            if stats.get("status") == "success":
+                lines.append(f"## {chain.upper()} Network\n")
+                
+                if chain == "bitcoin":
+                    s = stats.get("stats", {})
+                    lines.append(f"• **Block Height:** {s.get('block_height', 'N/A'):,}")
+                    lines.append(f"• **Difficulty:** {s.get('difficulty', 0):,.0f}")
+                    if s.get('hashrate_eh_s'):
+                        lines.append(f"• **Hashrate:** {s['hashrate_eh_s']:.2f} EH/s")
+                    lines.append(f"• **Mempool Size:** {s.get('mempool_size', 0):,} pending txs")
+                    lines.append(f"• **Mempool Fees:** {s.get('mempool_total_fee_btc', 0):.4f} BTC")
+                    fees = s.get('recommended_fee_sat_vb', {})
+                    lines.append(f"• **Avg Fee Rate:** {fees.get('half_hour', 0)} sat/vB")
+                    
+                elif chain == "solana":
+                    s = stats.get("stats", {})
+                    lines.append(f"• **Block Height:** {s.get('block_height', 0):,}")
+                    lines.append(f"• **Current Epoch:** {s.get('epoch', 'N/A')}")
+                    lines.append(f"• **Slot Height:** {s.get('slot_height', 0):,}")
+                    if s.get('total_supply_sol'):
+                        lines.append(f"• **Total Supply:** {s['total_supply_sol']:,.0f} SOL")
+                    if s.get('circulating_supply_sol'):
+                        lines.append(f"• **Circulating:** {s['circulating_supply_sol']:,.0f} SOL")
+                
+                lines.append("")
+            else:
+                lines.append(f"## {chain.upper()}\n")
+                lines.append(f"⚠️ {stats.get('message', 'Data unavailable')}\n")
+        
+        # Add comparison analysis
+        lines.append("## 📊 Comparison Analysis\n")
+        
+        btc_data = chain_data.get("bitcoin", {})
+        sol_data = chain_data.get("solana", {})
+        
+        if btc_data.get("stats", {}).get("status") == "success" and sol_data.get("stats", {}).get("status") == "success":
+            btc_stats = btc_data["stats"].get("stats", {})
+            sol_stats = sol_data["stats"].get("stats", {})
+            
+            # Block production comparison
+            lines.append("**Block Production:**")
+            lines.append(f"• Bitcoin: ~1 block every 10 minutes (PoW)")
+            lines.append(f"• Solana: ~2 blocks per second (PoS)")
+            lines.append("")
+            
+            # Mempool/pending activity
+            btc_mempool = btc_stats.get('mempool_size', 0)
+            lines.append("**Network Activity:**")
+            lines.append(f"• Bitcoin mempool: {btc_mempool:,} pending transactions")
+            lines.append(f"• Solana processes transactions in real-time (no mempool backlog)")
+            lines.append("")
+            
+            # Fee analysis
+            btc_fees = btc_stats.get('recommended_fee_sat_vb', {})
+            lines.append("**Transaction Fees:**")
+            lines.append(f"• Bitcoin: {btc_fees.get('half_hour', 0)} sat/vB (~${self._estimate_btc_fee_usd(btc_fees.get('half_hour', 0))} for typical tx)")
+            lines.append(f"• Solana: ~0.000005 SOL (~$0.001 per transaction)")
+            lines.append("")
+            
+            # Correlation note
+            lines.append("**Correlation Analysis:**")
+            lines.append("• Bitcoin and Solana operate on fundamentally different consensus mechanisms")
+            lines.append("• Bitcoin (PoW) block times are variable; Solana (PoS) has consistent ~400ms slots")
+            lines.append("• Network congestion on one chain does not directly affect the other")
+            lines.append("• Price correlation exists but blockchain activity correlation is weak")
+            lines.append("• Bitcoin mempool congestion is NOT a predictor of Solana network activity")
+            lines.append("")
+            lines.append("💡 *For price correlation analysis, ask about price trends instead of blockchain data.*")
+        else:
+            lines.append("Insufficient data to perform full comparison analysis.")
+        
+        return "\n".join(lines)
+    
+    def _estimate_btc_fee_usd(self, sat_per_vb: int) -> str:
+        """Estimate USD cost for a typical Bitcoin transaction.
+        
+        Args:
+            sat_per_vb: Fee rate in satoshis per virtual byte
+            
+        Returns:
+            Estimated USD cost as string
+        """
+        # Typical transaction is ~140 vB, BTC ~$100k
+        typical_vb = 140
+        btc_price = 100000  # approximate
+        fee_btc = (sat_per_vb * typical_vb) / 1e8
+        fee_usd = fee_btc * btc_price
+        return f"{fee_usd:.2f}"
 
     def _format_blockchain_transactions(self, result: dict[str, Any]) -> str:
         """Format blockchain transaction data for display with rich details."""
