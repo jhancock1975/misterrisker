@@ -210,7 +210,7 @@ class ResearcherAgent:
         return workflow.compile()
     
     def _analyze_query(self, state: ResearcherAgentState) -> ResearcherAgentState:
-        """Analyze the user query and determine what research to perform.
+        """Analyze the user query using LLM to determine what research to perform.
         
         Args:
             state: Current workflow state
@@ -228,94 +228,82 @@ class ResearcherAgent:
         state["history"] = state.get("history", [])
         state["history"].append({"step": "analyze_query", "query": query})
         
-        # Simple query analysis to determine tools to call
-        query_lower = query.lower()
-        
         # Extract stock symbols from query
         symbols = self._extract_symbols(query)
         
-        if symbols:
-            for symbol in symbols:
-                # Determine what data to fetch based on query
-                if any(word in query_lower for word in ["price", "quote", "trading"]):
-                    state["tool_calls"].append({
-                        "tool": "get_stock_quote",
-                        "params": {"symbol": symbol}
-                    })
-                
-                if any(word in query_lower for word in ["analysis", "research", "complete", "comprehensive", "all"]):
-                    state["tool_calls"].append({
-                        "tool": "research_stock",
-                        "params": {"symbol": symbol, "include_web_search": True}
-                    })
-                elif any(word in query_lower for word in ["financials", "metrics", "pe", "ratio"]):
-                    state["tool_calls"].append({
-                        "tool": "get_basic_financials",
-                        "params": {"symbol": symbol}
-                    })
-                    
-                if any(word in query_lower for word in ["news", "latest", "recent"]):
-                    state["tool_calls"].append({
-                        "tool": "get_company_news",
-                        "params": {"symbol": symbol, "limit": 5}
-                    })
-                
-                if any(word in query_lower for word in ["analyst", "recommendation", "buy", "sell", "hold", "rating"]):
-                    state["tool_calls"].append({
-                        "tool": "get_analyst_recommendations",
-                        "params": {"symbol": symbol}
-                    })
-                
-                if any(word in query_lower for word in ["competitor", "peer", "compare"]):
-                    state["tool_calls"].append({
-                        "tool": "get_company_peers",
-                        "params": {"symbol": symbol}
-                    })
-                
-                if any(word in query_lower for word in ["earnings", "eps", "quarter"]):
-                    state["tool_calls"].append({
-                        "tool": "get_earnings_history",
-                        "params": {"symbol": symbol}
-                    })
-                
-                if any(word in query_lower for word in ["profile", "company", "about", "what is"]):
-                    state["tool_calls"].append({
-                        "tool": "get_company_profile",
-                        "params": {"symbol": symbol}
-                    })
-                
-                # If no specific request, do comprehensive research
-                if not state["tool_calls"]:
-                    state["tool_calls"].append({
-                        "tool": "research_stock",
-                        "params": {"symbol": symbol, "include_web_search": False}
-                    })
-        
-        # Check for market/general news request (no specific symbol)
-        news_keywords = ["news", "latest", "recent", "happening", "today", "market", "headlines"]
-        if any(word in query_lower for word in news_keywords):
-            # Add market news if not already getting company-specific news
-            if not any(tc.get("tool") == "get_company_news" for tc in state["tool_calls"]):
-                state["tool_calls"].append({
-                    "tool": "get_market_news",
-                    "params": {"category": "general", "limit": 10}
-                })
-            # Also do a web search for more context
-            if not any(tc.get("tool") == "web_search" for tc in state["tool_calls"]):
-                state["tool_calls"].append({
-                    "tool": "web_search",
-                    "params": {"query": query}
-                })
-        
-        # Check for web search request
-        if any(word in query_lower for word in ["search", "find", "look up", "outlook", "opinion"]):
-            if not any(tc.get("tool") == "web_search" for tc in state["tool_calls"]):
-                state["tool_calls"].append({
-                    "tool": "web_search",
-                    "params": {"query": query}
-                })
+        # Use LLM to determine what tools to call
+        if self.llm:
+            tool_calls = self._llm_analyze_query(query, symbols)
+            state["tool_calls"] = tool_calls
+        else:
+            raise ResearcherAgentError("LLM is required for query analysis. No LLM configured.")
         
         return state
+    
+    def _llm_analyze_query(self, query: str, symbols: list[str]) -> list[dict]:
+        """Use LLM to determine which research tools to call.
+        
+        Args:
+            query: User's query
+            symbols: Extracted stock symbols
+            
+        Returns:
+            List of tool calls to make
+        """
+        import json
+        
+        system_prompt = """You are a research query analyzer. Analyze the user's query and determine which research tools to call.
+
+Available tools:
+- get_stock_quote: Get current stock quote with price, change, volume. Use for price/quote requests.
+- research_stock: Comprehensive stock research with financials, news, analysis. Use for deep research.
+- get_basic_financials: Financial metrics like P/E ratio, market cap. Use for financial analysis.
+- get_company_news: Recent news about a company. Use for news requests.
+- get_analyst_recommendations: Analyst buy/sell/hold ratings. Use for recommendation requests.
+- get_company_peers: Get competitor companies. Use for peer/comparison requests.
+- get_earnings_history: Historical earnings data. Use for earnings analysis.
+- get_company_profile: Company description and info. Use for company overview.
+- get_market_news: General market news (no symbol needed). Use for market-wide news.
+- web_search: Search the web for information. Use for general lookups or opinions.
+
+Given the user query and any stock symbols found, return a JSON array of tool calls.
+Each tool call should have "tool" (tool name) and "params" (parameters object).
+
+For symbol-specific tools, include the symbol in params.
+For comprehensive queries about a stock, use research_stock.
+For multiple aspects, include multiple tool calls.
+
+Example output:
+[
+  {"tool": "get_stock_quote", "params": {"symbol": "AAPL"}},
+  {"tool": "get_company_news", "params": {"symbol": "AAPL", "limit": 5}}
+]
+
+Return ONLY valid JSON array, no other text."""
+        
+        user_content = f"Query: {query}\nSymbols found: {symbols if symbols else 'None'}"
+        
+        try:
+            response = self.llm.invoke([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ])
+            
+            content = _extract_content(response.content)
+            
+            # Parse JSON response
+            tool_calls = json.loads(content)
+            
+            if isinstance(tool_calls, list):
+                return tool_calls
+            else:
+                # If single tool call, wrap in list
+                return [tool_calls]
+                
+        except json.JSONDecodeError as e:
+            raise ResearcherAgentError(f"LLM returned invalid JSON for tool selection: {e}")
+        except Exception as e:
+            raise ResearcherAgentError(f"Failed to analyze query with LLM: {e}")
     
     def _extract_symbols(self, query: str) -> list[str]:
         """Extract stock symbols from a query.

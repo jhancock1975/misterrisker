@@ -113,11 +113,51 @@ def mock_mcp_server():
 
 
 @pytest.fixture
-def schwab_agent(mock_mcp_server):
-    """Create a Schwab agent with mocked MCP server."""
+def mock_llm():
+    """Create a mock LLM for testing Schwab agent routing."""
+    from unittest.mock import MagicMock, AsyncMock
+    import json
+    
+    llm = MagicMock()
+    
+    # Default routing response for account_balance
+    def create_routing_response(intent="account_balance", details=None):
+        response = MagicMock()
+        response.content = json.dumps({
+            "intent": intent,
+            "details": details or {}
+        })
+        return response
+    
+    # Make ainvoke return a mock async response
+    async def mock_ainvoke(messages):
+        # Analyze the query to determine appropriate response
+        query = ""
+        for msg in messages:
+            if hasattr(msg, 'content') and 'buy' in str(msg.content).lower():
+                return create_routing_response("place_order", {"action": "buy", "symbol": "AAPL", "quantity": 10})
+            if hasattr(msg, 'content') and 'price' in str(msg.content).lower():
+                return create_routing_response("get_quote", {"symbol": "AAPL"})
+            if hasattr(msg, 'content') and 'balance' in str(msg.content).lower():
+                return create_routing_response("account_balance", {})
+        return create_routing_response("account_balance", {})
+    
+    llm.ainvoke = mock_ainvoke
+    
+    # Regular invoke for CoT and other uses
+    mock_response = MagicMock()
+    mock_response.content = "Analysis complete"
+    llm.invoke = MagicMock(return_value=mock_response)
+    
+    return llm
+
+
+@pytest.fixture
+def schwab_agent(mock_mcp_server, mock_llm):
+    """Create a Schwab agent with mocked MCP server and LLM."""
     from agents.schwab_agent import SchwabAgent
     
-    agent = SchwabAgent(mcp_server=mock_mcp_server)
+    agent = SchwabAgent(mcp_server=mock_mcp_server, llm=mock_llm)
     return agent
 
 
@@ -606,3 +646,247 @@ class TestAccountSelection:
         calls = mock_mcp_server.call_tool.call_args_list
         tool_names = [call[0][0] for call in calls]
         assert "get_account_numbers" in tool_names
+
+
+# =============================================================================
+# Process Query Tests
+# =============================================================================
+
+class TestProcessQuery:
+    """Tests for query processing and order handling."""
+
+    @pytest.mark.asyncio
+    async def test_process_query_routes_balance_request(self, schwab_agent, mock_mcp_server):
+        """Process query should route balance requests to account summary."""
+        result = await schwab_agent.process_query("what's my account balance?")
+        
+        assert result["status"] == "success"
+        assert "response" in result
+
+    @pytest.mark.asyncio
+    async def test_process_query_routes_price_request(self, schwab_agent, mock_mcp_server):
+        """Process query should route price requests to get_quote."""
+        # The fixture mock_llm already handles "price" queries by returning get_quote intent
+        result = await schwab_agent.process_query("what's the price of AAPL?")
+        
+        assert result["status"] == "success"
+        # The response should contain price info (even if it's "no data" since mock server returns empty)
+        assert "response" in result
+
+    @pytest.mark.asyncio
+    async def test_handle_order_request_parses_limit_buy(self, schwab_agent, mock_mcp_server):
+        """Order handler should parse and execute limit buy orders."""
+        # Mock the LLM response
+        mock_llm_response = MagicMock()
+        mock_llm_response.content = '{"action": "buy", "symbol": "NVDA", "quantity": 1, "order_type": "limit", "price": 160, "take_profit": 180, "stop_loss": 120}'
+        
+        schwab_agent.llm = AsyncMock()
+        schwab_agent.llm.ainvoke = AsyncMock(return_value=mock_llm_response)
+        
+        result = await schwab_agent._handle_order_request(
+            "buy 1 share of NVDA at $160 with take profit at 180 and stop loss at 120"
+        )
+        
+        # Should have placed a limit buy order
+        assert "NVDA" in result
+        assert "limit buy" in result.lower() or "placed" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_handle_order_request_handles_list_content(self, schwab_agent, mock_mcp_server):
+        """Order handler should handle LLM responses that return list content."""
+        # Mock the LLM response with list content (the bug we fixed)
+        mock_llm_response = MagicMock()
+        mock_llm_response.content = ['{"action": "buy", "symbol": "AAPL", "quantity": 10, "order_type": "market", "price": null}']
+        
+        schwab_agent.llm = AsyncMock()
+        schwab_agent.llm.ainvoke = AsyncMock(return_value=mock_llm_response)
+        
+        result = await schwab_agent._handle_order_request("buy 10 shares of AAPL at market")
+        
+        # Should not raise an error about 'list' object has no attribute 'strip'
+        assert "AAPL" in result or "error" in result.lower() or "couldn't" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_handle_order_request_handles_dict_in_list(self, schwab_agent, mock_mcp_server):
+        """Order handler should handle LLM responses with dict in list."""
+        mock_llm_response = MagicMock()
+        mock_llm_response.content = [{"text": '{"action": "sell", "symbol": "TSLA", "quantity": 5, "order_type": "limit", "price": 250}'}]
+        
+        schwab_agent.llm = AsyncMock()
+        schwab_agent.llm.ainvoke = AsyncMock(return_value=mock_llm_response)
+        
+        result = await schwab_agent._handle_order_request("sell 5 shares of TSLA at $250")
+        
+        # Should handle dict-in-list content
+        assert isinstance(result, str)
+
+    @pytest.mark.asyncio
+    async def test_process_query_routes_buy_to_order_handler(self, schwab_agent, mock_mcp_server):
+        """Process query should route buy requests to order handler."""
+        # Create a mock that handles both routing and order parsing calls
+        call_count = [0]
+        
+        async def multi_call_mock(messages):
+            call_count[0] += 1
+            mock_response = MagicMock()
+            if call_count[0] == 1:
+                # First call: routing - return place_order intent
+                mock_response.content = '{"intent": "place_order", "details": {"action": "buy", "symbol": "GOOGL", "quantity": 2}}'
+            else:
+                # Second call: order parsing
+                mock_response.content = '{"action": "buy", "symbol": "GOOGL", "quantity": 2, "order_type": "market", "price": null}'
+            return mock_response
+        
+        schwab_agent.llm.ainvoke = multi_call_mock
+        
+        result = await schwab_agent.process_query("buy 2 shares of GOOGL")
+        
+        assert result["status"] == "success"
+        # Should have called equity_buy_market
+        calls = mock_mcp_server.call_tool.call_args_list
+        tool_names = [call[0][0] for call in calls]
+        assert "equity_buy_market" in tool_names
+    @pytest.mark.asyncio
+    async def test_process_query_routes_transaction_history(self, schwab_agent, mock_mcp_server):
+        """Process query should route transaction history requests."""
+        # Mock LLM to return transaction_history intent
+        mock_llm_response = MagicMock()
+        mock_llm_response.content = '{"intent": "transaction_history", "details": {}}'
+        
+        schwab_agent.llm = AsyncMock()
+        schwab_agent.llm.ainvoke = AsyncMock(return_value=mock_llm_response)
+        
+        result = await schwab_agent.process_query("show me my recent transaction history")
+        
+        assert result["status"] == "success"
+        assert "transaction" in result["response"].lower() or "no recent" in result["response"].lower()
+
+    @pytest.mark.asyncio
+    async def test_process_query_routes_top_stocks(self, schwab_agent, mock_mcp_server):
+        """Process query should route top stocks requests to market movers."""
+        # Mock LLM to return top_stocks intent
+        mock_llm_response = MagicMock()
+        mock_llm_response.content = '{"intent": "top_stocks", "details": {"count": 100}}'
+        
+        schwab_agent.llm = AsyncMock()
+        schwab_agent.llm.ainvoke = AsyncMock(return_value=mock_llm_response)
+        
+        result = await schwab_agent.process_query("show me top 100 stocks")
+        
+        assert result["status"] == "success"
+        # Should call get_movers
+        calls = mock_mcp_server.call_tool.call_args_list
+        tool_names = [call[0][0] for call in calls]
+        assert "get_movers" in tool_names
+
+
+class TestFormatters:
+    """Tests for formatter methods to prevent slicing errors."""
+
+    def test_format_transactions_with_list(self, schwab_agent):
+        """Format transactions should handle list input."""
+        transactions = [
+            {"type": "TRADE", "transactionDate": "2024-01-15", "netAmount": -1500.00},
+            {"type": "DIVIDEND", "transactionDate": "2024-01-10", "netAmount": 25.50}
+        ]
+        
+        result = schwab_agent._format_transactions(transactions)
+        
+        assert isinstance(result, str)
+        assert "TRADE" in result or "transaction" in result.lower()
+
+    def test_format_transactions_with_dict_wrapper(self, schwab_agent):
+        """Format transactions should handle dict wrapper."""
+        data = {
+            "transactions": [
+                {"type": "TRADE", "transactionDate": "2024-01-15", "netAmount": -500.00}
+            ]
+        }
+        
+        result = schwab_agent._format_transactions(data)
+        
+        assert isinstance(result, str)
+        assert "TRADE" in result or "transaction" in result.lower()
+
+    def test_format_transactions_with_empty_list(self, schwab_agent):
+        """Format transactions should handle empty list."""
+        result = schwab_agent._format_transactions([])
+        
+        assert isinstance(result, str)
+        assert "no" in result.lower()
+
+    def test_format_transactions_with_none(self, schwab_agent):
+        """Format transactions should handle None input."""
+        result = schwab_agent._format_transactions(None)
+        
+        assert isinstance(result, str)
+        assert "no" in result.lower()
+
+    def test_format_positions_with_list(self, schwab_agent):
+        """Format positions should handle list input."""
+        positions = [
+            {"instrument": {"symbol": "AAPL"}, "longQuantity": 100, "marketValue": 17500.00},
+            {"instrument": {"symbol": "MSFT"}, "longQuantity": 50, "marketValue": 18900.00}
+        ]
+        
+        result = schwab_agent._format_positions(positions)
+        
+        assert isinstance(result, str)
+        assert "AAPL" in result
+        assert "MSFT" in result
+
+    def test_format_positions_with_empty_list(self, schwab_agent):
+        """Format positions should handle empty list."""
+        result = schwab_agent._format_positions([])
+        
+        assert isinstance(result, str)
+        assert "no positions" in result.lower()
+
+    def test_format_positions_with_none(self, schwab_agent):
+        """Format positions should handle None without slicing error."""
+        # This tests the bug that caused slice(None, 10, None) error
+        result = schwab_agent._format_positions(None)
+        
+        assert isinstance(result, str)
+        assert "no positions" in result.lower()
+
+    def test_format_market_movers_with_valid_data(self, schwab_agent):
+        """Format market movers should handle valid screener data."""
+        data = {
+            "screeners": [
+                {
+                    "direction": "up",
+                    "instruments": [
+                        {"symbol": "NVDA", "netChange": 5.50, "netPercentChange": 3.5, "lastPrice": 150.00}
+                    ]
+                }
+            ]
+        }
+        
+        result = schwab_agent._format_market_movers(data)
+        
+        assert isinstance(result, str)
+        assert "NVDA" in result
+
+    def test_format_market_movers_with_empty_screeners(self, schwab_agent):
+        """Format market movers should handle empty screeners."""
+        result = schwab_agent._format_market_movers({"screeners": []})
+        
+        assert isinstance(result, str)
+
+    def test_format_orders_with_list(self, schwab_agent):
+        """Format orders should handle list input."""
+        orders = [
+            {"orderId": 12345, "status": "FILLED", "orderLegCollection": [{"instrument": {"symbol": "AAPL"}}]}
+        ]
+        
+        result = schwab_agent._format_orders(orders)
+        
+        assert isinstance(result, str)
+
+    def test_format_orders_with_none(self, schwab_agent):
+        """Format orders should handle None without error."""
+        result = schwab_agent._format_orders(None)
+        
+        assert isinstance(result, str)
+        assert "no" in result.lower()

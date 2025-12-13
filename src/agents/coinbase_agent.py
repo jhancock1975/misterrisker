@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class CoinbaseToolDecision(BaseModel):
     """Structured output for LLM tool selection in Coinbase agent."""
     capability: str = Field(
-        description="The capability to use. Must be one of: portfolio, price, historical, blockchain, analysis, buy, sell, order, cancel, general"
+        description="The capability to use. Must be one of: portfolio, price, historical, blockchain, analysis, buy, sell, order, orders, fills, transaction_history, cancel"
     )
     crypto: str | None = Field(
         default=None,
@@ -497,13 +497,12 @@ class CoinbaseAgent:
             Dict with 'response' and 'status' keys
         """
         try:
-            # Use LLM-based routing if available
-            if self.tool_router:
-                decision = await self._llm_route_query(query, conversation_history)
-                response = await self._execute_capability(decision, query)
-            else:
-                # Fallback to keyword-based routing if no LLM
-                response = await self._fallback_route_query(query)
+            # LLM-based routing is required
+            if not self.tool_router:
+                raise CoinbaseAgentError("LLM is required for query processing. No LLM configured.")
+            
+            decision = await self._llm_route_query(query, conversation_history)
+            response = await self._execute_capability(decision, query)
             
             return {
                 "response": response,
@@ -555,9 +554,8 @@ class CoinbaseAgent:
             logger.info(f"[COINBASE] LLM routing: capability={decision.capability}, crypto={decision.crypto}, reason={decision.reasoning[:80]}...")
             return decision
         except Exception as e:
-            logger.error(f"LLM routing failed: {e}, falling back to keyword routing")
-            # Create fallback decision
-            return self._create_fallback_decision(query)
+            logger.error(f"LLM routing failed: {e}")
+            raise CoinbaseAgentError(f"Failed to route query via LLM: {e}")
     
     def _build_capability_routing_prompt(self) -> str:
         """Build a comprehensive prompt for LLM-based capability routing."""
@@ -608,13 +606,24 @@ Use when: User wants to sell crypto for dollars.
 Place a limit order (buy or sell at a specific price).
 Use when: User wants to place an order at a specific limit price.
 
+### orders
+List and check status of existing orders.
+Use when: User asks about their orders, order status, open orders, pending orders, 
+what orders they have, or wants to see their order history.
+
+### fills
+Get fill history - executed trades/order fills.
+Use when: User asks about filled orders, executed trades, trade history,
+what trades have been completed.
+
+### transaction_history
+Get account transaction history - deposits, withdrawals, fees, trades.
+Use when: User asks about transaction history, account activity, deposits,
+withdrawals, fee summary, or general account transactions.
+
 ### cancel
 Cancel an existing order.
 Use when: User wants to cancel an order.
-
-### general
-General crypto questions that can be answered with available data.
-Use when: Query doesn't fit other categories but is crypto-related.
 
 ## Instructions
 1. Analyze the user's query carefully
@@ -636,53 +645,22 @@ Use when: Query doesn't fit other categories but is crypto-related.
 - "Compare Bitcoin and Solana blockchains" → blockchain (crypto=BTC,SOL)
 - "What are the largest Bitcoin transactions today?" → blockchain (crypto=BTC)
 - "Mean and standard deviation of BTC prices this month" → historical (crypto=BTC, time_period=month)
+- "What are my orders?" → orders
+- "Show me my order status" → orders
+- "Status of my orders in coinbase" → orders
+- "Do I have any open orders?" → orders
+- "Show me my transaction history" → transaction_history
+- "What's my account activity?" → transaction_history
+- "Show my fills" → fills
+- "What trades have been executed?" → fills
+- "Show me my recent trades" → fills
 
 Be precise in your selection. If the user mentions historical/past data with statistics, use 'historical'.
 If they want current real-time analysis, use 'analysis'. These are different capabilities.
-If they want a visual chart/plot/graph, use 'chart'."""
-    
-    def _create_fallback_decision(self, query: str) -> CoinbaseToolDecision:
-        """Create a fallback decision using keyword matching when LLM fails."""
-        query_lower = query.lower()
-        crypto = self._extract_crypto(query)
-        
-        # Simple keyword matching as fallback
-        if any(word in query_lower for word in ["chart", "plot", "graph", "draw", "visualize", "visualization"]):
-            return CoinbaseToolDecision(
-                capability="chart",
-                crypto=crypto,
-                reasoning="Fallback: detected chart/visualization keywords"
-            )
-        elif any(word in query_lower for word in ["historical", "history", "past month", "last month", "past week", "last week", "statistics", "mean", "median"]):
-            return CoinbaseToolDecision(
-                capability="historical",
-                crypto=crypto,
-                time_period="month" if "month" in query_lower else "week" if "week" in query_lower else "year" if "year" in query_lower else None,
-                reasoning="Fallback: detected historical/statistics keywords"
-            )
-        elif any(word in query_lower for word in ["blockchain", "block chain", "on-chain", "transaction"]):
-            return CoinbaseToolDecision(
-                capability="blockchain",
-                crypto=crypto,
-                reasoning="Fallback: detected blockchain keywords"
-            )
-        elif any(word in query_lower for word in ["balance", "portfolio", "account"]):
-            return CoinbaseToolDecision(
-                capability="portfolio",
-                reasoning="Fallback: detected portfolio keywords"
-            )
-        elif any(word in query_lower for word in ["price", "quote", "cost"]):
-            return CoinbaseToolDecision(
-                capability="price",
-                crypto=crypto,
-                reasoning="Fallback: detected price keywords"
-            )
-        else:
-            return CoinbaseToolDecision(
-                capability="general",
-                crypto=crypto,
-                reasoning="Fallback: no specific keywords matched"
-            )
+If they want a visual chart/plot/graph, use 'chart'.
+If they ask about existing orders or order status, use 'orders'.
+If they ask about transaction history or account activity, use 'transaction_history'.
+If they ask about filled trades or executed orders, use 'fills'."""
     
     async def _execute_capability(self, decision: CoinbaseToolDecision, query: str) -> str:
         """Execute the selected capability based on LLM decision.
@@ -703,7 +681,8 @@ If they want a visual chart/plot/graph, use 'chart'."""
         
         elif capability == "price":
             crypto = crypto or "BTC"
-            result = await self.get_market_data(f"{crypto}-USD")
+            product_id = self._normalize_product_id(crypto)
+            result = await self.get_market_data(product_id)
             return self._format_price(crypto, result)
         
         elif capability == "historical":
@@ -727,25 +706,21 @@ If they want a visual chart/plot/graph, use 'chart'."""
         elif capability == "order":
             return await self._handle_order_request(query)
         
+        elif capability == "orders":
+            return await self._handle_orders_status_query(query)
+        
         elif capability == "cancel":
             return await self._handle_cancel_request(query)
         
-        else:  # general
-            # Try to provide helpful response based on available data
-            if crypto:
-                result = await self.get_market_data(f"{crypto}-USD")
-                return self._format_price(crypto, result)
-            else:
-                result = await self.get_portfolio_summary()
-                return f"Here's your Coinbase account:\n{self._format_portfolio(result)}"
-    
-    async def _fallback_route_query(self, query: str) -> str:
-        """Fallback routing when LLM is not available.
+        elif capability == "transaction_history":
+            return await self._handle_transaction_history_query(query)
         
-        Uses keyword matching as a backup routing mechanism.
-        """
-        decision = self._create_fallback_decision(query)
-        return await self._execute_capability(decision, query)
+        elif capability == "fills":
+            return await self._handle_fills_query(query)
+        
+        else:
+            # No fallback - require LLM to select a valid capability
+            raise ValueError(f"Unknown capability: {capability}. Valid capabilities are: portfolio, price, historical, blockchain, analysis, buy, sell, order, orders, fills, transaction_history, cancel")
     
     def _extract_crypto(self, query: str) -> str | None:
         """Extract cryptocurrency name/symbol from a query string."""
@@ -759,6 +734,13 @@ If they want a visual chart/plot/graph, use 'chart'."""
             "litecoin": "LTC", "ltc": "LTC",
             "ripple": "XRP", "xrp": "XRP",
             "cardano": "ADA", "ada": "ADA",
+            "zcash": "ZEC", "zec": "ZEC",
+            "avalanche": "AVAX", "avax": "AVAX",
+            "polkadot": "DOT", "dot": "DOT",
+            "chainlink": "LINK", "link": "LINK",
+            "polygon": "MATIC", "matic": "MATIC",
+            "uniswap": "UNI", "uni": "UNI",
+            "shiba": "SHIB", "shib": "SHIB",
         }
         
         for name, symbol in crypto_map.items():
@@ -786,6 +768,28 @@ If they want a visual chart/plot/graph, use 'chart'."""
         elif len(cleaned) == 1:
             return cleaned[0], None
         return None, None
+    
+    def _normalize_product_id(self, crypto: str | None) -> str:
+        """Normalize crypto symbol to Coinbase product_id format.
+        
+        Ensures we don't get double suffixes like ZEC-USD-USD.
+        
+        Args:
+            crypto: Crypto symbol (e.g., 'BTC', 'ZEC-USD', 'eth')
+            
+        Returns:
+            Normalized product_id (e.g., 'BTC-USD')
+        """
+        if not crypto:
+            return "BTC-USD"
+        
+        crypto = crypto.upper().strip()
+        
+        # Already has a trading pair suffix
+        if any(crypto.endswith(suffix) for suffix in ['-USD', '-USDT', '-BTC', '-EUR']):
+            return crypto
+        
+        return f"{crypto}-USD"
 
     def _extract_order_id(self, result: dict[str, Any]) -> str:
         """Extract order ID from a Coinbase API response.
@@ -827,7 +831,7 @@ If they want a visual chart/plot/graph, use 'chart'."""
         if not amount:
             return f"Please specify an amount for your {crypto} order (e.g., 'buy $200 of BTC at $83,000')."
         
-        product_id = f"{crypto}-USD"
+        product_id = self._normalize_product_id(crypto)
         
         try:
             if is_limit and limit_price:
@@ -888,7 +892,8 @@ If they want a visual chart/plot/graph, use 'chart'."""
         
         # Market buy
         try:
-            result = await self.place_market_buy(f"{crypto}-USD", amount)
+            product_id = self._normalize_product_id(crypto)
+            result = await self.place_market_buy(product_id, amount)
             if result.get("success") or result.get("order_id"):
                 order_id = self._extract_order_id(result)
                 return f"✅ Market buy order placed for ${amount} of {crypto}\nOrder ID: {order_id}"
@@ -906,7 +911,8 @@ If they want a visual chart/plot/graph, use 'chart'."""
             return f"Please specify an amount to sell (e.g., 'sell $100 of {crypto}')."
         
         try:
-            result = await self.place_market_sell(f"{crypto}-USD", amount)
+            product_id = self._normalize_product_id(crypto)
+            result = await self.place_market_sell(product_id, amount)
             if result.get("success") or result.get("order_id"):
                 order_id = self._extract_order_id(result)
                 return f"✅ Market sell order placed for ${amount} of {crypto}\nOrder ID: {order_id}"
@@ -914,6 +920,89 @@ If they want a visual chart/plot/graph, use 'chart'."""
                 return f"❌ Failed to place sell order: {result}"
         except Exception as e:
             return f"❌ Error placing sell order: {str(e)}"
+
+    async def _handle_orders_status_query(self, query: str) -> str:
+        """Handle order status queries - list existing orders.
+        
+        Args:
+            query: User query about their orders
+            
+        Returns:
+            Formatted list of orders with status
+        """
+        try:
+            # Get all orders (no filter = all statuses)
+            result = await self.execute_tool("list_orders", {})
+            
+            if not result:
+                return "📋 You don't have any orders in your Coinbase account."
+            
+            orders = result.get("orders", result) if isinstance(result, dict) else result
+            
+            if not orders or (isinstance(orders, list) and len(orders) == 0):
+                return "📋 You don't have any orders in your Coinbase account."
+            
+            if not isinstance(orders, list):
+                orders = [orders]
+            
+            # Format the orders
+            lines = ["📋 **Your Coinbase Orders:**\n"]
+            
+            for order in orders[:20]:  # Limit to 20 orders
+                order_id = order.get("order_id", order.get("id", "unknown"))
+                product_id = order.get("product_id", "unknown")
+                side = order.get("side", "unknown").upper()
+                status = order.get("status", "unknown").upper()
+                
+                # Get order type and price info
+                order_config = order.get("order_configuration", {})
+                order_type = "MARKET"
+                limit_price = None
+                
+                if "limit_limit_gtc" in order_config:
+                    order_type = "LIMIT GTC"
+                    limit_price = order_config["limit_limit_gtc"].get("limit_price")
+                elif "limit_limit_gtd" in order_config:
+                    order_type = "LIMIT GTD"
+                    limit_price = order_config["limit_limit_gtd"].get("limit_price")
+                elif "market_market_ioc" in order_config:
+                    order_type = "MARKET"
+                
+                # Get size/amount
+                size = order.get("filled_size", order.get("base_size", "0"))
+                quote_size = order.get("filled_value", order.get("quote_size", ""))
+                
+                # Status emoji
+                status_emoji = {
+                    "PENDING": "⏳",
+                    "OPEN": "📂",
+                    "FILLED": "✅",
+                    "CANCELLED": "❌",
+                    "CANCELED": "❌",
+                    "EXPIRED": "⌛",
+                    "FAILED": "💥"
+                }.get(status, "❓")
+                
+                line = f"{status_emoji} **{side}** {product_id} | {order_type}"
+                if limit_price:
+                    line += f" @ ${float(limit_price):,.2f}"
+                if size and float(size) > 0:
+                    line += f" | Size: {size}"
+                if quote_size and float(quote_size) > 0:
+                    line += f" | Value: ${float(quote_size):,.2f}"
+                line += f" | Status: {status}"
+                line += f"\n   ID: `{order_id[:12]}...`"
+                
+                lines.append(line)
+            
+            if len(orders) > 20:
+                lines.append(f"\n_...and {len(orders) - 20} more orders_")
+            
+            return "\n".join(lines)
+            
+        except Exception as e:
+            logger.error(f"Error fetching orders: {e}")
+            return f"❌ Error fetching orders: {str(e)}"
 
     async def _handle_cancel_request(self, query: str) -> str:
         """Handle order cancellation requests."""
@@ -956,27 +1045,151 @@ If they want a visual chart/plot/graph, use 'chart'."""
         except Exception as e:
             return f"❌ Error cancelling order: {str(e)}"
 
-    async def _handle_historical_query(self, query: str) -> str:
-        """Handle historical price data queries with statistics.
+    async def _handle_transaction_history_query(self, query: str) -> str:
+        """Handle transaction history/summary queries.
         
-        Fetches historical candle data from Coinbase API and calculates
-        statistics like mean, min, max, standard deviation, and median.
+        Args:
+            query: User query about transaction history or summary
+            
+        Returns:
+            Formatted transaction summary
+        """
+        try:
+            result = await self.execute_tool("get_transaction_summary", {})
+            
+            if not result:
+                return "📊 No transaction summary available."
+            
+            lines = ["📊 **Your Coinbase Transaction Summary:**\n"]
+            
+            # Parse transaction summary response
+            total_volume = result.get("total_volume", 0)
+            total_fees = result.get("total_fees", 0)
+            fee_tier = result.get("fee_tier", {})
+            margin_rate = result.get("margin_rate", {})
+            goods_and_services_tax = result.get("goods_and_services_tax", {})
+            advanced_trade_only_volume = result.get("advanced_trade_only_volume", 0)
+            advanced_trade_only_fees = result.get("advanced_trade_only_fees", 0)
+            
+            if total_volume:
+                lines.append(f"💰 **Total Volume:** ${float(total_volume):,.2f}")
+            if total_fees:
+                lines.append(f"💸 **Total Fees:** ${float(total_fees):,.2f}")
+            if advanced_trade_only_volume:
+                lines.append(f"📈 **Advanced Trade Volume:** ${float(advanced_trade_only_volume):,.2f}")
+            if advanced_trade_only_fees:
+                lines.append(f"📉 **Advanced Trade Fees:** ${float(advanced_trade_only_fees):,.2f}")
+            
+            if fee_tier:
+                pricing_tier = fee_tier.get("pricing_tier", "unknown")
+                maker_fee_rate = fee_tier.get("maker_fee_rate", "N/A")
+                taker_fee_rate = fee_tier.get("taker_fee_rate", "N/A")
+                lines.append(f"\n**Fee Tier:** {pricing_tier}")
+                lines.append(f"  • Maker Fee: {maker_fee_rate}")
+                lines.append(f"  • Taker Fee: {taker_fee_rate}")
+            
+            return "\n".join(lines)
+            
+        except Exception as e:
+            logger.error(f"Error fetching transaction summary: {e}")
+            return f"❌ Error fetching transaction summary: {str(e)}"
+
+    async def _handle_fills_query(self, query: str) -> str:
+        """Handle fills (executed trades) queries.
+        
+        Args:
+            query: User query about fills/executed trades
+            
+        Returns:
+            Formatted list of fills
+        """
+        try:
+            # Try to extract a specific product/crypto if mentioned
+            crypto = self._extract_crypto(query)
+            product_id = self._normalize_product_id(crypto) if crypto else None
+            
+            params = {}
+            if product_id:
+                params["product_id"] = product_id
+            
+            result = await self.execute_tool("get_fills", params)
+            
+            if not result:
+                return "📋 No fills/executed trades found."
+            
+            fills = result.get("fills", result) if isinstance(result, dict) else result
+            
+            if not fills or (isinstance(fills, list) and len(fills) == 0):
+                return "📋 No fills/executed trades found."
+            
+            if not isinstance(fills, list):
+                fills = [fills]
+            
+            lines = ["📋 **Your Recent Fills (Executed Trades):**\n"]
+            
+            for fill in fills[:25]:  # Limit to 25 fills
+                entry_id = fill.get("entry_id", fill.get("id", "unknown"))
+                trade_id = fill.get("trade_id", "")
+                order_id = fill.get("order_id", "")
+                trade_time = fill.get("trade_time", "")
+                trade_type = fill.get("trade_type", "unknown")
+                price = fill.get("price", "0")
+                size = fill.get("size", "0")
+                commission = fill.get("commission", "0")
+                product_id_fill = fill.get("product_id", "unknown")
+                side = fill.get("side", "UNKNOWN").upper()
+                
+                # Side emoji
+                side_emoji = "🟢" if side == "BUY" else "🔴" if side == "SELL" else "❓"
+                
+                line = f"{side_emoji} **{side}** {product_id_fill}"
+                if size:
+                    line += f" | Size: {size}"
+                if price:
+                    line += f" @ ${float(price):,.2f}"
+                if commission:
+                    line += f" | Fee: ${float(commission):,.4f}"
+                if trade_time:
+                    # Format the timestamp
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(trade_time.replace('Z', '+00:00'))
+                        line += f"\n   Time: {dt.strftime('%Y-%m-%d %H:%M')}"
+                    except Exception:
+                        line += f"\n   Time: {trade_time[:16]}"
+                
+                lines.append(line)
+            
+            if len(fills) > 25:
+                lines.append(f"\n_...and {len(fills) - 25} more fills_")
+            
+            return "\n".join(lines)
+            
+        except Exception as e:
+            logger.error(f"Error fetching fills: {e}")
+            return f"❌ Error fetching fills: {str(e)}"
+
+    async def _handle_historical_query(self, query: str) -> str:
+        """Handle historical price data queries with LLM-based analysis.
+        
+        Fetches historical candle data and uses LLM to provide intelligent
+        analysis, not just raw statistics.
         
         Args:
             query: User query about historical prices
             
         Returns:
-            Formatted historical analysis with statistics
+            LLM-generated analysis of historical data
         """
-        import re
         from datetime import datetime, timedelta
+        from langchain_core.messages import SystemMessage, HumanMessage
         import statistics
         
         query_lower = query.lower()
         
         # Determine which crypto
         crypto = self._extract_crypto(query) or "BTC"
-        product_id = f"{crypto}-USD"
+        product_id = self._normalize_product_id(crypto)
         
         # Determine time period and granularity to stay under 350 candles limit
         if "year" in query_lower:
@@ -1076,46 +1289,67 @@ If they want a visual chart/plot/graph, use 'chart'."""
             # Overall high/low
             overall_high = max(high_prices)
             overall_low = min(low_prices)
+            volatility_pct = (price_std / price_mean * 100) if price_mean else 0
             
-            # Build response
-            lines = [f"📈 **{crypto} Historical Price Analysis** ({period_name})\n"]
+            # Build statistics summary for LLM
+            stats_summary = f"""
+{crypto} Historical Data ({period_name}):
+- Period: {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}
+- Data Points: {num_samples} candles
+- Current Price: ${current_price:,.2f}
+- Start Price: ${start_price:,.2f}
+- Change: ${price_change:+,.2f} ({price_change_pct:+.2f}%)
+- Mean: ${price_mean:,.2f}
+- Median: ${price_median:,.2f}
+- Min: ${price_min:,.2f}
+- Max: ${price_max:,.2f}
+- Std Dev: ${price_std:,.2f}
+- Volatility: {volatility_pct:.2f}%
+- Total Volume: {total_volume:,.2f}
+"""
             
-            lines.append("**Summary:**")
-            lines.append(f"• Data Points: {num_samples:,} candles")
-            lines.append(f"• Period: {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}")
-            lines.append("")
+            # Sample price series for LLM to see trends
+            if len(close_prices) > 20:
+                step = len(close_prices) // 20
+                sampled_prices = close_prices[::step]
+            else:
+                sampled_prices = close_prices
             
-            lines.append("**Price Statistics:**")
-            lines.append(f"• Current Price: ${current_price:,.2f}")
-            lines.append(f"• Mean (Average): ${price_mean:,.2f}")
-            lines.append(f"• Median: ${price_median:,.2f}")
-            lines.append(f"• Minimum: ${price_min:,.2f}")
-            lines.append(f"• Maximum: ${price_max:,.2f}")
-            lines.append(f"• Standard Deviation: ${price_std:,.2f}")
-            lines.append(f"• Period High: ${overall_high:,.2f}")
-            lines.append(f"• Period Low: ${overall_low:,.2f}")
-            lines.append("")
+            price_series = "Price samples (chronological): " + " → ".join([f"${p:,.2f}" for p in sampled_prices[-20:]])
             
-            lines.append("**Performance:**")
-            trend_emoji = "📈" if price_change >= 0 else "📉"
-            lines.append(f"• Change: {trend_emoji} ${price_change:+,.2f} ({price_change_pct:+.2f}%)")
-            lines.append(f"• Volatility (Std/Mean): {(price_std/price_mean)*100:.2f}%")
-            lines.append(f"• Price Range: ${overall_high - overall_low:,.2f}")
-            lines.append("")
-            
-            if total_volume > 0:
-                lines.append("**Volume:**")
-                lines.append(f"• Total Volume: {total_volume:,.2f} {crypto}")
-                lines.append(f"• Avg Volume/Candle: {total_volume/num_samples:,.2f} {crypto}")
-                lines.append("")
-            
-            # Check if user asked for chart
-            if any(word in query_lower for word in ["chart", "plot", "graph", "visualize"]):
-                lines.append("📊 *Note: Chart visualization is available in the web interface. Use the Charts button or ask for a specific chart type.*")
-            
-            lines.append(f"\n*Data source: Coinbase Advanced Trade API ({granularity} candles)*")
-            
-            return "\n".join(lines)
+            # Use LLM to analyze if available
+            if self.llm:
+                system_prompt = f"""You are a cryptocurrency analyst. Analyze the provided {crypto} historical data and answer the user's question.
+
+Provide intelligent analysis, not just a repeat of the statistics. Consider:
+- What do these numbers tell us about the asset's behavior?
+- Are there notable patterns or trends?
+- What does the volatility suggest?
+- How does current price compare to the historical average?
+- Any insights for traders based on this data?
+
+Be concise but insightful. Reference specific numbers to support your points."""
+
+                user_prompt = f"""User question: {query}
+
+{stats_summary}
+
+{price_series}
+
+Provide analysis addressing the user's question."""
+
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt)
+                ]
+                
+                response = await self.llm.ainvoke(messages)
+                content = response.content if hasattr(response, 'content') else str(response)
+                
+                return f"📈 **{crypto} Historical Analysis** ({period_name})\n\n{content}"
+            else:
+                # Fallback to basic stats if no LLM
+                return f"📈 **{crypto}** ({period_name}): ${current_price:,.2f} (change: {price_change_pct:+.2f}%)"
             
         except Exception as e:
             logger.error(f"Error fetching historical data: {e}")
@@ -1162,10 +1396,11 @@ If they want a visual chart/plot/graph, use 'chart'."""
             
             all_data = {}
             for crypto in cryptos[:2]:  # Max 2 for comparison
+                product_id = self._normalize_product_id(crypto)
                 candles_result = await self.mcp_server.call_tool(
                     "get_candles",
                     {
-                        "product_id": f"{crypto}-USD",
+                        "product_id": product_id,
                         "start": start_ts,
                         "end": end_ts,
                         "granularity": "SIX_HOUR"
@@ -1355,129 +1590,174 @@ If they want a visual chart/plot/graph, use 'chart'."""
         return '\n'.join(svg_parts)
 
     async def _handle_analysis_query(self, query: str) -> str:
-        """Handle analysis/pattern queries using real-time WebSocket data.
+        """Handle analysis queries using LLM reasoning over actual data.
         
-        Uses the WebSocket candle data for current prices and combines with
-        API data for a comprehensive analysis.
+        This method:
+        1. Parses what time period the user wants (default 2 days for "cycles")
+        2. Fetches historical candle data for that period
+        3. Uses the LLM to actually analyze patterns, cycles, trends
         
         Args:
-            query: User query about patterns or analysis
+            query: User's analysis question
             
         Returns:
-            Formatted analysis response with real data
+            LLM-generated analysis based on real data
         """
+        from datetime import datetime, timedelta
+        from langchain_core.messages import SystemMessage, HumanMessage
+        
         query_lower = query.lower()
         
-        # Determine which crypto to analyze
+        # Determine crypto
         crypto = self._extract_crypto(query) or "BTC"
-        product_id = f"{crypto}-USD"
+        product_id = self._normalize_product_id(crypto)
         
-        # Get real-time data from WebSocket if available
-        realtime_data = None
-        if self.websocket_service:
-            realtime_data = self.websocket_service.get_latest_candle(product_id)
-        
-        # Also get data from Coinbase API for comparison
-        try:
-            api_data = await self.get_market_data(product_id)
-        except Exception as e:
-            logger.warning(f"Failed to get API data: {e}")
-            api_data = None
-        
-        # Build the analysis response
-        lines = [f"📊 **{crypto} Real-Time Analysis**\n"]
-        
-        # Use WebSocket data if available (most current)
-        if realtime_data:
-            close = realtime_data.get("close", "N/A")
-            high = realtime_data.get("high", "N/A")
-            low = realtime_data.get("low", "N/A")
-            open_price = realtime_data.get("open", "N/A")
-            volume = realtime_data.get("volume", "N/A")
-            
-            lines.append("**Current Data** (Real-Time WebSocket):")
-            lines.append(f"• Price: ${close}")
-            lines.append(f"• High: ${high}")
-            lines.append(f"• Low: ${low}")
-            lines.append(f"• Open: ${open_price}")
-            lines.append(f"• Volume: {volume}")
-            
-            # Calculate simple pattern indicators
-            try:
-                close_f = float(close)
-                open_f = float(open_price)
-                high_f = float(high)
-                low_f = float(low)
-                
-                # Price change
-                change = close_f - open_f
-                change_pct = (change / open_f * 100) if open_f > 0 else 0
-                
-                lines.append(f"\n**Pattern Analysis**:")
-                
-                # Trend direction
-                if change > 0:
-                    lines.append(f"• Trend: 📈 Bullish (+${change:.2f}, {change_pct:+.2f}%)")
-                elif change < 0:
-                    lines.append(f"• Trend: 📉 Bearish (${change:.2f}, {change_pct:.2f}%)")
-                else:
-                    lines.append(f"• Trend: ➡️ Sideways (0.00%)")
-                
-                # Volatility (high-low range as % of price)
-                range_size = high_f - low_f
-                volatility = (range_size / close_f * 100) if close_f > 0 else 0
-                if volatility > 3:
-                    lines.append(f"• Volatility: 🔴 High ({volatility:.2f}% range)")
-                elif volatility > 1:
-                    lines.append(f"• Volatility: 🟡 Moderate ({volatility:.2f}% range)")
-                else:
-                    lines.append(f"• Volatility: 🟢 Low ({volatility:.2f}% range)")
-                
-                # Candle pattern
-                body = abs(close_f - open_f)
-                upper_wick = high_f - max(close_f, open_f)
-                lower_wick = min(close_f, open_f) - low_f
-                
-                if body < range_size * 0.1:
-                    lines.append("• Candle Pattern: Doji (indecision)")
-                elif upper_wick > body * 2 and close_f < open_f:
-                    lines.append("• Candle Pattern: Shooting Star (bearish)")
-                elif lower_wick > body * 2 and close_f > open_f:
-                    lines.append("• Candle Pattern: Hammer (bullish)")
-                elif close_f > open_f:
-                    lines.append("• Candle Pattern: Bullish candle")
-                else:
-                    lines.append("• Candle Pattern: Bearish candle")
-                    
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Error calculating patterns: {e}")
-        
-        elif api_data:
-            # Fallback to API data
-            product = api_data.get("product", {})
-            price = product.get("price", "N/A")
-            lines.append("**Current Data** (API):")
-            lines.append(f"• Price: ${price}")
-            
-            bid_ask = api_data.get("bid_ask", {})
-            if bid_ask and "pricebooks" in bid_ask:
-                pricebooks = bid_ask.get("pricebooks", [])
-                if pricebooks:
-                    bids = pricebooks[0].get("bids", [])
-                    asks = pricebooks[0].get("asks", [])
-                    if bids and asks:
-                        bid = bids[0].get("price")
-                        ask = asks[0].get("price")
-                        spread = float(ask) - float(bid) if bid and ask else 0
-                        lines.append(f"• Bid: ${bid}")
-                        lines.append(f"• Ask: ${ask}")
-                        lines.append(f"• Spread: ${spread:.2f}")
+        # Parse time period from query
+        if "hour" in query_lower:
+            hours = 1
+            for word in query_lower.split():
+                if word.isdigit():
+                    hours = int(word)
+                    break
+            days = hours / 24
+            period_name = f"{hours} hour(s)"
+            granularity = "FIVE_MINUTE"
+        elif "day" in query_lower:
+            days = 1
+            for word in query_lower.split():
+                if word.isdigit():
+                    days = int(word)
+                    break
+            period_name = f"{days} day(s)"
+            granularity = "FIFTEEN_MINUTE" if days <= 2 else "ONE_HOUR"
+        elif "week" in query_lower:
+            days = 7
+            period_name = "1 week"
+            granularity = "ONE_HOUR"
+        elif "month" in query_lower:
+            days = 30
+            period_name = "1 month"
+            granularity = "SIX_HOUR"
         else:
-            lines.append("⚠️ Unable to fetch real-time data. Please try again.")
+            # Default to 2 days for analysis queries
+            days = 2
+            period_name = "2 days"
+            granularity = "FIFTEEN_MINUTE"
         
-        lines.append("\n*Data source: Coinbase Advanced Trade*")
+        # Fetch historical data
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(days=days)
+        start_ts = str(int(start_time.timestamp()))
+        end_ts = str(int(end_time.timestamp()))
         
-        return "\n".join(lines)
+        try:
+            candles_result = await self.mcp_server.call_tool(
+                "get_candles",
+                {
+                    "product_id": product_id,
+                    "start": start_ts,
+                    "end": end_ts,
+                    "granularity": granularity
+                }
+            )
+            
+            # Parse candles into a data structure
+            candles = []
+            raw_candles = candles_result.get('candles', []) if isinstance(candles_result, dict) else []
+            
+            for candle in raw_candles:
+                if isinstance(candle, dict):
+                    candles.append({
+                        "time": datetime.fromtimestamp(int(candle.get('start', 0))).strftime('%Y-%m-%d %H:%M'),
+                        "open": float(candle.get('open', 0)),
+                        "high": float(candle.get('high', 0)),
+                        "low": float(candle.get('low', 0)),
+                        "close": float(candle.get('close', 0)),
+                        "volume": float(candle.get('volume', 0))
+                    })
+                elif hasattr(candle, 'close'):
+                    candles.append({
+                        "time": datetime.fromtimestamp(int(candle.start)).strftime('%Y-%m-%d %H:%M'),
+                        "open": float(candle.open),
+                        "high": float(candle.high),
+                        "low": float(candle.low),
+                        "close": float(candle.close),
+                        "volume": float(candle.volume)
+                    })
+            
+            if not candles:
+                return f"❌ Unable to fetch historical data for {crypto}."
+            
+            # Sort by time
+            candles.sort(key=lambda x: x['time'])
+            
+            # Calculate some basic stats to include
+            closes = [c['close'] for c in candles]
+            highs = [c['high'] for c in candles]
+            lows = [c['low'] for c in candles]
+            
+            price_range = max(highs) - min(lows)
+            current_price = closes[-1] if closes else 0
+            start_price = closes[0] if closes else 0
+            change_pct = ((current_price - start_price) / start_price * 100) if start_price else 0
+            
+            # Format candle data for LLM (sample if too many)
+            if len(candles) > 50:
+                # Sample every Nth candle to keep it manageable
+                step = len(candles) // 50
+                sampled = candles[::step]
+            else:
+                sampled = candles
+            
+            candle_text = "Time | Open | High | Low | Close | Volume\n"
+            candle_text += "-" * 60 + "\n"
+            for c in sampled:
+                candle_text += f"{c['time']} | ${c['open']:.2f} | ${c['high']:.2f} | ${c['low']:.2f} | ${c['close']:.2f} | {c['volume']:.2f}\n"
+            
+            # Build prompt for LLM analysis
+            system_prompt = f"""You are a cryptocurrency market analyst. Analyze the provided {crypto} price data and answer the user's specific question.
+
+Focus on EXACTLY what the user asked about. If they ask about:
+- Cycles: Look for repeating patterns, oscillations between highs and lows
+- Trends: Identify direction (upward, downward, sideways)
+- Patterns: Look for chart patterns, support/resistance levels
+- Volatility: Analyze price swings and range
+
+Be specific with your analysis:
+- Reference actual prices and times from the data
+- Quantify patterns (e.g., "price oscillated between $X and $Y every ~N hours")
+- Give actionable insights based on the patterns you find
+
+Data period: {period_name}
+Number of data points: {len(candles)}
+Price range: ${min(lows):.2f} - ${max(highs):.2f}
+Change over period: {change_pct:+.2f}%"""
+
+            user_prompt = f"""User question: {query}
+
+Here is the actual {crypto} price data for the last {period_name}:
+
+{candle_text}
+
+Analyze this data and answer the user's question. Be specific about patterns, cycles, or trends you observe."""
+
+            # Use LLM to analyze
+            if self.llm:
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt)
+                ]
+                
+                response = await self.llm.ainvoke(messages)
+                content = response.content if hasattr(response, 'content') else str(response)
+                
+                return f"📊 **{crypto} Analysis** ({period_name})\n\n{content}"
+            else:
+                return f"❌ LLM not available for analysis."
+                
+        except Exception as e:
+            logger.error(f"Analysis error: {e}")
+            return f"❌ Error analyzing {crypto}: {str(e)}"
 
     async def _handle_blockchain_query(self, query: str) -> str:
         """Handle blockchain data queries (transactions, blocks, stats).

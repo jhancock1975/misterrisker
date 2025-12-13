@@ -378,35 +378,9 @@ If you don't need to call a tool, just respond normally with text."""
             self.conversation_history.append(AIMessage(content=response))
             return response
         
-        # Check if this is an image generation request (handle separately)
-        if self._is_image_generation_request(user_message):
-            logger.info(">>> IMAGE GENERATION request detected")
-            try:
-                image_result = await self.generate_image(user_message)
-                
-                if image_result.get("type") == "error":
-                    logger.warning(f"Image generation failed: {image_result.get('content')}")
-                    # Fall through to normal processing
-                else:
-                    # Wrap the content for frontend rendering
-                    response_text = self._wrap_generated_content(
-                        image_result["type"],
-                        image_result["content"],
-                        image_result.get("description", "")
-                    )
-                    
-                    # Add to conversation history
-                    self.conversation_history.append(HumanMessage(content=user_message))
-                    self.conversation_history.append(AIMessage(content=response_text))
-                    
-                    logger.info(f"<<< Image generation completed: type={image_result['type']}")
-                    return response_text
-            except Exception as e:
-                logger.error(f"Image generation error: {e}", exc_info=True)
-                # Fall through to normal processing
-        
         # === SUPERVISOR AGENT PATTERN ===
         # Mister Risker (supervisor) decides which sub-agent to use
+        # The supervisor uses LLM to route ALL requests, including image generation
         if self.use_agents and self.supervisor_agent:
             logger.info(">>> SUPERVISOR AGENT routing query")
             try:
@@ -445,109 +419,19 @@ If you don't need to call a tool, just respond normally with text."""
                 
             except SupervisorAgentError as e:
                 logger.error(f"Supervisor agent error: {e}")
-                # Fall through to legacy handling
+                error_msg = f"Error processing your request: {str(e)}"
+                self.conversation_history.append(AIMessage(content=error_msg))
+                return error_msg
             except Exception as e:
                 logger.error(f"Supervisor error: {e}", exc_info=True)
-                # Fall through to legacy handling
+                error_msg = f"Error processing your request: {str(e)}"
+                self.conversation_history.append(AIMessage(content=error_msg))
+                return error_msg
         
-        # === LEGACY FALLBACK (when supervisor not available) ===
-        logger.info(f"Using legacy flow (supervisor not available)")
-        
-        # Early check for broker availability on trading-related queries
-        trading_keywords = ["balance", "buy", "sell", "order", "position", "account", "portfolio", "trade"]
-        if any(kw in lower_message for kw in trading_keywords):
-            if self.active_broker == "coinbase":
-                if not self.coinbase_server and not self.coinbase_agent:
-                    other_broker_msg = " (Schwab is available - say 'switch to schwab' to use it)" if self.schwab_server or self.schwab_agent else ""
-                    return f"Error: Coinbase not configured. Please set your Coinbase API credentials in the .env file.{other_broker_msg}"
-            elif self.active_broker == "schwab":
-                if not self.schwab_server and not self.schwab_agent:
-                    other_broker_msg = " (Coinbase is available - say 'switch to coinbase' to use it)" if self.coinbase_server or self.coinbase_agent else ""
-                    return f"Error: Schwab not configured. Please set your Schwab API credentials in the .env file.{other_broker_msg}"
-        
-        # Check for research-related queries and delegate to researcher agent
-        research_keywords = ["news", "research", "analyze", "analysis", "earnings", "financials", "recommend", "recommendation"]
-        if self.researcher_agent and any(kw in lower_message for kw in research_keywords):
-            logger.info(">>> LEGACY: Delegating to Researcher Agent")
-            try:
-                # Add to conversation history
-                self.conversation_history.append(HumanMessage(content=user_message))
-                
-                # Execute research
-                result = await self.researcher_agent.run(
-                    query=user_message,
-                    messages=self._format_history_for_agent(),
-                    config=self._get_agent_config()
-                )
-                
-                if result.get("status") == "success":
-                    response_text = result.get("response", "Research completed.")
-                    self.conversation_history.append(AIMessage(content=response_text))
-                    self.last_agent_used = "researcher"
-                    self.last_supervisor_logs = [
-                        f"[LEGACY] Detected research query",
-                        f"[LEGACY] Delegated to Researcher Agent",
-                        f"[LEGACY] Research completed successfully"
-                    ]
-                    logger.info("<<< LEGACY: Research delegation completed")
-                    return response_text
-            except Exception as e:
-                logger.error(f"Research delegation error: {e}", exc_info=True)
-                # Fall through to normal processing
-        
-        # Add user message to history
-        self.conversation_history.append(HumanMessage(content=user_message))
-        
-        # Build messages for LLM with current broker context
-        system_prompt = self.system_prompt.format(broker=self.active_broker.upper())
-        messages = [
-            SystemMessage(content=system_prompt),
-            *self.conversation_history
-        ]
-        
-        try:
-            # Get LLM response
-            response = await self.llm.ainvoke(messages)
-            response_text = self._extract_content(response.content)
-            
-            # Check if LLM wants to call a tool
-            tool_call = self._extract_tool_call(response_text)
-            
-            if tool_call:
-                # Execute the tool on the appropriate broker
-                tool_result = await self._execute_tool(
-                    tool_call["tool"],
-                    tool_call.get("params", {})
-                )
-                
-                # Get LLM to interpret the result
-                self.conversation_history.append(AIMessage(content=f"Tool result: {json.dumps(tool_result, indent=2)}"))
-                
-                interpret_messages = [
-                    SystemMessage(content=f"""You are Mister Risker, a helpful trading assistant. 
-Interpret the following tool result and explain it to the user in a friendly, clear way.
-Current broker: {self.active_broker.upper()}
-- Format currency amounts with $ signs and appropriate decimal places
-- Format crypto amounts with appropriate precision
-- List each account/balance/position on its own line
-- Highlight important information
-- Be concise but informative
-- Don't mention JSON or technical details"""),
-                    HumanMessage(content=f"The user asked: {user_message}\n\nTool called: {tool_call['tool']}\n\nResult: {json.dumps(tool_result, indent=2)}")
-                ]
-                
-                interpretation = await self.llm.ainvoke(interpret_messages)
-                response_text = self._extract_content(interpretation.content)
-            
-            # Add response to history
-            self.conversation_history.append(AIMessage(content=response_text))
-            
-            return response_text
-            
-        except Exception as e:
-            error_msg = f"Error processing message: {str(e)}"
-            self.conversation_history.append(AIMessage(content=error_msg))
-            return error_msg
+        # If supervisor is not available, return error - no legacy fallback
+        error_msg = "Supervisor agent is not available. Please check your configuration."
+        self.conversation_history.append(AIMessage(content=error_msg))
+        return error_msg
     
     async def process_message_with_image(self, user_message: str, image_data: str) -> str:
         """Process a user message with an attached image using vision capabilities.
@@ -821,83 +705,7 @@ Current active broker: {self.active_broker.upper()}"""
             pass
         
         return None
-    
-    def _is_research_query(self, message: str) -> bool:
-        """Detect if a message is a research query that should use the researcher agent.
-        
-        Args:
-            message: User message
-        
-        Returns:
-            True if this is a research query
-        """
-        lower_msg = message.lower()
-        
-        # Research indicators
-        research_keywords = [
-            "research", "analyze", "analysis", "what do you think",
-            "should i buy", "should i sell", "should i invest",
-            "news", "latest", "what happened", "tell me about",
-            "compare", "vs", "versus", "which is better",
-            "risk", "outlook", "forecast", "prediction",
-            "earnings", "financials", "pe ratio", "market cap",
-            "recommendation", "analyst", "rating"
-        ]
-        
-        matched = [kw for kw in research_keywords if kw in lower_msg]
-        is_research = len(matched) > 0
-        logger.debug(f"  _is_research_query: matched_keywords={matched}, is_research={is_research}")
-        
-        return is_research
-    
-    def _is_image_generation_request(self, message: str) -> bool:
-        """Detect if a message is requesting image/visual content generation.
-        
-        This method distinguishes between:
-        - Generic image/art generation ("draw a cat", "create logo") → Image generator
-        - Data visualization requests ("plot BTC prices", "chart correlation") → Agent
-        
-        Args:
-            message: User message
-        
-        Returns:
-            True if this is a generic image generation request (not data visualization)
-        """
-        lower_msg = message.lower()
-        import re
-        
-        # Data visualization keywords - these should go to agents, not image generator
-        # The agent can use actual data to create meaningful visualizations
-        # Use word boundaries to avoid false matches (e.g., "eth" in "something")
-        data_viz_patterns = [
-            r"\bplot\b", r"\bchart\b", r"\bgraph\b", r"\bhistogram\b", r"\bscatter\b",
-            r"\bcorrelation\b", r"\btrend\b", r"\bprice\b", r"\bprices\b", r"\bdata\b",
-            r"\bstatistics\b", r"\bstats\b", r"\bperformance\b", r"\bportfolio\b",
-            r"\bbitcoin\b", r"\bbtc\b", r"\bethereum\b", r"\beth\b", r"\bsolana\b", r"\bsol\b",
-            r"\bstock\b", r"\bstocks\b", r"\bmarket\b", r"\btrading\b", r"\bhistorical\b"
-        ]
-        
-        # If the message contains data visualization keywords, route to agent
-        if any(re.search(pattern, lower_msg) for pattern in data_viz_patterns):
-            return False
-        
-        # Image generation indicators for generic images/art
-        image_keywords = [
-            "draw", "sketch", "create an image", "create a picture",
-            "generate an svg", "generate svg", "make an svg", "make svg",
-            "create an animation", "make an animation", "animate",
-            "visualization", "visualize", "create a graphic", "make a graphic",
-            "show me a graphic", "show me a picture", "show me an image",
-            "design", "illustrate", "render"
-        ]
-        
-        # Check for keyword matches
-        for keyword in image_keywords:
-            if keyword in lower_msg:
-                return True
-        
-        return False
-    
+
     async def generate_image(self, prompt: str) -> dict:
         """Generate an image (SVG or animation) based on the user's prompt.
         

@@ -105,18 +105,49 @@ def mock_mcp_server():
         {"name": "get_portfolios", "description": "Get portfolios"},
         {"name": "get_portfolio_breakdown", "description": "Get portfolio breakdown"},
         {"name": "get_candles", "description": "Get candles"},
-        {"name": "get_transaction_summary", "description": "Get fees"},
+        {"name": "get_transaction_summary", "description": "Get transaction summary"},
+        {"name": "get_fills", "description": "Get fills"},
     ]
     
     return server
 
 
 @pytest.fixture
-def coinbase_agent(mock_mcp_server):
-    """Create a Coinbase agent with mocked MCP server."""
+def mock_llm():
+    """Create a mock LLM for testing."""
+    from unittest.mock import MagicMock, AsyncMock
+    from agents.coinbase_agent import CoinbaseToolDecision
+    
+    llm = MagicMock()
+    
+    # Create a proper CoinbaseToolDecision object for the structured output router
+    mock_decision = CoinbaseToolDecision(
+        capability="price",
+        crypto="ETH",
+        reasoning="User wants price information for Ethereum"
+    )
+    
+    # Create the tool router mock that returns the decision
+    tool_router = MagicMock()
+    tool_router.invoke = MagicMock(return_value=mock_decision)
+    
+    # with_structured_output should return the tool_router
+    llm.with_structured_output = MagicMock(return_value=tool_router)
+    
+    # Regular invoke for other LLM calls (like CoT)
+    mock_response = MagicMock()
+    mock_response.content = "Analysis complete"
+    llm.invoke = MagicMock(return_value=mock_response)
+    
+    return llm
+
+
+@pytest.fixture
+def coinbase_agent(mock_mcp_server, mock_llm):
+    """Create a Coinbase agent with mocked MCP server and LLM."""
     from agents.coinbase_agent import CoinbaseAgent
     
-    agent = CoinbaseAgent(mcp_server=mock_mcp_server)
+    agent = CoinbaseAgent(mcp_server=mock_mcp_server, llm=mock_llm)
     return agent
 
 

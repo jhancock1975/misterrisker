@@ -522,17 +522,22 @@ Include entry prices, take profit levels, stop losses, and your reasoning based 
         if self.coinbase_agent:
             capabilities.append("""
 ## Coinbase Agent (agent="coinbase")
-**Purpose**: Cryptocurrency trading, real-time market data, AND blockchain queries
+**Purpose**: Cryptocurrency trading, real-time market data, blockchain queries, AND account history
 **Capabilities**:
-- Access to YOUR Coinbase account: balances, portfolio, transaction history
+- Access to YOUR Coinbase account: balances, portfolio, positions
+- **TRANSACTION HISTORY**: Account activity, deposits, withdrawals, fees, trade summary
+- **FILLS/TRADES**: Executed orders, fill history, completed trades
+- **ORDERS**: View, place, and cancel orders (market and limit orders)
 - Real-time WebSocket price feeds for BTC, ETH, SOL, XRP, ZEC (ACCURATE live prices)
-- Place buy/sell orders for cryptocurrencies
 - **BLOCKCHAIN DATA**: On-chain transactions, blocks, largest transactions, blockchain analytics
 - Technical analysis with live candle data (OHLCV)
 - Pattern detection: bullish/bearish trends, volatility analysis
 - **DATA CHARTS**: Generate actual price charts, correlation plots, performance graphs with REAL data
 **Use when**: 
 - User asks about crypto prices, wants to trade crypto, check crypto balances
+- User asks about **transaction history**, **account activity**, or **trades**
+- User asks about **fills** or **executed trades**
+- User asks about **order status** or **my orders**
 - User asks about **blockchain transactions** (e.g., "largest transactions on Solana blockchain")
 - User asks about **on-chain data** for any cryptocurrency
 - User mentions "blockchain" + a crypto name (Bitcoin, Ethereum, Solana, etc.)
@@ -553,8 +558,11 @@ route to Coinbase - this is blockchain data, NOT stock ticker "SOL"!
 - Option chains and options pricing
 - Place equity and options orders
 - View positions, market movers, market hours
-- Account balances and transaction history
+- Account balances and **transaction history**
+- Order status, open orders, executed orders
 **Use when**: User asks about stocks, equities, options, or anything stock-related
+- User asks about **transaction history** for stocks
+- User asks about **order status** for stock orders
 **Common stock symbols this handles**: AAPL, TSLA, NVDA, AMD, GOOG, GOOGL, MSFT, AMZN, META, 
 MU (Micron), INTC (Intel), NFLX, and ALL OTHER stock ticker symbols
 **KEY DISTINCTION**: If user mentions a stock symbol (like MU, AAPL, NVDA, etc.) and wants 

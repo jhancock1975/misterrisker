@@ -370,31 +370,55 @@ Conduct a thorough risk assessment step by step:
         
         return ""
     
-    def detect_reasoning_type(self, query: str) -> ReasoningType:
-        """Detect the appropriate reasoning type from a query.
+    def detect_reasoning_type(self, query: str, llm: Any = None) -> ReasoningType:
+        """Detect the appropriate reasoning type from a query using LLM.
         
         Args:
             query: User query string
+            llm: Language model instance (required)
         
         Returns:
             Detected ReasoningType
         """
-        query_lower = query.lower()
+        if not llm:
+            # If no LLM provided, default to GENERAL
+            return ReasoningType.GENERAL
         
-        # Decision indicators
-        if any(word in query_lower for word in ["should i", "should we", "recommend", "buy or", "sell or"]):
-            return ReasoningType.DECISION
+        import json
         
-        # Comparison indicators
-        if any(word in query_lower for word in ["compare", "vs", "versus", "better", "which one"]):
-            return ReasoningType.COMPARISON
-        
-        # Risk indicators
-        if any(word in query_lower for word in ["risk", "danger", "volatile", "safe", "downside"]):
-            return ReasoningType.RISK_ASSESSMENT
-        
-        # Analysis indicators
-        if any(word in query_lower for word in ["analyze", "analysis", "evaluate", "assess", "review"]):
-            return ReasoningType.ANALYSIS
-        
-        return ReasoningType.GENERAL
+        system_prompt = """Analyze the user's query and determine the type of reasoning needed.
+
+Types:
+- DECISION: User is asking whether to buy/sell, asking for recommendations, or needs a decision
+- COMPARISON: User is comparing two or more options, asking which is better
+- RISK_ASSESSMENT: User is asking about risk, volatility, safety, or downside
+- ANALYSIS: User wants detailed analysis, evaluation, or assessment
+- GENERAL: General question that doesn't fit the above
+
+Return JSON only: {"reasoning_type": "DECISION|COMPARISON|RISK_ASSESSMENT|ANALYSIS|GENERAL"}"""
+
+        try:
+            response = llm.invoke([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query}
+            ])
+            
+            content = response.content
+            if isinstance(content, list):
+                content = content[0].get("text", "") if content else ""
+            
+            result = json.loads(content)
+            reasoning_type_str = result.get("reasoning_type", "GENERAL").upper()
+            
+            type_map = {
+                "DECISION": ReasoningType.DECISION,
+                "COMPARISON": ReasoningType.COMPARISON,
+                "RISK_ASSESSMENT": ReasoningType.RISK_ASSESSMENT,
+                "ANALYSIS": ReasoningType.ANALYSIS,
+                "GENERAL": ReasoningType.GENERAL,
+            }
+            
+            return type_map.get(reasoning_type_str, ReasoningType.GENERAL)
+            
+        except Exception:
+            return ReasoningType.GENERAL

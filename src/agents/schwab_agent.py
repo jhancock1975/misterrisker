@@ -446,39 +446,116 @@ class SchwabAgent:
             Dict with 'response' and 'status' keys
         """
         try:
-            # Determine what tool to call based on the query
-            query_lower = query.lower()
+            # Use LLM to understand user intent and route appropriately
+            from langchain_core.messages import SystemMessage, HumanMessage
+            import json
             
-            # Route to appropriate tool based on query content
-            if any(word in query_lower for word in ["balance", "account", "cash", "value", "worth"]):
-                result = await self.get_account_summary()
-                response = f"Here's your Schwab account summary:\n{self._format_account_summary(result)}"
-            elif any(word in query_lower for word in ["position", "holding", "portfolio", "stock", "own"]):
-                result = await self.get_portfolio()
-                response = f"Here are your current positions:\n{self._format_positions(result)}"
-            elif any(word in query_lower for word in ["quote", "price"]):
-                # Extract symbol from query (basic extraction)
-                symbols = self._extract_symbols(query)
-                if symbols:
-                    result = await self.get_stock_price(symbols[0])
-                    response = f"Quote for {symbols[0]}:\n{self._format_quote(result)}"
-                else:
-                    response = "Please specify a stock symbol to get a quote."
-            elif any(word in query_lower for word in ["order", "trade"]):
+            routing_prompt = """You are a trading assistant router. Analyze the user's request and determine what action to take.
+
+Return a JSON object with:
+- intent: one of "place_order", "cancel_order", "check_orders", "get_quote", "account_balance", "portfolio", "market_movers", "market_hours", "transaction_history", "top_stocks"
+- details: any relevant extracted details (symbol, quantity, price, order_type, order_id, etc.)
+
+Intent definitions:
+- "place_order": User wants to BUY or SELL securities (stocks, options)
+- "cancel_order": User wants to CANCEL an existing order
+- "check_orders": User wants to VIEW their existing orders
+- "get_quote": User wants current price/quote for a symbol
+- "account_balance": User wants to see account balance, cash, buying power
+- "portfolio": User wants to see positions/holdings
+- "market_movers": User wants to see what's moving in the market, top gainers/losers
+- "market_hours": User wants to know if market is open
+- "transaction_history": User wants to see recent transactions, trades, activity history
+- "top_stocks": User wants to see top/popular stocks, stock rankings, or screen for stocks
+
+Examples:
+- "buy 10 shares of AAPL" → {"intent": "place_order", "details": {"action": "buy", "symbol": "AAPL", "quantity": 10}}
+- "put in a limit order to buy NVDA at 160" → {"intent": "place_order", "details": {"action": "buy", "symbol": "NVDA", "price": 160, "order_type": "limit"}}
+- "cancel the order" → {"intent": "cancel_order", "details": {}}
+- "show me my orders" → {"intent": "check_orders", "details": {}}
+- "what's the price of TSLA" → {"intent": "get_quote", "details": {"symbol": "TSLA"}}
+- "show me my recent transactions" → {"intent": "transaction_history", "details": {}}
+- "top 100 stocks" → {"intent": "top_stocks", "details": {"count": 100}}
+- "what are the top movers today" → {"intent": "market_movers", "details": {}}
+
+Return ONLY the JSON object."""
+
+            messages = [
+                SystemMessage(content=routing_prompt),
+                HumanMessage(content=query)
+            ]
+            
+            llm_response = await self.llm.ainvoke(messages)
+            content = llm_response.content
+            
+            # Handle list content from some LLMs
+            if isinstance(content, list):
+                content = content[0] if content else "{}"
+                if isinstance(content, dict):
+                    content = content.get("text", str(content))
+            content = str(content).strip()
+            
+            # Clean markdown if present
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+            
+            routing = json.loads(content)
+            intent = routing.get("intent", "account_balance")
+            details = routing.get("details", {})
+            
+            # Execute based on LLM-determined intent
+            if intent == "place_order":
+                response = await self._handle_order_request(query)
+            elif intent == "cancel_order":
+                response = await self._handle_cancel_order(query, details)
+            elif intent == "check_orders":
                 result = await self.get_open_orders()
                 response = f"Here are your recent orders:\n{self._format_orders(result)}"
-            elif any(word in query_lower for word in ["market", "today", "mover", "movers"]):
+            elif intent == "get_quote":
+                symbol = details.get("symbol", "").upper()
+                if symbol:
+                    result = await self.get_stock_price(symbol)
+                    response = f"Quote for {symbol}:\n{self._format_quote(result)}"
+                else:
+                    # Try to extract from original query
+                    symbols = self._extract_symbols(query)
+                    if symbols:
+                        result = await self.get_stock_price(symbols[0])
+                        response = f"Quote for {symbols[0]}:\n{self._format_quote(result)}"
+                    else:
+                        response = "Please specify a stock symbol to get a quote."
+            elif intent == "portfolio":
+                result = await self.get_portfolio()
+                response = f"Here are your current positions:\n{self._format_positions(result)}"
+            elif intent == "market_movers":
                 result = await self.get_market_movers()
                 response = f"Here's what's moving in the market today:\n{self._format_market_movers(result)}"
-            else:
-                # Default to account summary
+            elif intent == "market_hours":
+                result = await self.get_market_hours()
+                is_open = result.get("equity", {}).get("EQ", {}).get("isOpen", False)
+                response = f"The market is currently {'**open**' if is_open else '**closed**'}."
+            elif intent == "transaction_history":
+                result = await self.get_transactions()
+                response = f"Here's your recent transaction history:\n{self._format_transactions(result)}"
+            elif intent == "top_stocks":
+                # Get top movers as proxy for "top stocks"
+                result = await self.get_market_movers()
+                response = f"Here are today's top stock movers:\n{self._format_market_movers(result)}"
+            else:  # account_balance or default
                 result = await self.get_account_summary()
-                response = f"Here's your Schwab account information:\n{self._format_account_summary(result)}"
+                response = f"Here's your Schwab account summary:\n{self._format_account_summary(result)}"
             
             return {
                 "response": response,
                 "status": "success"
             }
+        except json.JSONDecodeError as e:
+            # LLM failed to return valid JSON - raise error instead of falling back to keywords
+            logger.error(f"LLM returned invalid JSON: {e}")
+            raise SchwabAgentError(f"Failed to route query - LLM returned invalid response: {e}")
         except SchwabAgentError as e:
             return {
                 "response": f"Error accessing Schwab: {str(e)}",
@@ -546,10 +623,17 @@ class SchwabAgent:
         if not data:
             return "No quote data available."
         
+        # API returns {"SYMBOL": {"quote": {...}}} structure
+        # Unwrap the symbol key if present
+        if data and len(data) == 1:
+            symbol_key = next(iter(data.keys()))
+            if isinstance(data[symbol_key], dict):
+                data = data[symbol_key]
+        
         quote = data.get("quote", data)
         price = quote.get("lastPrice", quote.get("mark", 0))
         change = quote.get("netChange", 0)
-        pct = quote.get("netPercentChangeInDouble", 0)
+        pct = quote.get("netPercentChange", quote.get("netPercentChangeInDouble", 0))
         return f"• Price: ${price:,.2f}\n• Change: ${change:+,.2f} ({pct:+.2f}%)"
     
     def _format_orders(self, data: list[dict[str, Any]]) -> str:
@@ -605,6 +689,217 @@ class SchwabAgent:
             lines.append("📊 Market movers data not available in expected format.")
         
         return "\n".join(lines) if lines else "No market mover data available."
+
+    def _format_transactions(self, data: list[dict[str, Any]] | dict[str, Any]) -> str:
+        """Format transaction history for display.
+        
+        Args:
+            data: Transaction data from Schwab API
+            
+        Returns:
+            Formatted string with transaction history
+        """
+        # Handle dict wrapper
+        if isinstance(data, dict):
+            transactions = data.get("transactions", data.get("securitiesAccount", {}).get("transactions", []))
+            if not transactions:
+                transactions = [data] if data else []
+        else:
+            transactions = data if data else []
+        
+        if not transactions:
+            return "No recent transactions found."
+        
+        lines = ["📜 **Recent Transactions:**\n"]
+        
+        for txn in transactions[:20]:  # Limit to 20
+            txn_type = txn.get("type", txn.get("transactionType", "Unknown"))
+            description = txn.get("description", "")
+            date = txn.get("transactionDate", txn.get("settlementDate", ""))[:10]  # Just the date
+            
+            # Get net amount
+            net_amount = txn.get("netAmount", 0)
+            
+            # Get trade details if available
+            trade_info = ""
+            if "transferItems" in txn:
+                for item in txn.get("transferItems", []):
+                    inst = item.get("instrument", {})
+                    symbol = inst.get("symbol", "")
+                    amount = item.get("amount", 0)
+                    if symbol:
+                        trade_info = f" | {symbol}"
+                        if amount:
+                            trade_info += f" ({amount} shares)"
+            
+            # Format line
+            emoji = "💰" if net_amount > 0 else "💸" if net_amount < 0 else "📋"
+            line = f"{emoji} **{date}** - {txn_type}"
+            if description:
+                line += f": {description[:40]}"
+            if trade_info:
+                line += trade_info
+            if net_amount != 0:
+                line += f" | ${net_amount:,.2f}"
+            
+            lines.append(line)
+        
+        if len(transactions) > 20:
+            lines.append(f"\n_...and {len(transactions) - 20} more transactions_")
+        
+        return "\n".join(lines)
+
+    async def _handle_order_request(self, query: str) -> str:
+        """Handle order placement requests using LLM to parse user intent.
+        
+        Args:
+            query: User's order request (e.g., "buy 10 shares of AAPL at $150")
+            
+        Returns:
+            Formatted response about the order
+        """
+        import json
+        from langchain_core.messages import SystemMessage, HumanMessage
+        
+        # Use LLM to parse the order request
+        system_prompt = """You are a trading order parser. Extract order details from user requests.
+        
+Return a JSON object with:
+- action: "buy" or "sell"
+- symbol: stock ticker (uppercase)
+- quantity: number of shares (integer)
+- order_type: "market" or "limit"
+- price: limit price if specified (number, or null for market orders)
+- take_profit: take profit price if specified (number, or null)
+- stop_loss: stop loss price if specified (number, or null)
+
+Example input: "buy 10 shares of AAPL at $150 with take profit at 180 and stop loss at 120"
+Example output: {"action": "buy", "symbol": "AAPL", "quantity": 10, "order_type": "limit", "price": 150, "take_profit": 180, "stop_loss": 120}
+
+Return ONLY the JSON object, no other text."""
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=query)
+        ]
+        
+        try:
+            response = await self.llm.ainvoke(messages)
+            content = response.content
+            
+            # Handle case where content is a list (some LLM responses)
+            if isinstance(content, list):
+                content = content[0] if content else ""
+                if isinstance(content, dict):
+                    content = content.get("text", str(content))
+            
+            content = str(content).strip()
+            
+            # Parse the LLM response
+            # Clean up markdown code blocks if present
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+            
+            order_details = json.loads(content)
+            
+            action = order_details.get("action", "").lower()
+            symbol = order_details.get("symbol", "").upper()
+            quantity = int(order_details.get("quantity", 0))
+            order_type = order_details.get("order_type", "market").lower()
+            price = order_details.get("price")
+            take_profit = order_details.get("take_profit")
+            stop_loss = order_details.get("stop_loss")
+            
+            if not symbol or quantity <= 0:
+                return "I couldn't understand the order details. Please specify the stock symbol and quantity."
+            
+            # Get account hash
+            account_hash = await self._get_account_hash()
+            
+            # Place the main order
+            if order_type == "limit" and price:
+                if action == "buy":
+                    result = await self.place_limit_buy(account_hash, symbol, quantity, float(price))
+                else:
+                    result = await self.place_limit_sell(account_hash, symbol, quantity, float(price))
+                order_desc = f"limit {action} order for {quantity} shares of {symbol} at ${price:,.2f}"
+            else:
+                if action == "buy":
+                    result = await self.place_market_buy(account_hash, symbol, quantity)
+                else:
+                    result = await self.place_market_sell(account_hash, symbol, quantity)
+                order_desc = f"market {action} order for {quantity} shares of {symbol}"
+            
+            # Build response
+            response_lines = [f"✅ Placed {order_desc}"]
+            
+            # Note about bracket orders (take profit / stop loss)
+            if take_profit or stop_loss:
+                response_lines.append("")
+                response_lines.append("⚠️ **Note:** Schwab API requires separate orders for take-profit and stop-loss.")
+                if take_profit:
+                    response_lines.append(f"  • To set take-profit at ${take_profit:,.2f}, place a separate limit sell order")
+                if stop_loss:
+                    response_lines.append(f"  • To set stop-loss at ${stop_loss:,.2f}, place a separate stop order")
+            
+            return "\n".join(response_lines)
+            
+        except json.JSONDecodeError as e:
+            return f"I couldn't parse the order details. Please try again with a clearer format like 'buy 10 shares of AAPL at $150'."
+        except Exception as e:
+            return f"Error placing order: {str(e)}"
+
+    async def _handle_cancel_order(self, query: str, details: dict) -> str:
+        """Handle order cancellation requests.
+        
+        Args:
+            query: User's cancel request
+            details: Extracted details from routing (may contain order_id)
+            
+        Returns:
+            Formatted response about the cancellation
+        """
+        try:
+            # Get account hash
+            account_hash = await self._get_account_hash()
+            
+            # Check if order_id was provided
+            order_id = details.get("order_id")
+            
+            if order_id:
+                # Cancel specific order
+                result = await self.execute_tool("cancel_order", {
+                    "account_hash": account_hash,
+                    "order_id": int(order_id)
+                })
+                return f"✅ Order {order_id} has been cancelled."
+            else:
+                # No order ID - need to find the most recent order
+                orders = await self.get_open_orders()
+                
+                if not orders:
+                    return "You don't have any open orders to cancel."
+                
+                # Get the most recent order
+                if isinstance(orders, list) and len(orders) > 0:
+                    recent_order = orders[0]
+                    order_id = recent_order.get("orderId")
+                    symbol = recent_order.get("orderLegCollection", [{}])[0].get("instrument", {}).get("symbol", "Unknown")
+                    
+                    if order_id:
+                        result = await self.execute_tool("cancel_order", {
+                            "account_hash": account_hash,
+                            "order_id": order_id
+                        })
+                        return f"✅ Cancelled your most recent order (Order #{order_id} for {symbol})."
+                
+                return "I couldn't find an order to cancel. Please specify the order ID."
+                
+        except Exception as e:
+            return f"Error cancelling order: {str(e)}"
 
     async def _get_account_hash(self, account_hash: str | None = None) -> str:
         """Get account hash, using default or fetching first available.
@@ -789,12 +1084,25 @@ class SchwabAgent:
         Returns:
             List of open orders
         """
+        import datetime
         hash_value = await self._get_account_hash(account_hash)
         
-        return await self.execute_tool("get_orders_for_account", {
+        # Schwab API requires both from and to entered datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        from_date = (now - datetime.timedelta(days=60)).strftime("%Y-%m-%dT00:00:00.000Z")
+        to_date = now.strftime("%Y-%m-%dT23:59:59.000Z")
+        
+        # Don't filter by status - get all orders and filter client-side for cancelable ones
+        orders = await self.execute_tool("get_orders_for_account", {
             "account_hash": hash_value,
-            "status": "WORKING"
+            "from_entered_datetime": from_date,
+            "to_entered_datetime": to_date
         })
+        
+        # Filter to only show cancelable orders (open orders)
+        if isinstance(orders, list):
+            return [o for o in orders if o.get("cancelable", False)]
+        return orders
     
     async def get_market_movers(self, index: str = "$SPX") -> dict[str, Any]:
         """Get market movers.
@@ -806,6 +1114,28 @@ class SchwabAgent:
             Market movers data
         """
         return await self.execute_tool("get_movers", {"index": index})
+    
+    async def get_transactions(self, days: int = 30) -> list[dict[str, Any]]:
+        """Get recent transaction history.
+        
+        Args:
+            days: Number of days of history (default: 30)
+        
+        Returns:
+            List of transactions
+        """
+        from datetime import datetime, timedelta, timezone
+        
+        account = await self._get_account_hash()
+        
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=days)
+        
+        return await self.execute_tool("get_transactions", {
+            "account_hash": account,
+            "start_date": start_date.strftime("%Y-%m-%dT00:00:00.000Z"),
+            "end_date": end_date.strftime("%Y-%m-%dT23:59:59.000Z")
+        })
     
     async def get_market_hours(self, markets: list[str] | None = None) -> dict[str, Any]:
         """Get market hours.

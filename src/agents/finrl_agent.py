@@ -229,12 +229,11 @@ class FinRLAgent:
         logger.info(f"[FINRL AGENT] Processing: {query[:50]}...")
         
         try:
-            # Check for specific query types
-            query_lower = query.lower()
+            # Use LLM to determine the intent and extract symbol
+            intent, symbol = await self._llm_analyze_query(query)
             
-            # Train model request
-            if "train" in query_lower and ("model" in query_lower or "finrl" in query_lower):
-                symbol = self._extract_symbol(query) or "BTC-USD"
+            if intent == "train":
+                symbol = symbol or "BTC-USD"
                 result = self.finrl_service.train_model(symbol, total_timesteps=10000)
                 return f"""🎓 **Model Training Complete**
 
@@ -245,21 +244,74 @@ class FinRLAgent:
 
 The model is now ready to generate trading signals!"""
             
-            # Portfolio overview request
-            if any(word in query_lower for word in ["portfolio", "all", "overview", "market"]):
+            elif intent == "portfolio":
                 portfolio = self.finrl_service.get_portfolio_recommendation()
                 return self._format_portfolio(portfolio)
             
-            # Single symbol request
-            symbol = self._extract_symbol(query)
-            if symbol:
+            elif intent == "signal" and symbol:
                 signal = self.finrl_service.get_trading_signal(symbol)
                 return self._format_signal(signal)
             
-            # Default: portfolio overview
-            portfolio = self.finrl_service.get_portfolio_recommendation()
-            return self._format_portfolio(portfolio)
+            else:
+                # Default: portfolio overview
+                portfolio = self.finrl_service.get_portfolio_recommendation()
+                return self._format_portfolio(portfolio)
             
         except Exception as e:
             logger.error(f"[FINRL AGENT] Error: {e}")
             return f"❌ Error generating trading signal: {str(e)}"
+    
+    async def _llm_analyze_query(self, query: str) -> tuple[str, Optional[str]]:
+        """Use LLM to analyze query intent and extract symbol.
+        
+        Args:
+            query: User's query
+            
+        Returns:
+            Tuple of (intent, symbol) where intent is 'train', 'portfolio', or 'signal'
+        """
+        import json
+        import asyncio
+        
+        system_prompt = """Analyze the user's trading query and determine:
+1. Intent: "train" (train a model), "portfolio" (overview of all assets), or "signal" (specific asset trading signal)
+2. Symbol: If asking about specific asset, extract the symbol (e.g., BTC-USD, ETH-USD, AAPL, NVDA)
+
+Symbol mappings:
+- Bitcoin/BTC -> BTC-USD
+- Ethereum/ETH -> ETH-USD  
+- Solana/SOL -> SOL-USD
+- Apple -> AAPL
+- Tesla -> TSLA
+- Nvidia -> NVDA
+- Microsoft -> MSFT
+- Amazon -> AMZN
+- Google -> GOOG
+
+Return JSON only: {"intent": "train|portfolio|signal", "symbol": "SYMBOL-OR-NULL"}"""
+
+        try:
+            response = await asyncio.to_thread(
+                self.llm.invoke,
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query}
+                ]
+            )
+            
+            content = response.content
+            if isinstance(content, list):
+                content = content[0].get("text", "") if content else ""
+            
+            result = json.loads(content)
+            intent = result.get("intent", "portfolio")
+            symbol = result.get("symbol")
+            if symbol in ["null", "NULL", "None", ""]:
+                symbol = None
+                
+            return intent, symbol
+            
+        except Exception as e:
+            logger.warning(f"LLM analysis failed: {e}, defaulting to portfolio")
+            # No fallback to keyword matching - default to portfolio
+            return "portfolio", None
