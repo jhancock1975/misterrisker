@@ -564,6 +564,48 @@ class SchwabAgent:
             lines.append(f"• {symbol}: {status}")
         return "\n".join(lines)
     
+    def _format_market_movers(self, data: dict[str, Any]) -> str:
+        """Format market movers data for display.
+        
+        Args:
+            data: Market movers data from Schwab API
+            
+        Returns:
+            Formatted string with gainers and losers
+        """
+        lines = []
+        
+        # Handle different response formats
+        screeners = data.get("screeners", [])
+        if screeners:
+            for screener in screeners:
+                direction = screener.get("direction", "")
+                instruments = screener.get("instruments", [])
+                
+                if direction.lower() == "up":
+                    lines.append("📈 **Top Gainers:**")
+                elif direction.lower() == "down":
+                    lines.append("📉 **Top Losers:**")
+                else:
+                    lines.append(f"**{direction}:**")
+                
+                for inst in instruments[:5]:  # Top 5
+                    symbol = inst.get("symbol", "?")
+                    desc = inst.get("description", "")[:30]
+                    change = inst.get("netChange", 0)
+                    pct = inst.get("netPercentChange", 0)
+                    last = inst.get("lastPrice", inst.get("last", 0))
+                    
+                    emoji = "🟢" if change >= 0 else "🔴"
+                    lines.append(f"  {emoji} **{symbol}** ${last:,.2f} ({pct:+.2f}%)")
+                
+                lines.append("")
+        else:
+            # Fallback for simple format
+            lines.append("📊 Market movers data not available in expected format.")
+        
+        return "\n".join(lines) if lines else "No market mover data available."
+
     async def _get_account_hash(self, account_hash: str | None = None) -> str:
         """Get account hash, using default or fetching first available.
         

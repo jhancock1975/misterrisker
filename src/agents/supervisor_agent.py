@@ -272,13 +272,16 @@ class SupervisorAgent:
 - **BLOCKCHAIN DATA**: On-chain transactions, blocks, largest transactions, blockchain analytics
 - Technical analysis with live candle data (OHLCV)
 - Pattern detection: bullish/bearish trends, volatility analysis
+- **DATA CHARTS**: Generate actual price charts, correlation plots, performance graphs with REAL data
 **Use when**: 
 - User asks about crypto prices, wants to trade crypto, check crypto balances
 - User asks about **blockchain transactions** (e.g., "largest transactions on Solana blockchain")
 - User asks about **on-chain data** for any cryptocurrency
 - User mentions "blockchain" + a crypto name (Bitcoin, Ethereum, Solana, etc.)
+- **User asks to DRAW, PLOT, CHART, or GRAPH crypto data** (correlation, prices, etc.)
 **CRITICAL**: If user asks about "Solana blockchain" or "Bitcoin blockchain" transactions, 
 route to Coinbase - this is blockchain data, NOT stock ticker "SOL"!
+**CRITICAL**: If user asks to draw/plot/chart crypto prices or correlations, route to Coinbase!
 **Recognized crypto symbols**: BTC, ETH, SOL, XRP, ZEC, Bitcoin, Ethereum, Solana, Ripple, Zcash
 **DO NOT use for**: Stock trading, general web searches, or generating trading strategies with specific limit orders""")
         
@@ -303,16 +306,23 @@ trading advice or limit orders, route to Schwab for stock-specific handling
         if self.researcher_agent:
             capabilities.append("""
 ## Researcher Agent (agent="researcher")
-**Purpose**: Investment research, web search, and external information
+**Purpose**: Investment research, web search, and external information gathering
 **Capabilities**:
-- Web search for news, analyst reports, company information
+- **Web search for ANYTHING**: news, current events, world news, weather, sports
+- Investment research: analyst reports, company information
 - Fundamental analysis: earnings, financials, analyst ratings
 - Sentiment analysis from news and social media
 - Compare investments and companies
 - Risk assessment and investment recommendations
-- General knowledge queries (weather, news, etc.)
-- Access to external data sources via internet search
-**Use when**: User wants research, opinions, news, comparisons, or any external information
+- **CRITICAL**: Use for ANY question that requires external/up-to-date information
+- **CRITICAL**: Use when asked about news, current events, "what's happening with X"
+**Use when**: 
+- User wants research, opinions, news, comparisons
+- User asks about world events, current news, "what about [topic]?"
+- User asks something that requires internet search
+- User asks about topics outside of trading (weather, sports, politics, etc.)
+- You don't have direct knowledge of the answer
+**This agent has INTERNET ACCESS - use it when external info is needed!**
 **DO NOT use for**: 
 - Real-time crypto prices (will hallucinate)
 - Placing trades
@@ -363,8 +373,13 @@ asks "should I buy/sell" from an AI perspective, or wants machine learning-based
 ## Direct Response (agent="direct")
 **Purpose**: Simple interactions that don't need delegation
 **Use when**: Simple greetings ("hi", "hello"), questions about Mister Risker's capabilities,
-or when no other agent is appropriate
-**DO NOT use for**: Any actual trading, research, or analysis tasks""")
+or basic clarifying questions
+**DO NOT use for**: 
+- Any actual trading, research, or analysis tasks
+- News queries (use researcher!)
+- Current events questions (use researcher!)
+- Any question that requires external information (use researcher!)
+- Weather, sports, world events (use researcher!)""")
         
         capabilities_text = "\n".join(capabilities)
         
@@ -394,6 +409,36 @@ When routing, you MUST also extract:
    - "Solana blockchain transactions" → Coinbase (NOT researcher!)
    - "Bitcoin blockchain" anything → Coinbase
    - "largest transactions on [crypto] blockchain" → Coinbase
+8. **NEWS and CURRENT EVENTS** → Researcher (has internet access!)
+   - "What about the world news?" → Researcher
+   - "What's happening in the stock market?" (general news) → Researcher
+   - "Tell me about current events" → Researcher
+   - Any question requiring external/up-to-date information → Researcher
+9. **CHART/PLOT/GRAPH requests for crypto data** → Coinbase
+   - "Draw a chart of BTC prices" → Coinbase
+   - "Plot the price correlation" → Coinbase
+   - "Graph BTC vs ETH" → Coinbase
+   - Any request to visualize crypto price data → Coinbase
+
+## CRITICAL: Follow-Up "Other/Different" Queries
+When user asks about "other", "different", "more", or "else" assets:
+1. Look at the conversation history to see what symbols were already discussed
+2. **EXCLUDE those symbols from the new request**
+3. Provide DIFFERENT assets, not the same ones
+
+Example:
+- Previous: Strategies for BTC, ETH, SOL, XRP, ZEC
+- User: "what about other cryptos?"
+- DO NOT include BTC, ETH, SOL, XRP, ZEC in symbols!
+- Instead, suggest: DOGE-USD, ADA-USD, AVAX-USD, DOT-USD, LINK-USD, etc.
+
+For stocks:
+- Previous: AAPL, TSLA, NVDA
+- User: "what about other stocks?"
+- DO NOT include AAPL, TSLA, NVDA
+- Instead, suggest: AMD, GOOG, MSFT, AMZN, META, etc.
+
+**ALWAYS check conversation history when user says "other" or "different"!**
 
 ## CRITICAL Disambiguation:
 - "Solana blockchain" or "SOL blockchain" = cryptocurrency Solana → route to Coinbase
@@ -442,15 +487,28 @@ if they say "Bitcoin" that's BTC-USD crypto. Extract ALL symbols mentioned."""
         # Add relevant conversation context for better routing decisions
         if conversation_history:
             context_summary = []
+            previously_mentioned_symbols = []
             for msg in conversation_history[-5:]:  # Last 5 messages for context
                 role = msg.get("role", "unknown")
-                content = msg.get("content", "")[:200]  # Truncate for context
+                content = msg.get("content", "")[:500]  # Larger window to capture more symbols
                 context_summary.append(f"{role}: {content}")
+                
+                # Also extract any symbols mentioned in previous messages
+                # Look for crypto patterns (BTC-USD, ETH, etc.) and stock tickers
+                import re
+                symbols_in_msg = re.findall(r'\b([A-Z]{2,5})-USD\b', content)
+                symbols_in_msg.extend(re.findall(r'📊\s*([A-Z]{2,5})', content))
+                previously_mentioned_symbols.extend(symbols_in_msg)
             
             if context_summary:
                 context_text = "\n".join(context_summary)
+                symbols_note = ""
+                if previously_mentioned_symbols:
+                    unique_symbols = list(set(previously_mentioned_symbols))
+                    symbols_note = f"\n\n**PREVIOUSLY DISCUSSED SYMBOLS**: {unique_symbols}\nIf user asks about 'other' or 'different' assets, EXCLUDE these from your response!"
+                
                 messages.append(SystemMessage(
-                    content=f"Recent conversation context:\n{context_text}\n\nNow routing the following new message:"
+                    content=f"Recent conversation context:\n{context_text}{symbols_note}\n\nNow routing the following new message:"
                 ))
         
         # Add current query
