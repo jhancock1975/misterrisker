@@ -24,6 +24,33 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 
 # =============================================================================
+# Mock LLM Fixture for tests that create agents directly
+# =============================================================================
+
+@pytest.fixture
+def mock_llm():
+    """Mock LLM for routing with CoinbaseToolDecision structured output."""
+    from agents.coinbase_agent import CoinbaseToolDecision
+    
+    mock = MagicMock()
+    
+    # Mock the tool router's structured output
+    def mock_with_structured_output(output_class):
+        tool_router = MagicMock()
+        # Return a decision that routes to price capability
+        decision = CoinbaseToolDecision(
+            capability="price",
+            crypto="BTC",
+            reasoning="User is asking about BTC price"
+        )
+        tool_router.invoke = MagicMock(return_value=decision)
+        return tool_router
+    
+    mock.with_structured_output = mock_with_structured_output
+    return mock
+
+
+# =============================================================================
 # Test: BTC Price Analysis Uses Real Data
 # =============================================================================
 
@@ -266,7 +293,7 @@ class TestAnalysisHandler:
             log.info(f"Candle data available for analysis: {candle}")
 
     @pytest.mark.asyncio
-    async def test_analysis_response_includes_current_price(self, log):
+    async def test_analysis_response_includes_current_price(self, log, mock_llm):
         """Analysis responses should include the current real-time price."""
         from agents.coinbase_agent import CoinbaseAgent
         from mcp_servers.coinbase import CoinbaseMCPServer
@@ -285,7 +312,8 @@ class TestAnalysisHandler:
         
         agent = CoinbaseAgent(
             mcp_server=mock_mcp,
-            enable_websocket=True
+            enable_websocket=True,
+            llm=mock_llm
         )
         
         # Set up WebSocket data
@@ -459,7 +487,7 @@ class TestFullAnalysisFlow:
     """Integration tests for complete analysis flow."""
 
     @pytest.mark.asyncio
-    async def test_full_btc_analysis_flow(self, log):
+    async def test_full_btc_analysis_flow(self, log, mock_llm):
         """Test complete flow from query to response with real data."""
         from agents.coinbase_agent import CoinbaseAgent
         from mcp_servers.coinbase import CoinbaseMCPServer
@@ -480,7 +508,8 @@ class TestFullAnalysisFlow:
         
         agent = CoinbaseAgent(
             mcp_server=mock_mcp,
-            enable_websocket=True
+            enable_websocket=True,
+            llm=mock_llm
         )
         
         # Simulate WebSocket data with realistic prices

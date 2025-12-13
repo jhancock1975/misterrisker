@@ -167,10 +167,30 @@ def mock_llm():
     """Create a mock LLM for the agent."""
     llm = MagicMock()
     
-    # Mock response for analysis - use regular MagicMock since invoke is called synchronously
-    mock_response = MagicMock()
-    mock_response.content = "Based on the research data, AAPL appears to be a strong buy. Recommendation: BUY"
-    llm.invoke = MagicMock(return_value=mock_response)
+    # Track call count to return different responses
+    call_count = [0]
+    
+    def mock_invoke(messages):
+        call_count[0] += 1
+        mock_response = MagicMock()
+        
+        # Check if this is a tool selection call or analysis call
+        if isinstance(messages, list) and len(messages) > 0:
+            first_msg = messages[0] if isinstance(messages, list) else messages
+            content = str(first_msg.get("content", "") if isinstance(first_msg, dict) else getattr(first_msg, "content", ""))
+            
+            if "research query analyzer" in content.lower() or "available tools" in content.lower():
+                # Tool selection call - return JSON array of tool calls
+                mock_response.content = '[{"tool": "research_stock", "params": {"symbol": "AAPL"}}]'
+            else:
+                # Analysis/response generation call - return text
+                mock_response.content = "Based on the research data, AAPL appears to be a strong buy. Recommendation: BUY"
+        else:
+            mock_response.content = "Based on the research data, AAPL appears to be a strong buy. Recommendation: BUY"
+        
+        return mock_response
+    
+    llm.invoke = MagicMock(side_effect=mock_invoke)
     llm.bind_tools = MagicMock(return_value=llm)
     
     return llm

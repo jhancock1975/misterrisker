@@ -551,20 +551,29 @@ route to Coinbase - this is blockchain data, NOT stock ticker "SOL"!
         if self.schwab_agent:
             capabilities.append("""
 ## Schwab Agent (agent="schwab")
-**Purpose**: Stock and options trading via Schwab brokerage
+**Purpose**: Stock and options trading AND market data via Schwab brokerage
 **Capabilities**:
+- **REAL-TIME STOCK MARKET DATA**: Stock quotes, prices, bid/ask spreads
+- **Market movers**: Top gainers, losers, most active stocks
+- **Market hours**: Trading sessions, pre-market, after-hours
 - Access to YOUR Schwab brokerage account
 - Stock quotes and real-time equity prices  
 - Option chains and options pricing
 - Place equity and options orders
-- View positions, market movers, market hours
-- Account balances and **transaction history**
+- View positions and portfolio holdings
+- Account balances and **transaction history** for YOUR account
 - Order status, open orders, executed orders
-**Use when**: User asks about stocks, equities, options, or anything stock-related
+**Use when**: 
+- User asks about STOCK PRICES (AAPL, TSLA, any stock quote)
+- User asks about MARKET DATA (movers, gainers, losers)
+- User asks about stocks, equities, options, or anything stock-related
 - User asks about **transaction history** for stocks
 - User asks about **order status** for stock orders
+- User asks "what's the price of [STOCK]?"
+- User asks about "market movers", "top stocks", "biggest gainers/losers"
 **Common stock symbols this handles**: AAPL, TSLA, NVDA, AMD, GOOG, GOOGL, MSFT, AMZN, META, 
 MU (Micron), INTC (Intel), NFLX, and ALL OTHER stock ticker symbols
+**CRITICAL**: This is the ONLY agent that can get STOCK PRICES. For any stock quote, use Schwab!
 **KEY DISTINCTION**: If user mentions a stock symbol (like MU, AAPL, NVDA, etc.) and wants 
 trading advice or limit orders, route to Schwab for stock-specific handling
 **DO NOT use for**: Cryptocurrency trading (use Coinbase instead)""")
@@ -673,19 +682,27 @@ When routing, you MUST also extract:
 1. **"Trade ideas" or "trading strategy"** → Strategy (ALWAYS! generates specific limit order prices)
 2. **"What about other cryptos/stocks?"** → Strategy (generates specific prices for DIFFERENT assets)
 3. **"Give me a limit order/strategy for X"** → Strategy (generates specific prices)
-4. **"What is the current price of X?"** → Coinbase (crypto) or Schwab (stocks)
-5. **"Research X" or "What do analysts think?"** → Researcher
-6. **"Buy/sell X" (execute trade)** → Coinbase (crypto) or Schwab (stocks)
-7. **"Check my balance"** → Coinbase (crypto) or Schwab (stocks)
-8. **AI/ML trading signals** → FinRL
-9. **BLOCKCHAIN queries** (transactions, blocks, on-chain data) → Coinbase
+4. **CRYPTO PRICES** ("BTC price", "ETH value") → **Coinbase** (crypto market data)
+5. **STOCK PRICES** ("AAPL price", "TSLA quote") → **Schwab** (stock market data)
+6. **STOCK MARKET DATA** ("market movers", "top gainers", "biggest losers") → **Schwab**
+7. **"Research X" or "What do analysts think?"** → Researcher
+8. **"Buy/sell X crypto"** (execute crypto trade) → Coinbase
+9. **"Buy/sell X stock"** (execute stock trade) → Schwab
+10. **"Check my crypto balance"** → Coinbase
+11. **"Check my stock balance/positions"** → Schwab
+12. **TRANSACTION HISTORY**:
+    - "What's my transaction history on Coinbase?" → **Coinbase** (fills, trades, account activity)
+    - "Show my stock transaction history" → **Schwab** (stock account transactions)
+13. **AI/ML trading signals** → FinRL
+14. **BLOCKCHAIN queries** (transactions, blocks, on-chain data) → Coinbase
    - "Solana blockchain transactions" → Coinbase (NOT researcher!)
    - "Bitcoin blockchain" anything → Coinbase
    - "largest transactions on [crypto] blockchain" → Coinbase
-10. **NEWS and CURRENT EVENTS** → Researcher (has internet access!)
-11. **CHART/PLOT/GRAPH requests for crypto data** → Coinbase
+15. **NEWS and CURRENT EVENTS** → Researcher (has internet access!)
+16. **CHART/PLOT/GRAPH requests for crypto data** → Coinbase
 
 **CRITICAL**: "trade ideas", "trading recommendations", "what should I trade" → ALWAYS route to Strategy!
+**CRITICAL**: For STOCK quotes/prices, use SCHWAB. For CRYPTO quotes/prices, use COINBASE.
 
 ## CRITICAL: Follow-Up "Other/Different" Queries
 When user asks about "other", "different", "more", or "else" assets:

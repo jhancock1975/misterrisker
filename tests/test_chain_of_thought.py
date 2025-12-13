@@ -24,10 +24,27 @@ logger = logging.getLogger("test.chain_of_thought")
 
 @pytest.fixture
 def mock_llm():
-    """Create a mock LLM that returns CoT responses."""
+    """Create a mock LLM that returns CoT responses and handles query analysis."""
     llm = MagicMock()
-    llm.invoke.return_value = MagicMock(
-        content="""## Reasoning Steps
+    
+    # Track calls to return different responses
+    call_count = [0]
+    
+    def mock_invoke(messages):
+        call_count[0] += 1
+        mock_response = MagicMock()
+        
+        # Check message content to determine response type
+        if isinstance(messages, list) and len(messages) > 0:
+            first_msg = messages[0] if isinstance(messages, list) else messages
+            content = str(first_msg.get("content", "") if isinstance(first_msg, dict) else getattr(first_msg, "content", ""))
+            
+            if "research query analyzer" in content.lower() or "available tools" in content.lower():
+                # Tool selection call - return JSON array
+                mock_response.content = '[{"tool": "research_stock", "params": {"symbol": "AAPL"}}]'
+            else:
+                # CoT/Analysis response
+                mock_response.content = """## Reasoning Steps
 
 1. **Understanding the Query**: The user wants to know about AAPL stock.
 2. **Data Analysis**: Current price is $150.25, up 1.69% today.
@@ -37,7 +54,12 @@ def mock_llm():
 ## Conclusion
 
 Apple (AAPL) is trading at $150.25 with positive momentum. Analysts are bullish."""
-    )
+        else:
+            mock_response.content = "Analysis complete with reasoning steps."
+        
+        return mock_response
+    
+    llm.invoke = MagicMock(side_effect=mock_invoke)
     return llm
 
 
