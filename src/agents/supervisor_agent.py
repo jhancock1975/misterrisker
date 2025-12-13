@@ -220,6 +220,11 @@ class SupervisorAgent:
             else:
                 symbols, asset_type = self._extract_symbols_from_query(message)
             
+            # If still no symbols (generic query like "trade ideas"), use defaults
+            if not symbols:
+                symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ZEC-USD']
+                asset_type = "crypto"
+            
             logger.info(f"[SUPERVISOR] Generating strategy for {symbols} (type: {asset_type})")
             
             if not symbols:
@@ -367,7 +372,10 @@ asks "should I buy/sell" from an AI perspective, or wants machine learning-based
   - "What orders should I place?"
   - "Give me a trading plan for [symbol]"
   - Actionable trade recommendations (not just analysis)
-**This is the RIGHT choice when user wants SPECIFIC PRICES to trade at**""")
+  - **"Trade ideas"** - even generic requests for trade ideas
+  - **"What about other cryptos/stocks?"** - follow-up requests for different assets
+**This is the RIGHT choice when user wants SPECIFIC PRICES to trade at**
+**IMPORTANT**: Any request for "trade ideas" or "trading recommendations" should go to strategy!""")
         
         capabilities.append("""
 ## Direct Response (agent="direct")
@@ -394,43 +402,49 @@ When routing, you MUST also extract:
 1. **symbols**: List of trading symbols mentioned (e.g., ["BTC-USD", "AAPL", "ETH-USD"])
    - For crypto: use format "XXX-USD" (e.g., "BTC-USD", "ETH-USD")
    - For stocks: use ticker symbol (e.g., "AAPL", "MU", "TSLA")
+   - **For generic queries like "trade ideas" or "trading strategy" with no specific symbols**:
+     Use ALL available cryptos: ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ZEC-USD"]
 2. **asset_type**: "crypto", "stock", "mixed", or "unknown"
 
 # Routing Decision Guidelines
 
 ## Key Routing Rules:
-1. **"Give me a limit order/strategy for X"** → Strategy (generates specific prices)
-2. **"What is the current price of X?"** → Coinbase (crypto) or Schwab (stocks)
-3. **"Research X" or "What do analysts think?"** → Researcher
-4. **"Buy/sell X" (execute trade)** → Coinbase (crypto) or Schwab (stocks)
-5. **"Check my balance"** → Coinbase (crypto) or Schwab (stocks)
-6. **AI/ML trading signals** → FinRL
-7. **BLOCKCHAIN queries** (transactions, blocks, on-chain data) → Coinbase
+1. **"Trade ideas" or "trading strategy"** → Strategy (ALWAYS! generates specific limit order prices)
+2. **"What about other cryptos/stocks?"** → Strategy (generates specific prices for DIFFERENT assets)
+3. **"Give me a limit order/strategy for X"** → Strategy (generates specific prices)
+4. **"What is the current price of X?"** → Coinbase (crypto) or Schwab (stocks)
+5. **"Research X" or "What do analysts think?"** → Researcher
+6. **"Buy/sell X" (execute trade)** → Coinbase (crypto) or Schwab (stocks)
+7. **"Check my balance"** → Coinbase (crypto) or Schwab (stocks)
+8. **AI/ML trading signals** → FinRL
+9. **BLOCKCHAIN queries** (transactions, blocks, on-chain data) → Coinbase
    - "Solana blockchain transactions" → Coinbase (NOT researcher!)
    - "Bitcoin blockchain" anything → Coinbase
    - "largest transactions on [crypto] blockchain" → Coinbase
-8. **NEWS and CURRENT EVENTS** → Researcher (has internet access!)
-   - "What about the world news?" → Researcher
-   - "What's happening in the stock market?" (general news) → Researcher
-   - "Tell me about current events" → Researcher
-   - Any question requiring external/up-to-date information → Researcher
-9. **CHART/PLOT/GRAPH requests for crypto data** → Coinbase
-   - "Draw a chart of BTC prices" → Coinbase
-   - "Plot the price correlation" → Coinbase
-   - "Graph BTC vs ETH" → Coinbase
-   - Any request to visualize crypto price data → Coinbase
+10. **NEWS and CURRENT EVENTS** → Researcher (has internet access!)
+11. **CHART/PLOT/GRAPH requests for crypto data** → Coinbase
+
+**CRITICAL**: "trade ideas", "trading recommendations", "what should I trade" → ALWAYS route to Strategy!
 
 ## CRITICAL: Follow-Up "Other/Different" Queries
 When user asks about "other", "different", "more", or "else" assets:
-1. Look at the conversation history to see what symbols were already discussed
-2. **EXCLUDE those symbols from the new request**
-3. Provide DIFFERENT assets, not the same ones
+1. Route to **Strategy** agent (NOT coinbase!)
+2. Look at conversation history to find what symbols were already discussed
+3. **EXCLUDE those symbols from the symbols list**
+4. Provide DIFFERENT assets from the available list: BTC-USD, ETH-USD, SOL-USD, XRP-USD, ZEC-USD
+
+**IMPORTANT**: For crypto, we ONLY have real-time data for: BTC, ETH, SOL, XRP, ZEC
+When user asks for "other cryptos", only suggest from this list (excluding what was previously discussed).
 
 Example:
-- Previous: Strategies for BTC, ETH, SOL, XRP, ZEC
+- Previous: Strategies for BTC, ETH
 - User: "what about other cryptos?"
-- DO NOT include BTC, ETH, SOL, XRP, ZEC in symbols!
-- Instead, suggest: DOGE-USD, ADA-USD, AVAX-USD, DOT-USD, LINK-USD, etc.
+- DO NOT include BTC, ETH
+- Instead, suggest from remaining: SOL-USD, XRP-USD, ZEC-USD
+
+- Previous: BTC, ETH, SOL, XRP, ZEC (all 5 cryptos)
+- User: "what about other cryptos?"
+- All cryptos already shown! Suggest stocks instead: AAPL, TSLA, NVDA, AMD, etc.
 
 For stocks:
 - Previous: AAPL, TSLA, NVDA

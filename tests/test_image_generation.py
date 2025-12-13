@@ -35,7 +35,7 @@ class TestImageGenerationDetection:
     """Tests for detecting image generation requests."""
     
     def test_detects_draw_request(self, log):
-        """Should detect 'draw' as an image generation request."""
+        """Should detect 'draw' as an image generation request (for non-data viz)."""
         from web.app import TradingChatBot
         
         log.info("Testing draw request detection")
@@ -45,14 +45,18 @@ class TestImageGenerationDetection:
                 with patch('web.app.SchwabMCPServer'):
                     bot = TradingChatBot(use_agents=False)
         
+        # Generic image requests should be detected
         assert bot._is_image_generation_request("draw a picture of a duck")
-        assert bot._is_image_generation_request("Draw me a chart")
         assert bot._is_image_generation_request("Can you draw something?")
+        
+        # Data visualization requests should NOT be detected (go to agent instead)
+        assert not bot._is_image_generation_request("Draw me a chart")  # "chart" = data viz
+        assert not bot._is_image_generation_request("draw a price chart")  # "price" = data viz
         
         log.info("RESULT: Draw requests detected correctly")
     
     def test_detects_create_image_request(self, log):
-        """Should detect 'create an image' as an image generation request."""
+        """Should detect 'create an image' as an image generation request (non-data viz)."""
         from web.app import TradingChatBot
         
         log.info("Testing create image request detection")
@@ -62,13 +66,18 @@ class TestImageGenerationDetection:
                 with patch('web.app.SchwabMCPServer'):
                     bot = TradingChatBot(use_agents=False)
         
-        assert bot._is_image_generation_request("create an image of a stock chart")
-        assert bot._is_image_generation_request("Create a picture of Bitcoin")
+        # Generic image requests should be detected
+        assert bot._is_image_generation_request("create an image of a sunset")
+        assert bot._is_image_generation_request("Create a picture of a cat")
+        
+        # Data-related requests should NOT be detected (go to agent)
+        assert not bot._is_image_generation_request("create an image of a stock chart")  # stock = data
+        assert not bot._is_image_generation_request("Create a picture of Bitcoin")  # bitcoin = data
         
         log.info("RESULT: Create image requests detected correctly")
     
     def test_detects_generate_visual_request(self, log):
-        """Should detect requests for visualizations and animations."""
+        """Should detect requests for visualizations and animations (non-data viz)."""
         from web.app import TradingChatBot
         
         log.info("Testing visual/animation request detection")
@@ -78,10 +87,13 @@ class TestImageGenerationDetection:
                 with patch('web.app.SchwabMCPServer'):
                     bot = TradingChatBot(use_agents=False)
         
+        # Generic visual requests should be detected
         assert bot._is_image_generation_request("generate an SVG of a logo")
         assert bot._is_image_generation_request("make an animation of a bouncing ball")
-        assert bot._is_image_generation_request("create a visualization of my portfolio")
-        assert bot._is_image_generation_request("show me a graphic of Bitcoin price")
+        
+        # Data-related visual requests should NOT be detected (go to agent)
+        assert not bot._is_image_generation_request("create a visualization of my portfolio")  # portfolio = data
+        assert not bot._is_image_generation_request("show me a graphic of Bitcoin price")  # bitcoin/price = data
         
         log.info("RESULT: Visual/animation requests detected correctly")
     

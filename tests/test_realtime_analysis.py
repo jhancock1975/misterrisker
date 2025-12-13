@@ -375,7 +375,7 @@ class TestAnalysisQueryRouting:
         )
         
         # The routing prompt should include analysis keywords
-        prompt = supervisor._build_routing_prompt()
+        prompt = supervisor._build_intelligent_routing_prompt()
         
         log.info("Checking routing prompt includes crypto analysis")
         assert "crypto" in prompt.lower() or "coinbase" in prompt.lower()

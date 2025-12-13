@@ -847,19 +847,21 @@ Current active broker: {self.active_broker.upper()}"""
             True if this is a generic image generation request (not data visualization)
         """
         lower_msg = message.lower()
+        import re
         
         # Data visualization keywords - these should go to agents, not image generator
         # The agent can use actual data to create meaningful visualizations
-        data_viz_indicators = [
-            "plot", "chart", "graph", "histogram", "scatter",
-            "correlation", "trend", "price", "prices", "data",
-            "statistics", "stats", "performance", "portfolio",
-            "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
-            "stock", "stocks", "market", "trading", "historical"
+        # Use word boundaries to avoid false matches (e.g., "eth" in "something")
+        data_viz_patterns = [
+            r"\bplot\b", r"\bchart\b", r"\bgraph\b", r"\bhistogram\b", r"\bscatter\b",
+            r"\bcorrelation\b", r"\btrend\b", r"\bprice\b", r"\bprices\b", r"\bdata\b",
+            r"\bstatistics\b", r"\bstats\b", r"\bperformance\b", r"\bportfolio\b",
+            r"\bbitcoin\b", r"\bbtc\b", r"\bethereum\b", r"\beth\b", r"\bsolana\b", r"\bsol\b",
+            r"\bstock\b", r"\bstocks\b", r"\bmarket\b", r"\btrading\b", r"\bhistorical\b"
         ]
         
         # If the message contains data visualization keywords, route to agent
-        if any(indicator in lower_msg for indicator in data_viz_indicators):
+        if any(re.search(pattern, lower_msg) for pattern in data_viz_patterns):
             return False
         
         # Image generation indicators for generic images/art
