@@ -130,6 +130,7 @@ class TradingStrategyService:
         finrl_service: Optional[Any] = None,
         researcher_agent: Optional[Any] = None,
         schwab_mcp_server: Optional[Any] = None,
+        rag_service: Optional[Any] = None,
     ):
         """Initialize the Trading Strategy Service.
         
@@ -138,17 +139,64 @@ class TradingStrategyService:
             finrl_service: FinRLService for AI trading signals
             researcher_agent: ResearcherAgent for fundamental analysis
             schwab_mcp_server: SchwabMCPServer for stock quotes
+            rag_service: RAGService for retrieving trading knowledge context
         """
         self.websocket_service = websocket_service
         self.finrl_service = finrl_service
         self.researcher_agent = researcher_agent
         self.schwab_mcp_server = schwab_mcp_server
+        self.rag_service = rag_service
         
         # Price history for technical analysis (symbol -> list of prices)
         self._price_history: dict[str, list[float]] = {}
         self._candle_history: dict[str, list[dict]] = {}
         
+        # Cache for RAG context (to avoid repeated queries)
+        self._rag_context_cache: dict[str, str] = {}
+        
         logger.info("TradingStrategyService initialized")
+    
+    def get_trading_wisdom(self, query: str, n_results: int = 3) -> str:
+        """Get relevant trading wisdom from the RAG knowledge base.
+        
+        Retrieves context from resources like The Intelligent Investor,
+        Trading Strategies and Market Psychology, etc.
+        
+        Args:
+            query: The query to search for relevant passages
+            n_results: Number of results per source
+            
+        Returns:
+            Formatted wisdom context string
+        """
+        if not self.rag_service:
+            return ""
+        
+        # Check cache first
+        cache_key = f"{query[:50]}_{n_results}"
+        if cache_key in self._rag_context_cache:
+            return self._rag_context_cache[cache_key]
+        
+        try:
+            context = self.rag_service.get_trading_context(
+                query=query,
+                include_intelligent_investor=True,
+                include_trading_psychology=True,
+                include_stats=False,
+                n_results=n_results
+            )
+            
+            # Cache for 5 minutes (in practice, cache lives for session)
+            self._rag_context_cache[cache_key] = context
+            
+            if context:
+                logger.debug(f"RAG context retrieved: {len(context)} chars")
+            
+            return context
+            
+        except Exception as e:
+            logger.warning(f"Error getting RAG context: {e}")
+            return ""
     
     def _is_crypto_symbol(self, symbol: str) -> bool:
         """Determine if symbol looks like a crypto symbol.
@@ -1188,8 +1236,24 @@ class TradingStrategyService:
         for rec in strategy.recommendations:
             recommendations_text += self.format_recommendation_text(rec) + "\n\n---\n\n"
         
+        # Get relevant trading wisdom from knowledge base
+        wisdom_section = ""
+        if strategy.recommendations:
+            symbols = [rec.symbol for rec in strategy.recommendations]
+            actions = [rec.action for rec in strategy.recommendations]
+            query = f"{actions[0] if actions else 'hold'} strategy for {symbols[0]}"
+            wisdom = self.get_trading_wisdom(query)
+            if wisdom:
+                wisdom_section = f"""📚 **Trading Wisdom from Knowledge Base**:
+
+{wisdom[:1000]}{"..." if len(wisdom) > 1000 else ""}
+
+---
+
+"""
+        
         footer = f"""📝 **Summary**: {strategy.summary}
 
 ⚠️ *Following Intelligent Investor principles: margin of safety, diversification, and risk management. This is AI-generated analysis and not financial advice.*"""
         
-        return header + recommendations_text + footer
+        return header + recommendations_text + wisdom_section + footer

@@ -197,64 +197,299 @@ class SupervisorAgent:
     async def _generate_trading_strategy_response(
         self, 
         message: str,
-        routing_decision: RoutingDecision = None
+        routing_decision: RoutingDecision = None,
+        conversation_history: list[dict] = None,
+        config: dict = None
     ) -> str:
-        """Generate a trading strategy response using TradingStrategyService.
+        """Generate an intelligent trading strategy using AGENTIC workflow.
         
-        This method synthesizes data from multiple sources to create actionable
-        trading recommendations with entry, take profit, and stop loss levels.
-        Supports ANY tradeable asset - crypto, stocks, ETFs, etc.
+        This method orchestrates multiple sub-agents to gather real data,
+        then uses LLM reasoning to synthesize actionable trading recommendations.
+        
+        WORKFLOW:
+        1. Extract symbols from user query
+        2. Gather real-time price data from Coinbase/Schwab
+        3. Gather news and research from Researcher agent
+        4. Get AI signals from FinRL if available  
+        5. Retrieve relevant wisdom from RAG knowledge base
+        6. Use LLM to reason about ALL data and generate recommendations
         
         Args:
             message: The user's query
             routing_decision: Optional pre-computed routing decision with extracted symbols
+            conversation_history: Previous messages for context
+            config: LangGraph config
         """
-        if not self.trading_strategy_service:
-            return "Trading strategy service is not available. Please try again later."
+        logger.info(f"[SUPERVISOR] Starting AGENTIC trading strategy workflow")
+        
+        # Step 1: Extract symbols
+        if routing_decision and routing_decision.symbols:
+            symbols = routing_decision.symbols
+            asset_type = routing_decision.asset_type
+        else:
+            symbols, asset_type = self._extract_symbols_from_query(message)
+        
+        if not symbols:
+            symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ZEC-USD']
+            asset_type = "crypto"
+        
+        logger.info(f"[SUPERVISOR] Analyzing symbols: {symbols} (type: {asset_type})")
+        
+        # Step 2: Gather data from multiple agents IN PARALLEL
+        import asyncio
+        gathered_data = {
+            "prices": {},
+            "research": "",
+            "finrl_signals": {},
+            "rag_wisdom": ""
+        }
+        
+        # Helper for no-op async tasks
+        async def noop_str():
+            return ""
+        
+        async def noop_dict():
+            return {}
+        
+        # Create tasks for parallel execution
+        tasks = []
+        
+        # Task: Get price data
+        tasks.append(self._gather_price_data(symbols, asset_type))
+        
+        # Task: Get research/news (if user asked for it or if researcher is available)
+        if self.researcher_agent:
+            research_query = f"Latest news and analysis for {', '.join(symbols[:3])}"
+            tasks.append(self._gather_research(research_query, conversation_history, config))
+        else:
+            tasks.append(noop_str())
+        
+        # Task: Get FinRL signals (if available)
+        if self.finrl_agent:
+            tasks.append(self._gather_finrl_signals(symbols))
+        else:
+            tasks.append(noop_dict())
+        
+        # Task: Get RAG wisdom
+        if self.trading_strategy_service and self.trading_strategy_service.rag_service:
+            tasks.append(self._gather_rag_wisdom(symbols))
+        else:
+            tasks.append(noop_str())
+        
+        # Execute all tasks in parallel
+        logger.info(f"[SUPERVISOR] Gathering data from {len(tasks)} sources in parallel...")
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            gathered_data["prices"] = results[0] if not isinstance(results[0], Exception) else {}
+            gathered_data["research"] = results[1] if not isinstance(results[1], Exception) else ""
+            gathered_data["finrl_signals"] = results[2] if not isinstance(results[2], Exception) else {}
+            gathered_data["rag_wisdom"] = results[3] if not isinstance(results[3], Exception) else ""
+        except Exception as e:
+            logger.error(f"[SUPERVISOR] Error gathering data: {e}")
+        
+        logger.info(f"[SUPERVISOR] Data gathered: prices={len(gathered_data['prices'])} symbols, "
+                   f"research={len(gathered_data['research'])} chars, "
+                   f"finrl={len(gathered_data['finrl_signals'])} signals, "
+                   f"rag={len(gathered_data['rag_wisdom'])} chars")
+        
+        # Step 3: Use LLM to reason and generate recommendations
+        response = await self._llm_generate_recommendations(
+            user_message=message,
+            symbols=symbols,
+            asset_type=asset_type,
+            gathered_data=gathered_data,
+            conversation_history=conversation_history
+        )
+        
+        return response
+    
+    async def _gather_price_data(self, symbols: list[str], asset_type: str) -> dict:
+        """Gather real-time price data from appropriate agents."""
+        prices = {}
+        
+        for symbol in symbols:
+            try:
+                is_crypto = asset_type == "crypto" or symbol.endswith("-USD")
+                
+                if is_crypto and self.coinbase_agent:
+                    # Get crypto price from Coinbase
+                    result = await self.coinbase_agent.process_query(
+                        f"Get the current price for {symbol}"
+                    )
+                    if isinstance(result, dict) and "response" in result:
+                        prices[symbol] = {"source": "coinbase", "data": result["response"]}
+                elif not is_crypto and self.schwab_agent:
+                    # Get stock price from Schwab
+                    result = await self.schwab_agent.process_query(
+                        f"Get quote for {symbol}"
+                    )
+                    if isinstance(result, dict) and "response" in result:
+                        prices[symbol] = {"source": "schwab", "data": result["response"]}
+            except Exception as e:
+                logger.warning(f"[SUPERVISOR] Error getting price for {symbol}: {e}")
+                prices[symbol] = {"source": "error", "data": str(e)}
+        
+        return prices
+    
+    async def _gather_research(self, query: str, conversation_history: list[dict], config: dict) -> str:
+        """Gather research and news from the Researcher agent."""
+        if not self.researcher_agent:
+            return ""
         
         try:
-            # Use LLM-extracted symbols if available, otherwise fall back to pattern matching
-            if routing_decision and routing_decision.symbols:
-                symbols = routing_decision.symbols
-                asset_type = routing_decision.asset_type
-            else:
-                symbols, asset_type = self._extract_symbols_from_query(message)
-            
-            # If still no symbols (generic query like "trade ideas"), use defaults
-            if not symbols:
-                symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ZEC-USD']
-                asset_type = "crypto"
-            
-            logger.info(f"[SUPERVISOR] Generating strategy for {symbols} (type: {asset_type})")
-            
-            if not symbols:
-                return ("I couldn't identify specific trading symbols. "
-                        "Please specify what you want to trade (e.g., 'BTC', 'AAPL', 'MU').")
-            
-            # Generate recommendations for all symbols using unified method
-            recommendations = await self.trading_strategy_service.generate_recommendations(
-                symbols=symbols,
-                asset_type=asset_type,
-                risk_tolerance="conservative"
+            logger.info(f"[SUPERVISOR] Calling Researcher agent: {query[:50]}...")
+            result = await self.researcher_agent.run(
+                query=query,
+                messages=conversation_history or [],
+                config=config,
+                return_structured=True
             )
-            
-            if not recommendations:
-                return "Unable to generate recommendations. No market data available for the requested symbols."
-            
-            if len(recommendations) == 1:
-                return self.trading_strategy_service.format_recommendation_text(recommendations[0])
-            else:
-                # Multiple recommendations - format as portfolio
-                strategy = self.trading_strategy_service.create_portfolio_from_recommendations(
-                    recommendations=recommendations
-                )
-                return self.trading_strategy_service.format_portfolio_strategy_text(strategy)
-                
+            return result.get("response", "") if isinstance(result, dict) else str(result)
         except Exception as e:
-            logger.error(f"[SUPERVISOR] Trading strategy error: {e}")
-            import traceback
-            traceback.print_exc()
-            return f"Error generating trading strategy: {e}"
+            logger.warning(f"[SUPERVISOR] Research error: {e}")
+            return f"Research unavailable: {e}"
+    
+    async def _gather_finrl_signals(self, symbols: list[str]) -> dict:
+        """Gather AI trading signals from FinRL agent."""
+        if not self.finrl_agent:
+            return {}
+        
+        signals = {}
+        for symbol in symbols:
+            try:
+                # Only FinRL for crypto symbols
+                if symbol.endswith("-USD"):
+                    result = await self.finrl_agent.process(f"Get trading signal for {symbol}")
+                    signals[symbol] = result
+            except Exception as e:
+                logger.warning(f"[SUPERVISOR] FinRL error for {symbol}: {e}")
+        
+        return signals
+    
+    async def _gather_rag_wisdom(self, symbols: list[str]) -> str:
+        """Retrieve relevant trading wisdom from RAG knowledge base."""
+        if not self.trading_strategy_service or not self.trading_strategy_service.rag_service:
+            return ""
+        
+        try:
+            query = f"Trading strategy and risk management for {', '.join(symbols[:3])}"
+            wisdom = self.trading_strategy_service.get_trading_wisdom(query, n_results=3)
+            return wisdom
+        except Exception as e:
+            logger.warning(f"[SUPERVISOR] RAG error: {e}")
+            return ""
+    
+    async def _llm_generate_recommendations(
+        self,
+        user_message: str,
+        symbols: list[str],
+        asset_type: str,
+        gathered_data: dict,
+        conversation_history: list[dict] = None
+    ) -> str:
+        """Use LLM to reason about gathered data and generate recommendations.
+        
+        This is the BRAIN of the agentic workflow - it takes all gathered data
+        and uses the LLM to synthesize intelligent trading recommendations.
+        """
+        logger.info(f"[SUPERVISOR] LLM reasoning about {len(symbols)} symbols with gathered data...")
+        
+        # Build the context for LLM
+        context_parts = []
+        
+        # Add price data
+        if gathered_data["prices"]:
+            context_parts.append("## Current Market Data")
+            for symbol, data in gathered_data["prices"].items():
+                context_parts.append(f"**{symbol}** (source: {data['source']}):\n{data['data']}\n")
+        
+        # Add research
+        if gathered_data["research"]:
+            context_parts.append(f"## News & Research\n{gathered_data['research']}\n")
+        
+        # Add FinRL signals
+        if gathered_data["finrl_signals"]:
+            context_parts.append("## AI/ML Trading Signals (FinRL)")
+            for symbol, signal in gathered_data["finrl_signals"].items():
+                context_parts.append(f"**{symbol}**: {signal}\n")
+        
+        # Add RAG wisdom
+        if gathered_data["rag_wisdom"]:
+            context_parts.append(f"## Trading Wisdom from Knowledge Base\n{gathered_data['rag_wisdom']}\n")
+        
+        context = "\n".join(context_parts)
+        
+        # Build the prompt
+        system_prompt = """You are Mister Risker, an expert trading analyst and advisor.
+Your job is to analyze the provided market data, news, AI signals, and trading wisdom
+to generate SPECIFIC, ACTIONABLE trading recommendations.
+
+For EACH symbol the user asked about, provide:
+1. **Action**: BUY, SELL, or HOLD (with confidence level)
+2. **Entry Price**: Specific limit order price (with margin of safety)
+3. **Take Profit**: Target price for profit-taking
+4. **Stop Loss**: Price to cut losses
+5. **Risk/Reward Ratio**: Calculate and show the R:R
+6. **Position Size**: Suggested % of portfolio
+7. **Reasoning**: Explain WHY based on the data you have
+
+Apply these principles from The Intelligent Investor:
+- Margin of Safety: Entry should be below current price for buys
+- Risk Management: Always include stop loss
+- Diversification: Consider position sizing
+
+Format your response with clear headers and emojis for readability.
+Be specific with numbers - don't be vague.
+If you don't have enough data, say so but still provide your best analysis.
+"""
+
+        messages = [SystemMessage(content=system_prompt)]
+        
+        # Add conversation history for context
+        if conversation_history:
+            for msg in conversation_history[-5:]:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "user":
+                    messages.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    messages.append(AIMessage(content=content))
+        
+        # Add the current request with all gathered context
+        user_prompt = f"""User request: {user_message}
+
+Symbols to analyze: {', '.join(symbols)}
+Asset type: {asset_type}
+
+=== GATHERED DATA ===
+{context}
+=== END GATHERED DATA ===
+
+Please analyze this data and provide specific trading recommendations for each symbol.
+Include entry prices, take profit levels, stop losses, and your reasoning based on the data above."""
+
+        messages.append(HumanMessage(content=user_prompt))
+        
+        # Generate response
+        try:
+            response = await self.llm.ainvoke(messages)
+            content = response.content if hasattr(response, "content") else str(response)
+            
+            # Handle list of content blocks
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                return "".join(text_parts) if text_parts else str(content)
+            
+            return content if isinstance(content, str) else str(content)
+            
+        except Exception as e:
+            logger.error(f"[SUPERVISOR] LLM recommendation error: {e}")
+            return f"I apologize, I had trouble generating recommendations: {e}"
 
     def _build_intelligent_routing_prompt(self) -> str:
         """Build a comprehensive prompt for intelligent LLM-based routing.
@@ -655,16 +890,18 @@ if they say "Bitcoin" that's BTC-USD crypto. Extract ALL symbols mentioned."""
                 logs.append(f"[SUPERVISOR] ERROR: Trading Strategy service not available")
                 response = "I'd like to help with trading strategy, but the strategy service is not configured."
             else:
-                logs.append(f"[SUPERVISOR] Generating trading strategy with TradingStrategyService")
+                logs.append(f"[SUPERVISOR] Starting AGENTIC trading strategy workflow")
                 logs.append(f"[SUPERVISOR] Symbols: {decision.symbols}, Asset type: {decision.asset_type}")
                 try:
                     response = await self._generate_trading_strategy_response(
                         decision.query_for_agent,
-                        routing_decision=decision
+                        routing_decision=decision,
+                        conversation_history=conversation_history,
+                        config=config
                     )
-                    logs.append(f"[STRATEGY SERVICE] Completed: {len(response)} chars")
+                    logs.append(f"[SUPERVISOR] AGENTIC workflow completed: {len(response)} chars")
                 except Exception as e:
-                    logs.append(f"[STRATEGY SERVICE] Error: {e}")
+                    logs.append(f"[SUPERVISOR] AGENTIC workflow error: {e}")
                     response = f"I encountered an error generating trading strategy: {e}"
         
         else:

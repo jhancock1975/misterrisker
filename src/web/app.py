@@ -45,6 +45,7 @@ from src.agents.supervisor_agent import SupervisorAgent, SupervisorAgentError
 from src.agents.finrl_agent import FinRLAgent
 from src.services.finrl_service import FinRLService
 from src.services.trading_strategy import TradingStrategyService
+from src.services.rag_service import RAGService
 
 # Load environment variables
 load_dotenv()
@@ -85,6 +86,7 @@ class TradingChatBot:
         self.finrl_service: FinRLService | None = None
         self.trading_strategy_service: TradingStrategyService | None = None
         self.supervisor_agent: SupervisorAgent | None = None
+        self.rag_service: RAGService | None = None
         
         # Configuration
         self.use_agents = use_agents
@@ -275,6 +277,18 @@ If you don't need to call a tool, just respond normally with text."""
             except Exception as e:
                 logger.warning(f"  ✗ Could not initialize FinRL Agent: {e}")
         
+        # Initialize RAG Service (ChromaDB-based document retrieval)
+        try:
+            self.rag_service = RAGService(
+                persist_directory=".chromadb",
+                resources_dir="resources",
+                auto_index=True  # Index resources if collection is empty
+            )
+            stats = self.rag_service.get_stats()
+            logger.info(f"  ✓ RAG Service initialized ({stats['total_chunks']} document chunks)")
+        except Exception as e:
+            logger.warning(f"  ✗ Could not initialize RAG Service: {e}")
+        
         # Initialize Trading Strategy Service (multi-source analysis for actionable recommendations)
         if self.use_agents:
             try:
@@ -292,11 +306,14 @@ If you don't need to call a tool, just respond normally with text."""
                     websocket_service=websocket_service,
                     finrl_service=self.finrl_service,
                     researcher_agent=self.researcher_agent,
-                    schwab_mcp_server=schwab_mcp_server
+                    schwab_mcp_server=schwab_mcp_server,
+                    rag_service=self.rag_service
                 )
                 logger.info("  ✓ Trading Strategy Service initialized (Intelligent Investor principles)")
                 if schwab_mcp_server:
                     logger.info("    - Stock support enabled via Schwab MCP")
+                if self.rag_service:
+                    logger.info("    - RAG context enabled via ChromaDB")
             except Exception as e:
                 logger.warning(f"  ✗ Could not initialize Trading Strategy Service: {e}")
         
