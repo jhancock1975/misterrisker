@@ -35,12 +35,27 @@ class FinRLAgent:
     for getting trading recommendations.
     """
     
-    SYMBOL_MAP = {
+    # Crypto symbol mappings
+    CRYPTO_MAP = {
         "btc": "BTC-USD", "bitcoin": "BTC-USD",
         "eth": "ETH-USD", "ethereum": "ETH-USD",
         "sol": "SOL-USD", "solana": "SOL-USD",
         "xrp": "XRP-USD", "ripple": "XRP-USD",
         "zec": "ZEC-USD", "zcash": "ZEC-USD",
+    }
+    
+    # Common stock symbols
+    STOCK_SYMBOLS = {
+        "aapl", "apple", "tsla", "tesla", "nvda", "nvidia", 
+        "amd", "goog", "googl", "google", "msft", "microsoft",
+        "amzn", "amazon", "meta", "facebook", "nflx", "netflix",
+        "spy", "qqq", "dia", "iwm"
+    }
+    
+    # Combined symbol map
+    SYMBOL_MAP = {
+        **CRYPTO_MAP,
+        # Stocks use their own ticker
     }
     
     def __init__(
@@ -69,12 +84,33 @@ class FinRLAgent:
         logger.info("FinRL Agent initialized")
     
     def _extract_symbol(self, query: str) -> Optional[str]:
-        """Extract cryptocurrency symbol from query."""
+        """Extract trading symbol from query (crypto or stock)."""
         query_lower = query.lower()
+        query_upper = query.upper()
         
-        for keyword, symbol in self.SYMBOL_MAP.items():
+        # Check crypto mappings first
+        for keyword, symbol in self.CRYPTO_MAP.items():
             if keyword in query_lower:
                 return symbol
+        
+        # Check for stock tickers (uppercase in query)
+        import re
+        # Find uppercase words that look like tickers (2-5 chars)
+        potential_tickers = re.findall(r'\b([A-Z]{2,5})\b', query_upper)
+        for ticker in potential_tickers:
+            if ticker.lower() in self.STOCK_SYMBOLS:
+                return ticker
+        
+        # Also check lowercase mentions
+        for stock in self.STOCK_SYMBOLS:
+            if stock in query_lower:
+                # Return uppercase ticker
+                ticker_map = {
+                    "apple": "AAPL", "tesla": "TSLA", "nvidia": "NVDA",
+                    "google": "GOOG", "microsoft": "MSFT", "amazon": "AMZN",
+                    "facebook": "META", "netflix": "NFLX"
+                }
+                return ticker_map.get(stock, stock.upper())
         
         return None
     

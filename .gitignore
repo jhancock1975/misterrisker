@@ -9,6 +9,18 @@
 # Emacs directory-local variables
 .dir-locals.el
 
+# Binary files
+*.bin
+
+# PDF files
+*.pdf
+
+# Log files
+*.log
+
+# ChromaDB database
+.chromadb/
+
 # Vi/Vim backup files
 *.swp
 *.swo
@@ -93,3 +105,7 @@ dmypy.json
 *.env
 env.local
 .envrc
+
+# Resources directory (large PDFs, downloaded content)
+resources/
+

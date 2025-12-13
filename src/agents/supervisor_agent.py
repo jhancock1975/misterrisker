@@ -185,14 +185,16 @@ class SupervisorAgent:
                 symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ZEC-USD']
                 asset_type = "crypto"
             elif any(term in message_lower for term in ['stock', 'equity', 'equities', 'share']):
-                # No specific stocks mentioned, can't default to a list
+                # No specific stocks mentioned, suggest popular ones
+                symbols = ['AAPL', 'TSLA', 'NVDA', 'AMD', 'GOOG', 'MSFT', 'AMZN', 'META']
                 asset_type = "stock"
-            else:
-                # Default to crypto for backward compatibility
-                symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ZEC-USD']
-                asset_type = "crypto"
+            # Don't default to anything - let the caller ask for clarification
         
-        return symbols, asset_type or "crypto"
+        return symbols, asset_type or "unknown"
+    
+    async def _ask_for_clarification(self, message: str) -> str:
+        """Return a message asking the user to clarify what they want."""
+        return message
     
     async def _generate_trading_strategy_response(
         self, 
@@ -230,8 +232,13 @@ class SupervisorAgent:
             symbols, asset_type = self._extract_symbols_from_query(message)
         
         if not symbols:
-            symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ZEC-USD']
-            asset_type = "crypto"
+            # Don't assume crypto - ask what the user wants
+            return await self._ask_for_clarification(
+                "I'd be happy to provide trading recommendations! What assets are you interested in?\n\n"
+                "**Crypto**: BTC, ETH, SOL, XRP, ZEC, etc.\n"
+                "**Stocks**: AAPL, TSLA, NVDA, AMD, GOOG, MSFT, AMZN, META, etc.\n\n"
+                "Just tell me which symbols you'd like me to analyze!"
+            )
         
         logger.info(f"[SUPERVISOR] Analyzing symbols: {symbols} (type: {asset_type})")
         
@@ -350,17 +357,16 @@ class SupervisorAgent:
             return f"Research unavailable: {e}"
     
     async def _gather_finrl_signals(self, symbols: list[str]) -> dict:
-        """Gather AI trading signals from FinRL agent."""
+        """Gather AI trading signals from FinRL agent for ALL asset types."""
         if not self.finrl_agent:
             return {}
         
         signals = {}
         for symbol in symbols:
             try:
-                # Only FinRL for crypto symbols
-                if symbol.endswith("-USD"):
-                    result = await self.finrl_agent.process(f"Get trading signal for {symbol}")
-                    signals[symbol] = result
+                # Get FinRL signals for any tradeable asset
+                result = await self.finrl_agent.process(f"Get trading signal for {symbol}")
+                signals[symbol] = result
             except Exception as e:
                 logger.warning(f"[SUPERVISOR] FinRL error for {symbol}: {e}")
         
@@ -424,23 +430,35 @@ class SupervisorAgent:
 Your job is to analyze the provided market data, news, AI signals, and trading wisdom
 to generate SPECIFIC, ACTIONABLE trading recommendations.
 
-For EACH symbol the user asked about, provide:
-1. **Action**: BUY, SELL, or HOLD (with confidence level)
-2. **Entry Price**: Specific limit order price (with margin of safety)
-3. **Take Profit**: Target price for profit-taking
-4. **Stop Loss**: Price to cut losses
-5. **Risk/Reward Ratio**: Calculate and show the R:R
-6. **Position Size**: Suggested % of portfolio
-7. **Reasoning**: Explain WHY based on the data you have
+For EACH symbol the user asked about, provide this EXACT format:
+
+## 📊 [SYMBOL]
+1. **Action**: BUY, SELL, or HOLD
+2. **Confidence Level**: X% - REQUIRED! Calculate based on:
+   - If FinRL signal available: Use FinRL confidence directly
+   - If no FinRL: Estimate based on trend alignment, volatility, and data quality
+   - Show as percentage (e.g., 75%)
+3. **Entry Price**: $X.XX (to provide a margin of safety)
+4. **Take Profit**: $X.XX
+5. **Stop Loss**: $X.XX
+6. **Risk/Reward Ratio**: X:X
+7. **Position Size**: X% of portfolio
+8. **Reasoning**: 2-3 sentences explaining WHY based on the data
+
+CONFIDENCE CALCULATION RULES:
+- 80%+: Strong signal alignment (FinRL + trend + fundamentals agree)
+- 60-79%: Moderate confidence (most signals agree, some uncertainty)
+- 40-59%: Low confidence (mixed signals, proceed with caution)
+- <40%: Very low confidence (conflicting signals, small position only)
 
 Apply these principles from The Intelligent Investor:
 - Margin of Safety: Entry should be below current price for buys
 - Risk Management: Always include stop loss
-- Diversification: Consider position sizing
+- Diversification: Consider position sizing based on confidence
 
-Format your response with clear headers and emojis for readability.
+Format your response with clear headers and emojis.
 Be specific with numbers - don't be vague.
-If you don't have enough data, say so but still provide your best analysis.
+CONFIDENCE LEVEL IS MANDATORY for every recommendation!
 """
 
         messages = [SystemMessage(content=system_prompt)]
