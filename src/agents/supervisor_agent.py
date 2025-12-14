@@ -554,6 +554,9 @@ route to Coinbase - this is blockchain data, NOT stock ticker "SOL"!
 **Purpose**: Stock and options trading AND market data via Schwab brokerage
 **Capabilities**:
 - **REAL-TIME STOCK MARKET DATA**: Stock quotes, prices, bid/ask spreads
+- **MULTI-SYMBOL QUOTES**: Get quotes for multiple stocks at once (AAPL, MSFT, GOOGL together)
+- **PRICE HISTORY**: Historical price data (daily, weekly, monthly candles for charting/analysis)
+- **OPTION CHAINS**: Full option data (calls, puts, strikes, expirations, Greeks)
 - **Market movers**: Top gainers, losers, most active stocks
 - **Market hours**: Trading sessions, pre-market, after-hours
 - Access to YOUR Schwab brokerage account
@@ -565,6 +568,9 @@ route to Coinbase - this is blockchain data, NOT stock ticker "SOL"!
 - Order status, open orders, executed orders
 **Use when**: 
 - User asks about STOCK PRICES (AAPL, TSLA, any stock quote)
+- User asks for QUOTES on MULTIPLE stocks at once
+- User asks about **price history** or **historical prices** for stocks
+- User asks about **options**, **option chains**, calls, puts, strikes
 - User asks about MARKET DATA (movers, gainers, losers)
 - User asks about stocks, equities, options, or anything stock-related
 - User asks about **transaction history** for stocks
@@ -574,6 +580,8 @@ route to Coinbase - this is blockchain data, NOT stock ticker "SOL"!
 **Common stock symbols this handles**: AAPL, TSLA, NVDA, AMD, GOOG, GOOGL, MSFT, AMZN, META, 
 MU (Micron), INTC (Intel), NFLX, and ALL OTHER stock ticker symbols
 **CRITICAL**: This is the ONLY agent that can get STOCK PRICES. For any stock quote, use Schwab!
+**CRITICAL**: For OPTION CHAINS and OPTIONS DATA, use Schwab!
+**CRITICAL**: For PRICE HISTORY and HISTORICAL DATA on stocks, use Schwab!
 **KEY DISTINCTION**: If user mentions a stock symbol (like MU, AAPL, NVDA, etc.) and wants 
 trading advice or limit orders, route to Schwab for stock-specific handling
 **DO NOT use for**: Cryptocurrency trading (use Coinbase instead)""")
@@ -608,17 +616,34 @@ trading advice or limit orders, route to Schwab for stock-specific handling
         
         if self.finrl_agent:
             capabilities.append("""
-## FinRL Agent (agent="finrl")
-**Purpose**: AI-powered trading decisions using Deep Reinforcement Learning
+## FinRL Agent (agent="finrl") - **MISTER RISKER'S CORE**
+**Purpose**: AI-powered trading decisions, market analysis, and trading education using Deep RL
+**This is Mister Risker's primary personality and expertise!**
 **Capabilities**:
-- Trained RL models (PPO, A2C, SAC, TD3) for crypto trading signals
-- Buy/sell/hold recommendations based on machine learning
+- Trained RL models (PPO, A2C, SAC, TD3) for trading signals on ANY asset
+- Buy/sell/hold recommendations with confidence scores
 - Train new models on historical data
-- AI confidence scores for trading decisions
+- **MARKET DISCUSSIONS**: General trading conversations and opinions
+- **TRADING EDUCATION**: Explain concepts, formulas, strategies
+- **MARKET ANALYSIS**: Technical analysis with RL insights
 - Portfolio optimization using reinforcement learning
-**Use when**: User specifically asks for AI/ML trading decisions, mentions reinforcement learning,
-asks "should I buy/sell" from an AI perspective, or wants machine learning-based signals
-**DO NOT use for**: Specific limit order prices, detailed trading strategies with entry/exit levels""")
+- Mathematical explanations with proper notation (LaTeX formulas)
+- Risk assessment and probability analysis
+**Use when**:
+- User asks "what do you think about..." (any trading topic)
+- User asks to explain a concept, formula, or strategy
+- User wants AI/ML trading decisions or signals
+- User asks general trading questions or wants a conversation
+- User asks "should I buy/sell" anything
+- User asks about formulas, math, or quantitative topics
+- User asks "what can you do?" or wants to know capabilities
+- User mentions reinforcement learning, AI trading, or machine learning
+- **ANY general question about trading or investing**
+**DO NOT use for**: 
+- Specific limit order prices (use strategy instead)
+- Fetching real-time prices (use Coinbase/Schwab)
+- Placing actual trades (use Coinbase/Schwab)
+- Web searches for news (use Researcher)""")
         
         if self.trading_strategy_service:
             capabilities.append("""
@@ -649,15 +674,15 @@ asks "should I buy/sell" from an AI perspective, or wants machine learning-based
         
         capabilities.append("""
 ## Direct Response (agent="direct")
-**Purpose**: Simple interactions that don't need delegation
-**Use when**: Simple greetings ("hi", "hello"), questions about Mister Risker's capabilities,
-or basic clarifying questions
+**Purpose**: ONLY for simple greetings - route almost everything else to FinRL or other agents
+**Use when**: ONLY simple greetings ("hi", "hello", "hey")
 **DO NOT use for**: 
 - Any actual trading, research, or analysis tasks
+- Questions about capabilities (use FinRL - it explains what Mister Risker can do)
+- Any question that requires thinking or explanation (use FinRL)
 - News queries (use researcher!)
-- Current events questions (use researcher!)
-- Any question that requires external information (use researcher!)
-- Weather, sports, world events (use researcher!)""")
+- Any question requiring external information (use researcher!)
+**NOTE**: When in doubt, route to FinRL - it's Mister Risker's core personality!""")
         
         capabilities_text = "\n".join(capabilities)
         
@@ -693,16 +718,20 @@ When routing, you MUST also extract:
 12. **TRANSACTION HISTORY**:
     - "What's my transaction history on Coinbase?" → **Coinbase** (fills, trades, account activity)
     - "Show my stock transaction history" → **Schwab** (stock account transactions)
-13. **AI/ML trading signals** → FinRL
+13. **AI/ML trading signals, trading education, market discussions** → **FinRL** (Mister Risker's core)
 14. **BLOCKCHAIN queries** (transactions, blocks, on-chain data) → Coinbase
    - "Solana blockchain transactions" → Coinbase (NOT researcher!)
    - "Bitcoin blockchain" anything → Coinbase
    - "largest transactions on [crypto] blockchain" → Coinbase
 15. **NEWS and CURRENT EVENTS** → Researcher (has internet access!)
 16. **CHART/PLOT/GRAPH requests for crypto data** → Coinbase
+17. **General trading questions** ("what do you think...", "explain...", "how does...") → **FinRL**
+18. **Questions about capabilities** ("what can you do?", "how can you help?") → **FinRL**
+19. **Formulas and quantitative concepts** → **FinRL** (can render LaTeX math)
 
 **CRITICAL**: "trade ideas", "trading recommendations", "what should I trade" → ALWAYS route to Strategy!
 **CRITICAL**: For STOCK quotes/prices, use SCHWAB. For CRYPTO quotes/prices, use COINBASE.
+**CRITICAL**: For general discussions/education/explanations → FinRL (Mister Risker's personality)
 
 ## CRITICAL: Follow-Up "Other/Different" Queries
 When user asks about "other", "different", "more", or "else" assets:

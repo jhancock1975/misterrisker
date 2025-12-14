@@ -2,6 +2,9 @@
 
 This agent uses FinRL and stable-baselines3 to provide AI-powered trading
 recommendations based on real-time market data.
+
+This is the CORE personality of Mister Risker - a sophisticated AI trading
+advisor that combines deep reinforcement learning with LLM reasoning.
 """
 
 import logging
@@ -16,6 +19,35 @@ from langgraph.graph.state import CompiledStateGraph
 from src.services.finrl_service import FinRLService, TradingSignal
 
 logger = logging.getLogger("mister_risker.finrl_agent")
+
+# Mister Risker's core personality - used in all responses
+MISTER_RISKER_PERSONALITY = """You are **Mister Risker**, an elite AI trading advisor with deep expertise in:
+- Deep Reinforcement Learning (PPO, A2C, SAC, TD3 algorithms)
+- Quantitative finance and algorithmic trading
+- Technical analysis and market microstructure
+- Risk management and portfolio theory
+- Cryptocurrency and traditional equity markets
+
+**Your personality**:
+- Confident but measured - you're an expert but always acknowledge uncertainty
+- Data-driven - you back up opinions with quantitative analysis
+- Risk-aware - you always discuss risk/reward tradeoffs
+- Educational - you explain your reasoning and teach trading concepts
+- Witty and engaging - you make complex topics accessible
+- Bold when appropriate - you give clear recommendations when confidence is high
+
+**Your communication style**:
+- Use emojis appropriately: 🤖 for AI insights, 📊 for data, ⚠️ for warnings
+- Format responses with clear structure (headers, bullet points)
+- Include confidence levels when giving recommendations
+- Always mention that this is AI analysis, not financial advice
+- Use mathematical notation when discussing formulas (LaTeX: $formula$)
+
+**Core principles**:
+- Reinforcement learning finds patterns humans miss
+- Risk management is more important than returns
+- Markets are probabilistic, not deterministic
+- Continuous learning improves predictions over time"""
 
 
 @dataclass
@@ -218,13 +250,20 @@ class FinRLAgent:
 ⚠️ *AI-generated analysis using Deep Reinforcement Learning. Not financial advice.*"""
     
     async def process(self, query: str) -> str:
-        """Process a query and return trading recommendation.
+        """Process a query and return trading recommendation or discussion.
+        
+        As Mister Risker, this agent can handle:
+        - Trading signal requests
+        - Model training
+        - Portfolio analysis
+        - General trading discussions and education
+        - Market analysis and explanations
         
         Args:
             query: User's query about trading
         
         Returns:
-            Formatted response with trading signal
+            Formatted response with trading signal or discussion
         """
         logger.info(f"[FINRL AGENT] Processing: {query[:50]}...")
         
@@ -252,14 +291,177 @@ The model is now ready to generate trading signals!"""
                 signal = self.finrl_service.get_trading_signal(symbol)
                 return self._format_signal(signal)
             
+            elif intent == "discuss":
+                # General trading discussion - use LLM with Mister Risker personality
+                return await self._generate_discussion_response(query, symbol)
+            
+            elif intent == "explain":
+                # Educational explanation - use LLM to explain concepts
+                return await self._generate_educational_response(query)
+            
+            elif intent == "analyze":
+                # Market analysis with RL insights
+                return await self._generate_analysis_response(query, symbol)
+            
             else:
-                # Default: portfolio overview
+                # Default: check if it's a general question or needs portfolio
+                if any(word in query.lower() for word in ['what', 'how', 'why', 'explain', 'tell me', 'can you']):
+                    return await self._generate_discussion_response(query, symbol)
                 portfolio = self.finrl_service.get_portfolio_recommendation()
                 return self._format_portfolio(portfolio)
             
         except Exception as e:
             logger.error(f"[FINRL AGENT] Error: {e}")
-            return f"❌ Error generating trading signal: {str(e)}"
+            return f"❌ Error generating response: {str(e)}"
+    
+    async def _generate_discussion_response(self, query: str, symbol: Optional[str] = None) -> str:
+        """Generate a conversational response as Mister Risker.
+        
+        Uses the LLM with Mister Risker personality to discuss trading topics.
+        """
+        import asyncio
+        
+        # Get any relevant RL signals to include in context
+        context = ""
+        if symbol:
+            try:
+                signal = self.finrl_service.get_trading_signal(symbol)
+                context = f"""
+Current RL Model Signal for {symbol}:
+- Action: {signal.action.upper()}
+- Confidence: {signal.confidence:.0%}
+- Price: ${signal.price:,.2f}
+- Reasoning: {signal.reasoning}
+"""
+            except:
+                pass
+        
+        system_prompt = f"""{MISTER_RISKER_PERSONALITY}
+
+{context}
+
+Respond to the user's query in character as Mister Risker. Be helpful, insightful, 
+and engaging. If the question relates to specific assets, include relevant RL insights.
+If asked about complex topics, use proper mathematical notation with LaTeX ($formula$).
+"""
+        
+        try:
+            response = await asyncio.to_thread(
+                self.llm.invoke,
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query}
+                ]
+            )
+            
+            content = response.content
+            if isinstance(content, list):
+                content = content[0].get("text", "") if content else ""
+            
+            return content
+            
+        except Exception as e:
+            logger.error(f"Discussion generation failed: {e}")
+            return f"🤖 I had trouble formulating a response. Let me try a simpler approach: {str(e)}"
+    
+    async def _generate_educational_response(self, query: str) -> str:
+        """Generate an educational response explaining trading concepts."""
+        import asyncio
+        
+        system_prompt = f"""{MISTER_RISKER_PERSONALITY}
+
+The user wants to learn about a trading concept. As Mister Risker, explain it clearly:
+1. Start with a simple explanation
+2. Add technical details with proper mathematical notation (LaTeX: $formula$)
+3. Give practical examples
+4. Relate it to reinforcement learning if applicable
+5. Include relevant emojis for engagement
+
+Be thorough but accessible. Use formulas when appropriate."""
+        
+        try:
+            response = await asyncio.to_thread(
+                self.llm.invoke,
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query}
+                ]
+            )
+            
+            content = response.content
+            if isinstance(content, list):
+                content = content[0].get("text", "") if content else ""
+            
+            return content
+            
+        except Exception as e:
+            logger.error(f"Educational response failed: {e}")
+            return f"🎓 I couldn't generate an educational response: {str(e)}"
+    
+    async def _generate_analysis_response(self, query: str, symbol: Optional[str] = None) -> str:
+        """Generate a market analysis response with RL insights."""
+        import asyncio
+        
+        # Gather RL signals for context
+        signals_context = ""
+        if symbol:
+            try:
+                signal = self.finrl_service.get_trading_signal(symbol)
+                signals_context = f"""
+**RL Analysis for {symbol}:**
+- Signal: {signal.action.upper()} 
+- Confidence: {signal.confidence:.0%}
+- Current Price: ${signal.price:,.2f}
+- Model: {signal.model_name}
+- Reasoning: {signal.reasoning}
+"""
+            except:
+                pass
+        else:
+            # Get portfolio overview
+            try:
+                portfolio = self.finrl_service.get_portfolio_recommendation()
+                signals_context = f"""
+**RL Portfolio Analysis:**
+- Overall Outlook: {portfolio.get('recommendation', 'NEUTRAL')}
+- Buy Signals: {portfolio.get('buy_count', 0)}
+- Sell Signals: {portfolio.get('sell_count', 0)}
+- Hold Signals: {portfolio.get('hold_count', 0)}
+"""
+            except:
+                pass
+        
+        system_prompt = f"""{MISTER_RISKER_PERSONALITY}
+
+You have access to real-time RL model analysis:
+{signals_context}
+
+Provide market analysis that incorporates this RL data. Be specific about:
+1. What the RL model is seeing
+2. Technical factors affecting the signals
+3. Risk considerations
+4. Actionable insights
+
+Use proper mathematical notation for any formulas (LaTeX: $formula$)."""
+        
+        try:
+            response = await asyncio.to_thread(
+                self.llm.invoke,
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query}
+                ]
+            )
+            
+            content = response.content
+            if isinstance(content, list):
+                content = content[0].get("text", "") if content else ""
+            
+            return content
+            
+        except Exception as e:
+            logger.error(f"Analysis response failed: {e}")
+            return f"📊 I couldn't generate analysis: {str(e)}"
     
     async def _llm_analyze_query(self, query: str) -> tuple[str, Optional[str]]:
         """Use LLM to analyze query intent and extract symbol.
@@ -268,16 +470,23 @@ The model is now ready to generate trading signals!"""
             query: User's query
             
         Returns:
-            Tuple of (intent, symbol) where intent is 'train', 'portfolio', or 'signal'
+            Tuple of (intent, symbol) where intent determines response type
         """
         import json
         import asyncio
         
-        system_prompt = """Analyze the user's trading query and determine:
-1. Intent: "train" (train a model), "portfolio" (overview of all assets), or "signal" (specific asset trading signal)
-2. Symbol: If asking about specific asset, extract the symbol (e.g., BTC-USD, ETH-USD, AAPL, NVDA)
+        system_prompt = """Analyze the user's query and determine the best intent:
 
-Symbol mappings:
+**INTENTS**:
+- "signal": User wants a specific trading signal for an asset (buy/sell/hold)
+- "portfolio": User wants overview of multiple assets or general portfolio advice
+- "train": User wants to train/retrain a model
+- "discuss": User wants to discuss trading, ask opinions, or have a conversation
+- "explain": User wants to learn about a concept, formula, or trading topic
+- "analyze": User wants market analysis or technical discussion
+
+**SYMBOL EXTRACTION**:
+If the query mentions a specific asset, extract the symbol:
 - Bitcoin/BTC -> BTC-USD
 - Ethereum/ETH -> ETH-USD  
 - Solana/SOL -> SOL-USD
@@ -288,7 +497,17 @@ Symbol mappings:
 - Amazon -> AMZN
 - Google -> GOOG
 
-Return JSON only: {"intent": "train|portfolio|signal", "symbol": "SYMBOL-OR-NULL"}"""
+**EXAMPLES**:
+- "Should I buy BTC?" -> {"intent": "signal", "symbol": "BTC-USD"}
+- "What do you think about the market?" -> {"intent": "discuss", "symbol": null}
+- "Explain the Sharpe ratio" -> {"intent": "explain", "symbol": null}
+- "Analyze TSLA" -> {"intent": "analyze", "symbol": "TSLA"}
+- "How does reinforcement learning work?" -> {"intent": "explain", "symbol": null}
+- "Train a model for ETH" -> {"intent": "train", "symbol": "ETH-USD"}
+- "Print a formula" -> {"intent": "explain", "symbol": null}
+- "What can you do?" -> {"intent": "discuss", "symbol": null}
+
+Return ONLY valid JSON: {"intent": "signal|portfolio|train|discuss|explain|analyze", "symbol": "SYMBOL-OR-NULL"}"""
 
         try:
             response = await asyncio.to_thread(
@@ -303,15 +522,22 @@ Return JSON only: {"intent": "train|portfolio|signal", "symbol": "SYMBOL-OR-NULL
             if isinstance(content, list):
                 content = content[0].get("text", "") if content else ""
             
+            # Extract JSON from response (handle markdown code blocks)
+            if "```" in content:
+                import re
+                json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+                if json_match:
+                    content = json_match.group(1)
+            
             result = json.loads(content)
-            intent = result.get("intent", "portfolio")
+            intent = result.get("intent", "discuss")
             symbol = result.get("symbol")
-            if symbol in ["null", "NULL", "None", ""]:
+            if symbol in ["null", "NULL", "None", "", None]:
                 symbol = None
                 
             return intent, symbol
             
         except Exception as e:
-            logger.warning(f"LLM analysis failed: {e}, defaulting to portfolio")
-            # No fallback to keyword matching - default to portfolio
-            return "portfolio", None
+            logger.warning(f"LLM analysis failed: {e}, defaulting to discuss")
+            # Default to discussion for general queries
+            return "discuss", None

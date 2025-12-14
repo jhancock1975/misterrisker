@@ -453,14 +453,17 @@ class SchwabAgent:
             routing_prompt = """You are a trading assistant router. Analyze the user's request and determine what action to take.
 
 Return a JSON object with:
-- intent: one of "place_order", "cancel_order", "check_orders", "get_quote", "account_balance", "portfolio", "market_movers", "market_hours", "transaction_history", "top_stocks"
-- details: any relevant extracted details (symbol, quantity, price, order_type, order_id, etc.)
+- intent: one of "place_order", "cancel_order", "check_orders", "get_quote", "get_quotes", "price_history", "option_chain", "account_balance", "portfolio", "market_movers", "market_hours", "transaction_history", "top_stocks"
+- details: any relevant extracted details (symbol, symbols, quantity, price, order_type, order_id, period, etc.)
 
 Intent definitions:
 - "place_order": User wants to BUY or SELL securities (stocks, options)
 - "cancel_order": User wants to CANCEL an existing order
 - "check_orders": User wants to VIEW their existing orders
-- "get_quote": User wants current price/quote for a symbol
+- "get_quote": User wants current price/quote for a SINGLE symbol
+- "get_quotes": User wants current prices/quotes for MULTIPLE symbols at once
+- "price_history": User wants HISTORICAL price data for a symbol (daily, weekly, minute candles, etc.)
+- "option_chain": User wants OPTION CHAIN data (calls, puts, strikes, expirations)
 - "account_balance": User wants to see account balance, cash, buying power
 - "portfolio": User wants to see positions/holdings
 - "market_movers": User wants to see what's moving in the market, top gainers/losers
@@ -474,6 +477,11 @@ Examples:
 - "cancel the order" → {"intent": "cancel_order", "details": {}}
 - "show me my orders" → {"intent": "check_orders", "details": {}}
 - "what's the price of TSLA" → {"intent": "get_quote", "details": {"symbol": "TSLA"}}
+- "get quotes for AAPL, MSFT, and GOOGL" → {"intent": "get_quotes", "details": {"symbols": ["AAPL", "MSFT", "GOOGL"]}}
+- "show me NVDA price history" → {"intent": "price_history", "details": {"symbol": "NVDA", "period": "month"}}
+- "daily prices for AAPL over the last year" → {"intent": "price_history", "details": {"symbol": "AAPL", "period": "year", "frequency": "daily"}}
+- "show me TSLA options" → {"intent": "option_chain", "details": {"symbol": "TSLA"}}
+- "AAPL calls expiring next month" → {"intent": "option_chain", "details": {"symbol": "AAPL", "contract_type": "CALL"}}
 - "show me my recent transactions" → {"intent": "transaction_history", "details": {}}
 - "top 100 stocks" → {"intent": "top_stocks", "details": {"count": 100}}
 - "what are the top movers today" → {"intent": "market_movers", "details": {}}
@@ -527,6 +535,41 @@ Return ONLY the JSON object."""
                         response = f"Quote for {symbols[0]}:\n{self._format_quote(result)}"
                     else:
                         response = "Please specify a stock symbol to get a quote."
+            elif intent == "get_quotes":
+                # Get quotes for multiple symbols at once
+                symbols = details.get("symbols", [])
+                if not symbols:
+                    symbols = self._extract_symbols(query)
+                if symbols:
+                    result = await self.get_multiple_quotes(symbols)
+                    response = f"Quotes for {', '.join(symbols)}:\n{self._format_multiple_quotes(result)}"
+                else:
+                    response = "Please specify stock symbols to get quotes."
+            elif intent == "price_history":
+                # Get historical price data
+                symbol = details.get("symbol", "").upper()
+                if not symbol:
+                    symbols = self._extract_symbols(query)
+                    symbol = symbols[0] if symbols else ""
+                if symbol:
+                    period = details.get("period", "month")
+                    frequency = details.get("frequency", "daily")
+                    result = await self.get_price_history(symbol, period, frequency)
+                    response = f"Price history for {symbol}:\n{self._format_price_history(result, symbol)}"
+                else:
+                    response = "Please specify a stock symbol for price history."
+            elif intent == "option_chain":
+                # Get option chain data
+                symbol = details.get("symbol", "").upper()
+                if not symbol:
+                    symbols = self._extract_symbols(query)
+                    symbol = symbols[0] if symbols else ""
+                if symbol:
+                    contract_type = details.get("contract_type", "ALL")
+                    result = await self.get_option_chain(symbol, contract_type)
+                    response = f"Option chain for {symbol}:\n{self._format_option_chain(result, symbol)}"
+                else:
+                    response = "Please specify a stock symbol for option chain."
             elif intent == "portfolio":
                 result = await self.get_portfolio()
                 response = f"Here are your current positions:\n{self._format_positions(result)}"
@@ -1150,3 +1193,195 @@ Return ONLY the JSON object, no other text."""
             markets = ["equity"]
         
         return await self.execute_tool("get_market_hours", {"markets": markets})
+
+    async def get_multiple_quotes(self, symbols: list[str]) -> dict[str, Any]:
+        """Get quotes for multiple symbols at once.
+        
+        Args:
+            symbols: List of stock symbols
+        
+        Returns:
+            Dictionary of quotes keyed by symbol
+        """
+        return await self.execute_tool("get_quotes", {"symbols": symbols})
+
+    async def get_price_history(
+        self,
+        symbol: str,
+        period: str = "month",
+        frequency: str = "daily"
+    ) -> dict[str, Any]:
+        """Get historical price data for a symbol.
+        
+        Args:
+            symbol: Stock symbol
+            period: Time period - "day", "week", "month", "year", "ytd"
+            frequency: Data frequency - "minute", "daily", "weekly", "monthly"
+        
+        Returns:
+            Price history data with candles
+        """
+        # Map user-friendly period names to API parameters
+        period_map = {
+            "day": ("day", 1),
+            "week": ("day", 5),
+            "month": ("month", 1),
+            "3months": ("month", 3),
+            "6months": ("month", 6),
+            "year": ("year", 1),
+            "5years": ("year", 5),
+            "ytd": ("ytd", 1)
+        }
+        
+        frequency_map = {
+            "minute": "minute",
+            "1min": "minute",
+            "5min": "minute",
+            "daily": "daily",
+            "day": "daily",
+            "weekly": "weekly",
+            "week": "weekly",
+            "monthly": "monthly",
+            "month": "monthly"
+        }
+        
+        period_type, period_value = period_map.get(period.lower(), ("month", 1))
+        freq_type = frequency_map.get(frequency.lower(), "daily")
+        
+        return await self.execute_tool("get_price_history", {
+            "symbol": symbol,
+            "period_type": period_type,
+            "period": period_value,
+            "frequency_type": freq_type,
+            "frequency": 1,
+            "need_previous_close": True
+        })
+
+    async def get_option_chain(
+        self,
+        symbol: str,
+        contract_type: str = "ALL"
+    ) -> dict[str, Any]:
+        """Get option chain for a symbol.
+        
+        Args:
+            symbol: Underlying stock symbol
+            contract_type: "CALL", "PUT", or "ALL"
+        
+        Returns:
+            Option chain data with calls and puts
+        """
+        return await self.execute_tool("get_option_chain", {
+            "symbol": symbol,
+            "contract_type": contract_type.upper(),
+            "strike_count": 10,  # 10 strikes above and below ATM
+            "include_underlying_quote": True
+        })
+
+    def _format_multiple_quotes(self, data: dict[str, Any]) -> str:
+        """Format multiple quotes for display."""
+        if not data:
+            return "No quote data available."
+        
+        lines = ["### 📊 Stock Quotes\n"]
+        
+        for symbol, quote_data in data.items():
+            quote = quote_data.get("quote", {}) if isinstance(quote_data, dict) else {}
+            last_price = quote.get("lastPrice", quote.get("mark", "N/A"))
+            change = quote.get("netChange", 0)
+            change_pct = quote.get("netPercentChange", 0)
+            
+            emoji = "🟢" if change >= 0 else "🔴"
+            sign = "+" if change >= 0 else ""
+            
+            lines.append(f"{emoji} **{symbol}**: ${last_price:,.2f} ({sign}{change:,.2f}, {sign}{change_pct:.2f}%)")
+        
+        return "\n".join(lines)
+
+    def _format_price_history(self, data: dict[str, Any], symbol: str) -> str:
+        """Format price history for display."""
+        if not data:
+            return "No price history available."
+        
+        candles = data.get("candles", [])
+        if not candles:
+            return "No price data available for this period."
+        
+        lines = [f"### 📈 Price History for {symbol}\n"]
+        
+        # Summary stats
+        if candles:
+            first_candle = candles[0]
+            last_candle = candles[-1]
+            open_price = first_candle.get("open", 0)
+            close_price = last_candle.get("close", 0)
+            high = max(c.get("high", 0) for c in candles)
+            low = min(c.get("low", float('inf')) for c in candles)
+            
+            change = close_price - open_price
+            change_pct = (change / open_price * 100) if open_price else 0
+            emoji = "🟢" if change >= 0 else "🔴"
+            
+            lines.append(f"**Period Summary** ({len(candles)} data points)")
+            lines.append(f"• Open: ${open_price:,.2f}")
+            lines.append(f"• Close: ${close_price:,.2f}")
+            lines.append(f"• High: ${high:,.2f}")
+            lines.append(f"• Low: ${low:,.2f}")
+            lines.append(f"• {emoji} Change: ${change:,.2f} ({change_pct:+.2f}%)")
+            
+            # Show last 5 candles
+            lines.append("\n**Recent Prices:**")
+            for candle in candles[-5:]:
+                from datetime import datetime
+                dt = datetime.fromtimestamp(candle.get("datetime", 0) / 1000)
+                c = candle.get("close", 0)
+                lines.append(f"  • {dt.strftime('%Y-%m-%d')}: ${c:,.2f}")
+        
+        return "\n".join(lines)
+
+    def _format_option_chain(self, data: dict[str, Any], symbol: str) -> str:
+        """Format option chain for display."""
+        if not data:
+            return "No option chain data available."
+        
+        lines = [f"### 🎯 Option Chain for {symbol}\n"]
+        
+        # Underlying quote
+        underlying = data.get("underlying", {})
+        if underlying:
+            price = underlying.get("last", underlying.get("mark", "N/A"))
+            lines.append(f"**Underlying Price:** ${price}")
+        
+        # Calls
+        call_map = data.get("callExpDateMap", {})
+        if call_map:
+            lines.append("\n**📈 CALLS** (nearest expirations)")
+            count = 0
+            for exp_date, strikes in call_map.items():
+                if count >= 2:  # Show only 2 expirations
+                    break
+                lines.append(f"\n*Expiration: {exp_date.split(':')[0]}*")
+                for strike, options in list(strikes.items())[:3]:  # Show 3 strikes per expiration
+                    for opt in options:
+                        bid = opt.get("bid", 0)
+                        ask = opt.get("ask", 0)
+                        lines.append(f"  • Strike ${strike}: Bid ${bid:.2f} / Ask ${ask:.2f}")
+                count += 1
+        
+        # Puts
+        put_map = data.get("putExpDateMap", {})
+        if put_map:
+            lines.append("\n**📉 PUTS** (nearest expirations)")
+            count = 0
+            for exp_date, strikes in put_map.items():
+                if count >= 2:
+                    break
+                lines.append(f"\n*Expiration: {exp_date.split(':')[0]}*")
+                for strike, options in list(strikes.items())[:3]:
+                    for opt in options:
+                        bid = opt.get("bid", 0)
+                        ask = opt.get("ask", 0)
+                        lines.append(f"  • Strike ${strike}: Bid ${bid:.2f} / Ask ${ask:.2f}")
+                count += 1
+        
+        return "\n".join(lines)

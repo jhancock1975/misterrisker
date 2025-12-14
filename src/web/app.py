@@ -856,6 +856,27 @@ HTML_TEMPLATE = r"""
     <title>Mister Risker</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="shortcut icon" type="image/svg+xml" href="/static/favicon.svg">
+    <!-- MathJax for math rendering -->
+    <script>
+        MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                processEscapes: true,
+                processEnvironments: true
+            },
+            options: {
+                skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+                ignoreHtmlClass: 'tex2jax_ignore'
+            },
+            startup: {
+                pageReady: () => {
+                    return MathJax.startup.defaultPageReady();
+                }
+            }
+        };
+    </script>
+    <script id="MathJax-script" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <!-- Markdown parser -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <!-- html2canvas for exporting chat to image -->
@@ -1527,6 +1548,76 @@ Ask me anything about trading!`;
         // Render welcome message
         document.getElementById('welcomeMessage').innerHTML = marked.parse(welcomeMarkdown);
         
+        // Math expression storage for protecting from markdown
+        let mathExpressionId = 0;
+        const mathExpressions = {};
+        
+        function protectMath(text) {
+            // Reset for each render
+            mathExpressionId = 0;
+            
+            // Protect display math $$...$$ (can span multiple lines)
+            text = text.replace(/\$\$([\s\S]+?)\$\$/g, function(match, expr) {
+                const id = `<!--MATH:block:${mathExpressionId++}-->`;
+                mathExpressions[id] = { type: 'block', expr: expr };
+                return id;
+            });
+            
+            // Protect display math \[...\] (backslash-bracket)
+            text = text.replace(/\\\[([\s\S]+?)\\\]/g, function(match, expr) {
+                const id = `<!--MATH:block:${mathExpressionId++}-->`;
+                mathExpressions[id] = { type: 'block', expr: expr };
+                return id;
+            });
+            
+            // Protect display math where [ and ] are on their own lines (LLM sometimes outputs this way)
+            text = text.replace(/^\[\s*\n([\s\S]+?)\n\s*\]$/gm, function(match, expr) {
+                const id = `<!--MATH:block:${mathExpressionId++}-->`;
+                mathExpressions[id] = { type: 'block', expr: expr };
+                return id;
+            });
+            
+            // Protect inline math $...$ (single line, no spaces at boundaries)
+            text = text.replace(/\$([^\$\n]+?)\$/g, function(match, expr) {
+                const id = `<!--MATH:inline:${mathExpressionId++}-->`;
+                mathExpressions[id] = { type: 'inline', expr: expr };
+                return id;
+            });
+            
+            // Protect inline math \(...\)
+            text = text.replace(/\\\(([\s\S]+?)\\\)/g, function(match, expr) {
+                const id = `<!--MATH:inline:${mathExpressionId++}-->`;
+                mathExpressions[id] = { type: 'inline', expr: expr };
+                return id;
+            });
+            
+            // Protect inline math (text) that contains LaTeX commands like \mathbf, \frac, etc.
+            text = text.replace(/\(\\[a-zA-Z]+\{[^)]+\}\)/g, function(match) {
+                const id = `<!--MATH:inline:${mathExpressionId++}-->`;
+                // Remove outer parentheses for rendering
+                const expr = match.slice(1, -1);
+                mathExpressions[id] = { type: 'inline', expr: expr };
+                return id;
+            });
+            
+            return text;
+        }
+        
+        function restoreMath(html) {
+            // Restore all protected math expressions with delimiters for MathJax
+            return html.replace(/<!--MATH:(block|inline):(\d+)-->/g, function(match, type, id) {
+                const data = mathExpressions[match];
+                if (data) {
+                    if (data.type === 'block') {
+                        return '<div class="math-block">\\[' + data.expr + '\\]</div>';
+                    } else {
+                        return '<span class="math-inline">\\(' + data.expr + '\\)</span>';
+                    }
+                }
+                return match;
+            });
+        }
+        
         function renderMarkdown(text) {
             // Check if it's a research response
             const isResearch = text.startsWith('🔍');
@@ -1535,8 +1626,14 @@ Ask me anything about trading!`;
             const hasSvg = text.includes('<!--GENERATED_IMAGE:svg-->') || text.includes('```svg');
             const hasAnimation = text.includes('<!--GENERATED_IMAGE:animation-->') || (text.includes('```html') && (text.includes('<script>') || text.includes('<canvas')));
             
+            // Protect math expressions from markdown processing
+            text = protectMath(text);
+            
             // Parse markdown
             let html = marked.parse(text);
+            
+            // Restore math expressions for MathJax to render
+            html = restoreMath(html);
             
             // Handle SVG content - render inline
             if (hasSvg) {
@@ -1658,6 +1755,13 @@ Ask me anything about trading!`;
                 contentDiv.querySelectorAll('pre code').forEach((block) => {
                     hljs.highlightElement(block);
                 });
+                // Render math with MathJax (if available)
+                // Use setTimeout to ensure DOM is updated before MathJax processes
+                setTimeout(() => {
+                    if (typeof MathJax !== 'undefined' && MathJax.typesetPromise) {
+                        MathJax.typesetPromise([contentDiv]).catch((err) => console.log('MathJax error:', err));
+                    }
+                }, 0);
             }
             
             // Add image if provided
