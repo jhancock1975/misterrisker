@@ -10,11 +10,12 @@ import asyncio
 import logging
 import base64
 import time
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Any, AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 # Configure logging
 logging.basicConfig(
@@ -821,9 +822,154 @@ Here's the animation you requested:
 chatbot = TradingChatBot(use_agents=True, enable_chain_of_thought=True)
 
 
+class AutoUpdateService:
+    """Service that tracks market data and logs status periodically."""
+    
+    def __init__(self, chatbot: TradingChatBot, log_interval: int = 300):
+        self.chatbot = chatbot
+        self.log_interval = log_interval  # seconds between status logs (5 min = 300s)
+        self._running = False
+        self._task: asyncio.Task | None = None
+        # Price history: {symbol: [(timestamp, price), ...]}
+        self._price_history: dict[str, list[tuple[datetime, float]]] = {}
+        self._last_log_time: datetime | None = None
+    
+    async def start(self):
+        """Start the price tracking background task."""
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._tracking_loop())
+        logger.info(f"📊 Price tracking service started (status log every {self.log_interval}s)")
+    
+    async def stop(self):
+        """Stop the price tracking service."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("📊 Price tracking service stopped")
+    
+    def _record_price(self, symbol: str, price: float):
+        """Record a price in the history."""
+        now = datetime.now()
+        if symbol not in self._price_history:
+            self._price_history[symbol] = []
+        self._price_history[symbol].append((now, price))
+        # Keep only last 24 hours of data (max ~288 entries per symbol at 5-min intervals)
+        cutoff = now - timedelta(hours=24)
+        self._price_history[symbol] = [
+            (ts, p) for ts, p in self._price_history[symbol] if ts > cutoff
+        ]
+    
+    def get_price_history(self, symbol: str) -> list[tuple[datetime, float]]:
+        """Get price history for a symbol."""
+        return self._price_history.get(symbol, [])
+    
+    async def _tracking_loop(self):
+        """Main loop that tracks prices and logs status."""
+        while self._running:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                # Collect current prices
+                await self._collect_prices()
+                
+                # Log status every 5 minutes
+                now = datetime.now()
+                if self._last_log_time is None or (now - self._last_log_time).seconds >= self.log_interval:
+                    self._log_status()
+                    self._last_log_time = now
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in price tracking loop: {e}")
+                await asyncio.sleep(5)
+    
+    async def _collect_prices(self):
+        """Collect current prices from WebSocket services."""
+        # Get crypto data from Coinbase WebSocket
+        if self.chatbot.coinbase_agent and hasattr(self.chatbot.coinbase_agent, 'websocket_service'):
+            ws = self.chatbot.coinbase_agent.websocket_service
+            if ws and hasattr(ws, 'get_all_latest_candles'):
+                candles = ws.get_all_latest_candles()
+                for product_id, candle in candles.items():
+                    close = candle.get('close', 0)
+                    if close:
+                        try:
+                            self._record_price(product_id, float(close))
+                        except (ValueError, TypeError):
+                            pass
+        
+        # Get stock data from Schwab WebSocket
+        if self.chatbot.schwab_websocket_service:
+            quotes = self.chatbot.schwab_websocket_service.get_all_quotes()
+            for symbol, quote in quotes.items():
+                last = quote.get('last', 0)
+                if last:
+                    try:
+                        self._record_price(symbol, float(last))
+                    except (ValueError, TypeError):
+                        pass
+    
+    def _log_status(self):
+        """Log WebSocket connection status and current prices."""
+        now = datetime.now().strftime("%H:%M:%S")
+        
+        # Check Coinbase WebSocket status
+        coinbase_status = "❌ Disconnected"
+        coinbase_symbols = []
+        if self.chatbot.coinbase_agent and hasattr(self.chatbot.coinbase_agent, 'websocket_service'):
+            ws = self.chatbot.coinbase_agent.websocket_service
+            if ws and ws.is_running:
+                coinbase_status = "✅ Connected"
+                candles = ws.get_all_latest_candles()
+                for product_id, candle in candles.items():
+                    close = candle.get('close', 0)
+                    if close:
+                        try:
+                            coinbase_symbols.append(f"{product_id}=${float(close):,.2f}")
+                        except:
+                            coinbase_symbols.append(f"{product_id}=${close}")
+        
+        # Check Schwab WebSocket status
+        schwab_status = "❌ Disconnected"
+        schwab_symbols = []
+        if self.chatbot.schwab_websocket_service:
+            if self.chatbot.schwab_websocket_service.is_running():
+                schwab_status = "✅ Connected"
+                quotes = self.chatbot.schwab_websocket_service.get_all_quotes()
+                for symbol, quote in quotes.items():
+                    last = quote.get('last', 0)
+                    if last:
+                        try:
+                            schwab_symbols.append(f"{symbol}=${float(last):,.2f}")
+                        except:
+                            schwab_symbols.append(f"{symbol}=${last}")
+        
+        # Log the status
+        logger.info(f"📊 === Market Status ({now}) ===")
+        logger.info(f"   Coinbase WebSocket: {coinbase_status}")
+        if coinbase_symbols:
+            logger.info(f"   Crypto: {', '.join(coinbase_symbols)}")
+        logger.info(f"   Schwab WebSocket: {schwab_status}")
+        if schwab_symbols:
+            logger.info(f"   Stocks: {', '.join(schwab_symbols)}")
+        logger.info(f"   Price history: {len(self._price_history)} symbols tracked")
+
+
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize resources on startup."""
+    global auto_update_service
+    
     await chatbot.initialize()
     
     # Start WebSocket monitoring if Coinbase agent is available
@@ -836,7 +982,15 @@ async def lifespan(app: FastAPI):
         await chatbot.schwab_websocket_service.start()
         logger.info("  ✓ Schwab WebSocket quote monitoring started")
     
+    # Start price tracking service (logs WebSocket status every 5 minutes)
+    auto_update_service = AutoUpdateService(chatbot, log_interval=300)
+    await auto_update_service.start()
+    
     yield
+    
+    # Cleanup: Stop auto-update service
+    if auto_update_service:
+        await auto_update_service.stop()
     
     # Cleanup: Stop WebSocket monitoring
     if chatbot.coinbase_agent and hasattr(chatbot.coinbase_agent, 'websocket_service'):
@@ -992,6 +1146,32 @@ HTML_TEMPLATE = r"""
         
         .message.assistant {
             align-items: flex-start;
+        }
+        
+        /* Auto-update messages have a distinctive style */
+        .message.assistant.auto-update {
+            opacity: 1;
+        }
+        
+        .message.assistant.auto-update .message-content {
+            background: linear-gradient(135deg, #1e3a5f 0%, #2d4a6f 100%);
+            border-left: 4px solid #60a5fa;
+            color: #ffffff;
+        }
+        
+        .message.assistant.auto-update .message-content strong {
+            color: #93c5fd;
+            font-weight: 700;
+        }
+        
+        .message.assistant.auto-update .message-content p {
+            color: #e0e7ff;
+            margin: 8px 0;
+        }
+        
+        .message.assistant.auto-update .message-label {
+            color: #60a5fa;
+            font-weight: 600;
         }
         
         .message-wrapper {
@@ -1208,6 +1388,35 @@ HTML_TEMPLATE = r"""
         .generated-image.svg-container svg {
             max-width: 100%;
             height: auto;
+        }
+        
+        /* Charts generated by agents - large size for visibility */
+        .generated-chart {
+            margin: 20px 0;
+            padding: 15px;
+            background: #1a1a2e;
+            border-radius: 12px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            width: 100%;
+            min-width: 800px;
+            overflow-x: auto;
+        }
+        
+        .generated-chart svg {
+            width: 1000px;
+            height: 500px;
+            min-width: 1000px;
+            min-height: 500px;
+            display: block;
+        }
+        
+        /* Allow message content to expand for charts */
+        .message-content:has(.generated-chart) {
+            max-width: none;
+            width: fit-content;
+            min-width: 1050px;
         }
         
         .generated-image.animation-container {
@@ -1643,12 +1852,31 @@ Ask me anything about trading!`;
             // Check if it contains generated image content
             const hasSvg = text.includes('<!--GENERATED_IMAGE:svg-->') || text.includes('```svg');
             const hasAnimation = text.includes('<!--GENERATED_IMAGE:animation-->') || (text.includes('```html') && (text.includes('<script>') || text.includes('<canvas')));
+            const hasChart = text.includes('<div class="generated-chart">');
+            
+            // Protect chart divs from markdown processing (extract and restore later)
+            let chartPlaceholders = {};
+            let chartId = 0;
+            if (hasChart) {
+                text = text.replace(/<div class="generated-chart">[\s\S]*?<\/svg>\s*<\/div>/g, function(match) {
+                    const id = `<!--CHART:${chartId++}-->`;
+                    chartPlaceholders[id] = match;
+                    return id;
+                });
+            }
             
             // Protect math expressions from markdown processing
             text = protectMath(text);
             
             // Parse markdown
             let html = marked.parse(text);
+            
+            // Restore chart divs
+            if (hasChart) {
+                for (const [id, chartHtml] of Object.entries(chartPlaceholders)) {
+                    html = html.replace(id, chartHtml);
+                }
+            }
             
             // Restore math expressions for MathJax to render
             html = restoreMath(html);
@@ -2024,6 +2252,12 @@ Ask me anything about trading!`;
             }
         }
         
+        // ============================================
+        // AUTO-UPDATE: Disabled - now logs to server only
+        // ============================================
+        // Price tracking and WebSocket status now logged to server every 5 minutes
+        // Browser auto-updates have been disabled
+        
         messageInput.focus();
     </script>
 </body>
@@ -2035,6 +2269,27 @@ Ask me anything about trading!`;
 async def get_chat_page():
     """Serve the chat interface."""
     return HTML_TEMPLATE
+
+
+@app.get("/updates")
+async def get_updates():
+    """Server-Sent Events endpoint for auto-updates (disabled).
+    
+    Browser auto-updates have been disabled.
+    Price tracking and WebSocket status are now logged to server every 5 minutes.
+    """
+    async def event_generator() -> AsyncGenerator[str, None]:
+        yield f"data: {json.dumps({'info': 'Auto-updates disabled. Check server logs for WebSocket status.'})}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 
 @app.post("/chat")

@@ -11,14 +11,18 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import requests
 import websockets
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# Eastern timezone for market hours
+ET = ZoneInfo("America/New_York")
 
 
 # =============================================================================
@@ -89,12 +93,56 @@ class SchwabWebSocketService:
         self._customer_id: str | None = None
         self._correl_id: str | None = None
         
+        # Track consecutive quick disconnects (market likely closed)
+        self._quick_disconnect_count = 0
+        self._last_connect_time: float = 0
+        
         # Store latest quote data for each symbol
         self._latest_quotes: dict[str, dict[str, Any]] = {}
         
         # Track quote update counts for summary
         self._quote_counts: dict[str, int] = {}
         self._last_summary_time: float = time.time()
+    
+    def _is_market_hours(self) -> bool:
+        """Check if we're within US stock market hours (with buffer).
+        
+        Market hours: Mon-Fri 9:30 AM - 4:00 PM ET
+        We add 30 min buffer on each side for pre/post market activity.
+        """
+        now = datetime.now(ET)
+        # Weekend check (Saturday=5, Sunday=6)
+        if now.weekday() >= 5:
+            return False
+        # Market hours check (9:00 AM - 4:30 PM with buffer)
+        market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        market_close = now.replace(hour=16, minute=30, second=0, microsecond=0)
+        return market_open <= now <= market_close
+    
+    def _time_until_market_open(self) -> timedelta:
+        """Calculate time until next market open."""
+        now = datetime.now(ET)
+        # Find next weekday
+        days_ahead = 0
+        if now.weekday() == 5:  # Saturday
+            days_ahead = 2
+        elif now.weekday() == 6:  # Sunday
+            days_ahead = 1
+        elif now.hour >= 17:  # After 5 PM, try next weekday
+            days_ahead = 1
+            if now.weekday() == 4:  # Friday after 5 PM
+                days_ahead = 3
+        
+        next_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if days_ahead > 0:
+            next_open = next_open + timedelta(days=days_ahead)
+        elif now >= next_open.replace(hour=16, minute=30):
+            # Past market close today, try tomorrow
+            next_open = next_open + timedelta(days=1)
+            if next_open.weekday() >= 5:
+                next_open = next_open + timedelta(days=(7 - next_open.weekday()))
+        
+        return next_open - now
     
     def _refresh_access_token(self) -> str:
         """Refresh the Schwab access token.
@@ -388,6 +436,26 @@ class SchwabWebSocketService:
         
         while self._running:
             try:
+                # Check if market is open before connecting
+                if not self._is_market_hours():
+                    wait_time = self._time_until_market_open()
+                    wait_minutes = int(wait_time.total_seconds() / 60)
+                    wait_hours = wait_minutes // 60
+                    wait_mins = wait_minutes % 60
+                    logger.info(
+                        f"📈 Market closed. Schwab WebSocket will reconnect in "
+                        f"~{wait_hours}h {wait_mins}m (at market open)"
+                    )
+                    # Wait in 5-minute intervals, checking if we should stop
+                    while self._running and not self._is_market_hours():
+                        await asyncio.sleep(300)  # Check every 5 minutes
+                    if not self._running:
+                        break
+                    logger.info("📈 Market may be opening, attempting to connect...")
+                
+                # Record connect time to detect quick disconnects
+                self._last_connect_time = time.time()
+                
                 # Connect and login
                 if not await self._connect():
                     logger.warning(f"⚠️ Connection failed, retrying in {self._reconnect_delay}s...")
@@ -396,6 +464,9 @@ class SchwabWebSocketService:
                 
                 # Subscribe to quotes
                 await self._subscribe()
+                
+                # Reset quick disconnect counter on successful subscription
+                self._quick_disconnect_count = 0
                 
                 # Handle messages
                 while self._running and self._ws:
@@ -410,6 +481,20 @@ class SchwabWebSocketService:
                         logger.debug("Sending keepalive ping")
                         continue
                     except websockets.exceptions.ConnectionClosed as e:
+                        # Check if this was a quick disconnect (< 10 seconds)
+                        connection_duration = time.time() - self._last_connect_time
+                        if connection_duration < 10:
+                            self._quick_disconnect_count += 1
+                            if self._quick_disconnect_count >= 3:
+                                logger.warning(
+                                    f"⚠️ WebSocket closed quickly ({connection_duration:.1f}s) - "
+                                    f"market is likely closed. Waiting 5 minutes before retry."
+                                )
+                                await asyncio.sleep(300)
+                                self._quick_disconnect_count = 0
+                                break
+                        else:
+                            self._quick_disconnect_count = 0
                         logger.warning(f"⚠️ WebSocket connection closed: {e}")
                         break
                         

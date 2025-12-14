@@ -1452,8 +1452,8 @@ Provide analysis addressing the user's question."""
         Returns:
             SVG string
         """
-        width, height = 600, 300
-        margin = 50
+        width, height = 1200, 600
+        margin = 100
         chart_width = width - 2 * margin
         chart_height = height - 2 * margin
         
@@ -1488,22 +1488,22 @@ Provide analysis addressing the user's question."""
                 y = margin + chart_height - ((price - min_price) / price_range * chart_height)
                 points.append(f"{x:.1f},{y:.1f}")
             
-            svg_parts.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2"/>')
+            svg_parts.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="4"/>')
             
             # Legend
-            legend_y = margin + 20 + idx * 20
-            svg_parts.append(f'<rect x="{margin + 10}" y="{legend_y - 10}" width="15" height="15" fill="{color}"/>')
-            svg_parts.append(f'<text x="{margin + 30}" y="{legend_y}" fill="white" font-size="12">{crypto}</text>')
+            legend_y = margin + 40 + idx * 40
+            svg_parts.append(f'<rect x="{margin + 20}" y="{legend_y - 18}" width="28" height="28" fill="{color}"/>')
+            svg_parts.append(f'<text x="{margin + 60}" y="{legend_y}" fill="white" font-size="20">{crypto}</text>')
         
         # Axis labels
-        svg_parts.append(f'<text x="{width/2}" y="{height - 10}" fill="white" font-size="12" text-anchor="middle">Time (7 days)</text>')
-        svg_parts.append(f'<text x="15" y="{height/2}" fill="white" font-size="12" transform="rotate(-90, 15, {height/2})">Price (USD)</text>')
+        svg_parts.append(f'<text x="{width/2}" y="{height - 20}" fill="white" font-size="20" text-anchor="middle">Time (7 days)</text>')
+        svg_parts.append(f'<text x="30" y="{height/2}" fill="white" font-size="20" transform="rotate(-90, 30, {height/2})">Price (USD)</text>')
         
         # Price labels
         for i in range(5):
             y = margin + (i * chart_height / 4)
             price_val = max_price - (i * price_range / 4)
-            svg_parts.append(f'<text x="{margin - 5}" y="{y + 4}" fill="white" font-size="10" text-anchor="end">${price_val:,.0f}</text>')
+            svg_parts.append(f'<text x="{margin - 10}" y="{y + 6}" fill="white" font-size="16" text-anchor="end">${price_val:,.0f}</text>')
         
         svg_parts.append('</svg>')
         return '\n'.join(svg_parts)
@@ -1545,8 +1545,8 @@ Provide analysis addressing the user's question."""
         
         correlation = numerator / (denom1 * denom2) if denom1 * denom2 > 0 else 0
         
-        width, height = 600, 350
-        margin = 60
+        width, height = 1200, 700
+        margin = 120
         chart_size = min(width, height) - 2 * margin
         
         # Scale changes for plotting
@@ -1557,15 +1557,15 @@ Provide analysis addressing the user's question."""
             f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">',
             f'<rect width="{width}" height="{height}" fill="#1a1a2e"/>',
             # Grid
-            f'<line x1="{margin}" y1="{margin + chart_size/2}" x2="{margin + chart_size}" y2="{margin + chart_size/2}" stroke="#444" stroke-width="1"/>',
-            f'<line x1="{margin + chart_size/2}" y1="{margin}" x2="{margin + chart_size/2}" y2="{margin + chart_size}" stroke="#444" stroke-width="1"/>',
+            f'<line x1="{margin}" y1="{margin + chart_size/2}" x2="{margin + chart_size}" y2="{margin + chart_size/2}" stroke="#444" stroke-width="2"/>',
+            f'<line x1="{margin + chart_size/2}" y1="{margin}" x2="{margin + chart_size/2}" y2="{margin + chart_size}" stroke="#444" stroke-width="2"/>',
         ]
         
         # Plot points
         for i in range(n):
             x = margin + chart_size/2 + (changes1[i] / max_change * chart_size/2)
             y = margin + chart_size/2 - (changes2[i] / max_change * chart_size/2)
-            svg_parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#60a5fa" opacity="0.8"/>')
+            svg_parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="#60a5fa" opacity="0.8"/>')
         
         # Correlation line (trend line)
         if abs(correlation) > 0.1:
@@ -1573,18 +1573,18 @@ Provide analysis addressing the user's question."""
             x1, x2 = margin, margin + chart_size
             y1 = margin + chart_size/2 + (slope * chart_size/2)
             y2 = margin + chart_size/2 - (slope * chart_size/2)
-            svg_parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#f97316" stroke-width="2" stroke-dasharray="5,5"/>')
+            svg_parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#f97316" stroke-width="4" stroke-dasharray="10,10"/>')
         
         # Labels
-        svg_parts.append(f'<text x="{width/2}" y="{height - 15}" fill="white" font-size="12" text-anchor="middle">{symbols[0]} Price Change (%)</text>')
-        svg_parts.append(f'<text x="20" y="{height/2}" fill="white" font-size="12" transform="rotate(-90, 20, {height/2})">{symbols[1]} Price Change (%)</text>')
+        svg_parts.append(f'<text x="{width/2}" y="{height - 30}" fill="white" font-size="20" text-anchor="middle">{symbols[0]} Price Change (%)</text>')
+        svg_parts.append(f'<text x="40" y="{height/2}" fill="white" font-size="20" transform="rotate(-90, 40, {height/2})">{symbols[1]} Price Change (%)</text>')
         
         # Correlation value
         corr_color = "#22c55e" if correlation > 0.5 else "#f97316" if correlation > 0 else "#ef4444"
-        svg_parts.append(f'<text x="{width - margin}" y="{margin + 20}" fill="{corr_color}" font-size="14" text-anchor="end">r = {correlation:.3f}</text>')
+        svg_parts.append(f'<text x="{width - margin}" y="{margin + 40}" fill="{corr_color}" font-size="24" text-anchor="end">r = {correlation:.3f}</text>')
         
         corr_label = "Strong Positive" if correlation > 0.7 else "Moderate Positive" if correlation > 0.3 else "Weak" if correlation > -0.3 else "Negative"
-        svg_parts.append(f'<text x="{width - margin}" y="{margin + 40}" fill="white" font-size="11" text-anchor="end">{corr_label} Correlation</text>')
+        svg_parts.append(f'<text x="{width - margin}" y="{margin + 70}" fill="white" font-size="18" text-anchor="end">{corr_label} Correlation</text>')
         
         svg_parts.append('</svg>')
         return '\n'.join(svg_parts)

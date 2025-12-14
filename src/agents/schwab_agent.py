@@ -1480,10 +1480,10 @@ Return ONLY the JSON object, no other text."""
         if not prices:
             return "<p>No data to chart</p>"
         
-        # Chart dimensions
-        width = 600
-        height = 300
-        margin = {"top": 30, "right": 30, "bottom": 40, "left": 60}
+        # Chart dimensions (2x size for better visibility)
+        width = 1200
+        height = 600
+        margin = {"top": 60, "right": 60, "bottom": 80, "left": 120}
         chart_width = width - margin["left"] - margin["right"]
         chart_height = height - margin["top"] - margin["bottom"]
         
@@ -1527,8 +1527,8 @@ Return ONLY the JSON object, no other text."""
         for i in range(num_labels):
             price_val = min_price + (i / (num_labels - 1)) * price_range
             y_pos = margin["top"] + (1 - i / (num_labels - 1)) * chart_height
-            y_labels.append(f'<text x="{margin["left"] - 10}" y="{y_pos}" text-anchor="end" font-size="11" fill="#9ca3af">${price_val:,.0f}</text>')
-            y_labels.append(f'<line x1="{margin["left"]}" y1="{y_pos}" x2="{margin["left"] + chart_width}" y2="{y_pos}" stroke="#374151" stroke-width="1" stroke-dasharray="4"/>')
+            y_labels.append(f'<text x="{margin["left"] - 15}" y="{y_pos}" text-anchor="end" font-size="18" fill="#9ca3af">${price_val:,.0f}</text>')
+            y_labels.append(f'<line x1="{margin["left"]}" y1="{y_pos}" x2="{margin["left"] + chart_width}" y2="{y_pos}" stroke="#374151" stroke-width="1" stroke-dasharray="6"/>')
         
         # X-axis labels (show a few dates)
         x_labels = []
@@ -1537,7 +1537,7 @@ Return ONLY the JSON object, no other text."""
             for i in range(0, len(dates), step):
                 if i < len(dates):
                     x_pos = margin["left"] + (i / (len(dates) - 1)) * chart_width if len(dates) > 1 else margin["left"]
-                    x_labels.append(f'<text x="{x_pos}" y="{height - 10}" text-anchor="middle" font-size="10" fill="#9ca3af">{dates[i]}</text>')
+                    x_labels.append(f'<text x="{x_pos}" y="{height - 20}" text-anchor="middle" font-size="16" fill="#9ca3af">{dates[i]}</text>')
         
         svg = f'''<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="background: #1a1a2e; border-radius: 8px;">
     <!-- Grid lines and Y-axis labels -->
@@ -1550,19 +1550,19 @@ Return ONLY the JSON object, no other text."""
     <path d="{area_path}" fill="{fill_color}"/>
     
     <!-- Price line -->
-    <path d="{line_path}" fill="none" stroke="{line_color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="{line_path}" fill="none" stroke="{line_color}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
     
     <!-- Latest price dot -->
-    <circle cx="{points[-1].split(',')[0]}" cy="{points[-1].split(',')[1]}" r="4" fill="{line_color}"/>
+    <circle cx="{points[-1].split(',')[0]}" cy="{points[-1].split(',')[1]}" r="8" fill="{line_color}"/>
     
     <!-- Title -->
-    <text x="{width / 2}" y="18" text-anchor="middle" font-size="14" font-weight="bold" fill="#ffffff">{symbol}</text>
+    <text x="{width / 2}" y="36" text-anchor="middle" font-size="24" font-weight="bold" fill="#ffffff">{symbol}</text>
     
     <!-- Y-axis title -->
-    <text x="15" y="{height / 2}" text-anchor="middle" font-size="11" fill="#9ca3af" transform="rotate(-90, 15, {height / 2})">Price (USD)</text>
+    <text x="30" y="{height / 2}" text-anchor="middle" font-size="18" fill="#9ca3af" transform="rotate(-90, 30, {height / 2})">Price (USD)</text>
     
     <!-- X-axis title -->
-    <text x="{width / 2}" y="{height - 2}" text-anchor="middle" font-size="10" fill="#6b7280">Date</text>
+    <text x="{width / 2}" y="{height - 4}" text-anchor="middle" font-size="16" fill="#6b7280">Date</text>
 </svg>'''
         
         return svg
