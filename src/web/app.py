@@ -46,6 +46,7 @@ from src.agents.finrl_agent import FinRLAgent
 from src.services.finrl_service import FinRLService
 from src.services.trading_strategy import TradingStrategyService
 from src.services.rag_service import RAGService
+from src.services.schwab_websocket import SchwabWebSocketService
 
 # Load environment variables
 load_dotenv()
@@ -87,6 +88,7 @@ class TradingChatBot:
         self.trading_strategy_service: TradingStrategyService | None = None
         self.supervisor_agent: SupervisorAgent | None = None
         self.rag_service: RAGService | None = None
+        self.schwab_websocket_service: SchwabWebSocketService | None = None
         
         # Configuration
         self.use_agents = use_agents
@@ -234,6 +236,13 @@ If you don't need to call a tool, just respond normally with text."""
                         checkpointer=self.checkpointer
                     )
                     logger.info("  ✓ Schwab Agent initialized")
+                    
+                    # Initialize Schwab WebSocket service for real-time quotes
+                    self.schwab_websocket_service = SchwabWebSocketService(
+                        client_id=schwab_client_id,
+                        client_secret=schwab_client_secret,
+                        refresh_token=schwab_refresh_token,
+                    )
             except Exception as e:
                 logger.warning(f"  ✗ Could not initialize Schwab: {e}")
         else:
@@ -822,6 +831,11 @@ async def lifespan(app: FastAPI):
         await chatbot.coinbase_agent.ensure_websocket_started()
         logger.info("  ✓ Coinbase WebSocket candle monitoring started")
     
+    # Start Schwab WebSocket monitoring if available
+    if chatbot.schwab_websocket_service:
+        await chatbot.schwab_websocket_service.start()
+        logger.info("  ✓ Schwab WebSocket quote monitoring started")
+    
     yield
     
     # Cleanup: Stop WebSocket monitoring
@@ -830,6 +844,10 @@ async def lifespan(app: FastAPI):
         if ws_service and ws_service.is_running:
             await ws_service.stop()
             logger.info("  ✓ Coinbase WebSocket monitoring stopped")
+    
+    if chatbot.schwab_websocket_service and chatbot.schwab_websocket_service.is_running():
+        await chatbot.schwab_websocket_service.stop()
+        logger.info("  ✓ Schwab WebSocket monitoring stopped")
 
 
 # Create FastAPI app

@@ -35,3 +35,5 @@ if there is some other form of long-running test
 if there is a long-runing test that is not an end-to-end test, ask what folder to create to put it in
 
 after major changes check for opportunities to refactor for things like removing dead code, factoring out duplicated logic, and clarifying logic
+
+make sure to keep documentation up to date.
