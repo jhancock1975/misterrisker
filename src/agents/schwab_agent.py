@@ -6,6 +6,7 @@ Server tools to execute trading operations.
 
 import asyncio
 import os
+from datetime import datetime
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -453,7 +454,7 @@ class SchwabAgent:
             routing_prompt = """You are a trading assistant router. Analyze the user's request and determine what action to take.
 
 Return a JSON object with:
-- intent: one of "place_order", "cancel_order", "check_orders", "get_quote", "get_quotes", "price_history", "option_chain", "account_balance", "portfolio", "market_movers", "market_hours", "transaction_history", "top_stocks"
+- intent: one of "place_order", "cancel_order", "check_orders", "get_quote", "get_quotes", "price_history", "chart", "option_chain", "account_balance", "portfolio", "market_movers", "market_hours", "transaction_history", "top_stocks"
 - details: any relevant extracted details (symbol, symbols, quantity, price, order_type, order_id, period, etc.)
 
 Intent definitions:
@@ -463,6 +464,7 @@ Intent definitions:
 - "get_quote": User wants current price/quote for a SINGLE symbol
 - "get_quotes": User wants current prices/quotes for MULTIPLE symbols at once
 - "price_history": User wants HISTORICAL price data for a symbol (daily, weekly, minute candles, etc.)
+- "chart": User wants to DRAW, PLOT, VISUALIZE, or CHART stock price data (generates an SVG chart)
 - "option_chain": User wants OPTION CHAIN data (calls, puts, strikes, expirations)
 - "account_balance": User wants to see account balance, cash, buying power
 - "portfolio": User wants to see positions/holdings
@@ -480,6 +482,9 @@ Examples:
 - "get quotes for AAPL, MSFT, and GOOGL" → {"intent": "get_quotes", "details": {"symbols": ["AAPL", "MSFT", "GOOGL"]}}
 - "show me NVDA price history" → {"intent": "price_history", "details": {"symbol": "NVDA", "period": "month"}}
 - "daily prices for AAPL over the last year" → {"intent": "price_history", "details": {"symbol": "AAPL", "period": "year", "frequency": "daily"}}
+- "draw a chart of NVDA prices" → {"intent": "chart", "details": {"symbol": "NVDA"}}
+- "plot AAPL stock price from december 12th" → {"intent": "chart", "details": {"symbol": "AAPL", "start_date": "december 12th"}}
+- "visualize TSLA performance" → {"intent": "chart", "details": {"symbol": "TSLA"}}
 - "show me TSLA options" → {"intent": "option_chain", "details": {"symbol": "TSLA"}}
 - "AAPL calls expiring next month" → {"intent": "option_chain", "details": {"symbol": "AAPL", "contract_type": "CALL"}}
 - "show me my recent transactions" → {"intent": "transaction_history", "details": {}}
@@ -558,6 +563,16 @@ Return ONLY the JSON object."""
                     response = f"Price history for {symbol}:\n{self._format_price_history(result, symbol)}"
                 else:
                     response = "Please specify a stock symbol for price history."
+            elif intent == "chart":
+                # Generate a visual chart for stock price data
+                symbol = details.get("symbol", "").upper()
+                if not symbol:
+                    symbols = self._extract_symbols(query)
+                    symbol = symbols[0] if symbols else ""
+                if symbol:
+                    response = await self._handle_chart_request(symbol, details)
+                else:
+                    response = "Please specify a stock symbol to chart (e.g., NVDA, AAPL, TSLA)."
             elif intent == "option_chain":
                 # Get option chain data
                 symbol = details.get("symbol", "").upper()
@@ -1385,3 +1400,169 @@ Return ONLY the JSON object, no other text."""
                 count += 1
         
         return "\n".join(lines)
+
+    async def _handle_chart_request(self, symbol: str, details: dict) -> str:
+        """Generate an SVG chart for stock price data.
+        
+        Args:
+            symbol: Stock ticker symbol (e.g., NVDA, AAPL)
+            details: Additional details like start_date, period
+            
+        Returns:
+            SVG chart wrapped in markdown or error message
+        """
+        try:
+            # Get price history for charting
+            period = details.get("period", "month")
+            frequency = details.get("frequency", "daily")
+            
+            result = await self.get_price_history(symbol, period, frequency)
+            
+            if not result or "candles" not in result:
+                return f"❌ Unable to fetch price data for {symbol}"
+            
+            candles = result.get("candles", [])
+            if not candles:
+                return f"❌ No price data available for {symbol}"
+            
+            # Extract close prices and dates
+            prices = []
+            dates = []
+            for candle in candles[-30:]:  # Last 30 data points
+                if isinstance(candle, dict):
+                    prices.append(float(candle.get("close", 0)))
+                    timestamp = candle.get("datetime", 0)
+                    if timestamp:
+                        dt = datetime.fromtimestamp(timestamp / 1000)
+                        dates.append(dt.strftime("%m/%d"))
+            
+            if not prices:
+                return f"❌ Unable to parse price data for {symbol}"
+            
+            # Generate SVG chart
+            svg = self._generate_stock_price_chart(symbol, prices, dates)
+            
+            # Calculate some stats
+            current_price = prices[-1] if prices else 0
+            start_price = prices[0] if prices else 0
+            change_pct = ((current_price - start_price) / start_price * 100) if start_price else 0
+            change_emoji = "📈" if change_pct >= 0 else "📉"
+            
+            return f"""📊 **Price Chart: {symbol}**
+
+<div class="generated-chart">
+{svg}
+</div>
+
+{change_emoji} **{symbol}**: ${current_price:,.2f} ({change_pct:+.2f}% over period)
+*Data: {len(prices)} days, from Schwab*"""
+            
+        except Exception as e:
+            logger.error(f"Error generating stock chart: {e}")
+            return f"❌ Error generating chart for {symbol}: {str(e)}"
+
+    def _generate_stock_price_chart(
+        self, 
+        symbol: str, 
+        prices: list[float], 
+        dates: list[str]
+    ) -> str:
+        """Generate an SVG line chart for stock price data.
+        
+        Args:
+            symbol: Stock ticker symbol
+            prices: List of close prices
+            dates: List of date strings
+            
+        Returns:
+            SVG markup string
+        """
+        if not prices:
+            return "<p>No data to chart</p>"
+        
+        # Chart dimensions
+        width = 600
+        height = 300
+        margin = {"top": 30, "right": 30, "bottom": 40, "left": 60}
+        chart_width = width - margin["left"] - margin["right"]
+        chart_height = height - margin["top"] - margin["bottom"]
+        
+        # Calculate scales
+        min_price = min(prices)
+        max_price = max(prices)
+        price_range = max_price - min_price
+        if price_range == 0:
+            price_range = 1  # Prevent division by zero
+        
+        # Add 5% padding to price range
+        padding = price_range * 0.05
+        min_price -= padding
+        max_price += padding
+        price_range = max_price - min_price
+        
+        # Generate path for line chart
+        points = []
+        for i, price in enumerate(prices):
+            x = margin["left"] + (i / (len(prices) - 1)) * chart_width if len(prices) > 1 else margin["left"] + chart_width / 2
+            y = margin["top"] + (1 - (price - min_price) / price_range) * chart_height
+            points.append(f"{x:.1f},{y:.1f}")
+        
+        line_path = "M " + " L ".join(points)
+        
+        # Create area fill (gradient below the line)
+        first_point = points[0]
+        last_point = points[-1]
+        area_path = f"M {first_point} L " + " L ".join(points[1:]) + \
+                   f" L {margin['left'] + chart_width},{margin['top'] + chart_height}" + \
+                   f" L {margin['left']},{margin['top'] + chart_height} Z"
+        
+        # Determine color based on price trend
+        is_up = prices[-1] >= prices[0]
+        line_color = "#22c55e" if is_up else "#ef4444"  # Green or red
+        fill_color = "#22c55e20" if is_up else "#ef444420"  # Transparent version
+        
+        # Y-axis labels
+        y_labels = []
+        num_labels = 5
+        for i in range(num_labels):
+            price_val = min_price + (i / (num_labels - 1)) * price_range
+            y_pos = margin["top"] + (1 - i / (num_labels - 1)) * chart_height
+            y_labels.append(f'<text x="{margin["left"] - 10}" y="{y_pos}" text-anchor="end" font-size="11" fill="#9ca3af">${price_val:,.0f}</text>')
+            y_labels.append(f'<line x1="{margin["left"]}" y1="{y_pos}" x2="{margin["left"] + chart_width}" y2="{y_pos}" stroke="#374151" stroke-width="1" stroke-dasharray="4"/>')
+        
+        # X-axis labels (show a few dates)
+        x_labels = []
+        if dates and len(dates) >= 5:
+            step = len(dates) // 5
+            for i in range(0, len(dates), step):
+                if i < len(dates):
+                    x_pos = margin["left"] + (i / (len(dates) - 1)) * chart_width if len(dates) > 1 else margin["left"]
+                    x_labels.append(f'<text x="{x_pos}" y="{height - 10}" text-anchor="middle" font-size="10" fill="#9ca3af">{dates[i]}</text>')
+        
+        svg = f'''<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="background: #1a1a2e; border-radius: 8px;">
+    <!-- Grid lines and Y-axis labels -->
+    {"".join(y_labels)}
+    
+    <!-- X-axis labels -->
+    {"".join(x_labels)}
+    
+    <!-- Area fill -->
+    <path d="{area_path}" fill="{fill_color}"/>
+    
+    <!-- Price line -->
+    <path d="{line_path}" fill="none" stroke="{line_color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    
+    <!-- Latest price dot -->
+    <circle cx="{points[-1].split(',')[0]}" cy="{points[-1].split(',')[1]}" r="4" fill="{line_color}"/>
+    
+    <!-- Title -->
+    <text x="{width / 2}" y="18" text-anchor="middle" font-size="14" font-weight="bold" fill="#ffffff">{symbol}</text>
+    
+    <!-- Y-axis title -->
+    <text x="15" y="{height / 2}" text-anchor="middle" font-size="11" fill="#9ca3af" transform="rotate(-90, 15, {height / 2})">Price (USD)</text>
+    
+    <!-- X-axis title -->
+    <text x="{width / 2}" y="{height - 2}" text-anchor="middle" font-size="10" fill="#6b7280">Date</text>
+</svg>'''
+        
+        return svg

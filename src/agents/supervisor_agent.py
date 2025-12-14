@@ -556,6 +556,7 @@ route to Coinbase - this is blockchain data, NOT stock ticker "SOL"!
 - **REAL-TIME STOCK MARKET DATA**: Stock quotes, prices, bid/ask spreads
 - **MULTI-SYMBOL QUOTES**: Get quotes for multiple stocks at once (AAPL, MSFT, GOOGL together)
 - **PRICE HISTORY**: Historical price data (daily, weekly, monthly candles for charting/analysis)
+- **STOCK CHARTS**: Generate price charts, visualizations, plots for ANY STOCK (AAPL, NVDA, TSLA, etc.)
 - **OPTION CHAINS**: Full option data (calls, puts, strikes, expirations, Greeks)
 - **Market movers**: Top gainers, losers, most active stocks
 - **Market hours**: Trading sessions, pre-market, after-hours
@@ -570,6 +571,7 @@ route to Coinbase - this is blockchain data, NOT stock ticker "SOL"!
 - User asks about STOCK PRICES (AAPL, TSLA, any stock quote)
 - User asks for QUOTES on MULTIPLE stocks at once
 - User asks about **price history** or **historical prices** for stocks
+- **User asks to DRAW, PLOT, CHART, or GRAPH stock data** (NVDA chart, AAPL prices, etc.)
 - User asks about **options**, **option chains**, calls, puts, strikes
 - User asks about MARKET DATA (movers, gainers, losers)
 - User asks about stocks, equities, options, or anything stock-related
@@ -582,6 +584,7 @@ MU (Micron), INTC (Intel), NFLX, and ALL OTHER stock ticker symbols
 **CRITICAL**: This is the ONLY agent that can get STOCK PRICES. For any stock quote, use Schwab!
 **CRITICAL**: For OPTION CHAINS and OPTIONS DATA, use Schwab!
 **CRITICAL**: For PRICE HISTORY and HISTORICAL DATA on stocks, use Schwab!
+**CRITICAL**: For STOCK CHARTS (draw/plot/chart/graph NVDA, AAPL, TSLA, etc.) → Use Schwab, NOT Coinbase!
 **KEY DISTINCTION**: If user mentions a stock symbol (like MU, AAPL, NVDA, etc.) and wants 
 trading advice or limit orders, route to Schwab for stock-specific handling
 **DO NOT use for**: Cryptocurrency trading (use Coinbase instead)""")
@@ -724,13 +727,15 @@ When routing, you MUST also extract:
    - "Bitcoin blockchain" anything → Coinbase
    - "largest transactions on [crypto] blockchain" → Coinbase
 15. **NEWS and CURRENT EVENTS** → Researcher (has internet access!)
-16. **CHART/PLOT/GRAPH requests for crypto data** → Coinbase
+16. **CHART/PLOT/GRAPH requests**:
+   - **For CRYPTO** (BTC, ETH, SOL) → **Coinbase**
+   - **For STOCKS** (NVDA, AAPL, TSLA, any stock ticker) → **Schwab**
 17. **General trading questions** ("what do you think...", "explain...", "how does...") → **FinRL**
 18. **Questions about capabilities** ("what can you do?", "how can you help?") → **FinRL**
 19. **Formulas and quantitative concepts** → **FinRL** (can render LaTeX math)
 
 **CRITICAL**: "trade ideas", "trading recommendations", "what should I trade" → ALWAYS route to Strategy!
-**CRITICAL**: For STOCK quotes/prices, use SCHWAB. For CRYPTO quotes/prices, use COINBASE.
+**CRITICAL**: For STOCK quotes/prices/charts, use SCHWAB. For CRYPTO quotes/prices/charts, use COINBASE.
 **CRITICAL**: For general discussions/education/explanations → FinRL (Mister Risker's personality)
 
 ## CRITICAL: Follow-Up "Other/Different" Queries

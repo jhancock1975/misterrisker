@@ -178,6 +178,58 @@ class TestSupervisorAgentRouting:
         assert result["agent_used"] == "researcher", \
             f"Expected 'researcher' but got '{result['agent_used']}'. Blockchain data queries should go to researcher agent, not coinbase."
 
+    @pytest.mark.asyncio
+    async def test_supervisor_routes_stock_chart_to_schwab_not_coinbase(self):
+        """Supervisor should route stock chart requests (NVDA, AAPL) to Schwab, not Coinbase.
+        
+        When user asks to 'draw a chart of NVDA prices', the system should:
+        1. Recognize NVDA as a stock (not crypto)
+        2. Route to Schwab agent (has stock market data)
+        3. NOT route to Coinbase (only has crypto data)
+        """
+        mock_llm = MagicMock()
+        mock_router = MagicMock()
+        mock_router.ainvoke = AsyncMock(return_value=RoutingDecision(
+            agent="schwab",
+            reasoning="NVDA is a stock ticker. Stock charts should go to Schwab which has stock price data.",
+            query_for_agent="draw a chart of NVDA prices from december 12th"
+        ))
+        mock_llm.with_structured_output = MagicMock(return_value=mock_router)
+        
+        mock_schwab_agent = MagicMock()
+        mock_schwab_agent.process_query = AsyncMock(return_value={
+            "response": "📊 **Price Chart: NVDA**\n<div class='generated-chart'>...</div>",
+            "status": "success"
+        })
+        
+        # Also provide a mock coinbase agent to ensure it's NOT used
+        mock_coinbase_agent = MagicMock()
+        mock_coinbase_agent.process_query = AsyncMock(return_value={
+            "response": "Crypto chart",
+            "status": "success"
+        })
+        
+        supervisor = SupervisorAgent(
+            llm=mock_llm,
+            schwab_agent=mock_schwab_agent,
+            coinbase_agent=mock_coinbase_agent
+        )
+        
+        result = await supervisor.execute(
+            user_message="can you draw a chart of nvda prices from december 12th?",
+            conversation_history=[],
+            config={"configurable": {"thread_id": "test-123"}}
+        )
+        
+        # Should route to Schwab, NOT Coinbase
+        assert result["agent_used"] == "schwab", \
+            f"Expected 'schwab' but got '{result['agent_used']}'. Stock chart requests (NVDA) should go to Schwab, not Coinbase."
+        
+        # Schwab agent should have been called
+        mock_schwab_agent.process_query.assert_called()
+        # Coinbase agent should NOT have been called
+        mock_coinbase_agent.process_query.assert_not_called()
+
 
 class TestSchwabAgentProcessQuery:
     """Tests for SchwabAgent.process_query method."""
